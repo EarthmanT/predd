@@ -277,6 +277,33 @@ class TestGhSubprocessWrapper:
         args = mock_run.call_args[0][0]
         assert "--request-changes" in args
 
+    def _fake_view(self, state="OPEN", reviews=None):
+        fake = MagicMock()
+        fake.stdout = json.dumps({"state": state, "reviews": reviews or []})
+        return fake
+
+    def test_already_reviewed_returns_false_for_open_unreviewed(self):
+        with patch("subprocess.run", return_value=self._fake_view()):
+            assert pw.gh_pr_already_reviewed("owner/repo", 1, "myuser") is False
+
+    def test_already_reviewed_returns_true_when_merged(self):
+        with patch("subprocess.run", return_value=self._fake_view(state="MERGED")):
+            assert pw.gh_pr_already_reviewed("owner/repo", 1, "myuser") is True
+
+    def test_already_reviewed_returns_true_when_closed(self):
+        with patch("subprocess.run", return_value=self._fake_view(state="CLOSED")):
+            assert pw.gh_pr_already_reviewed("owner/repo", 1, "myuser") is True
+
+    def test_already_reviewed_returns_true_when_user_reviewed(self):
+        reviews = [{"author": {"login": "myuser"}, "state": "APPROVED"}]
+        with patch("subprocess.run", return_value=self._fake_view(reviews=reviews)):
+            assert pw.gh_pr_already_reviewed("owner/repo", 1, "myuser") is True
+
+    def test_already_reviewed_returns_false_when_other_user_reviewed(self):
+        reviews = [{"author": {"login": "otheruser"}, "state": "APPROVED"}]
+        with patch("subprocess.run", return_value=self._fake_view(reviews=reviews)):
+            assert pw.gh_pr_already_reviewed("owner/repo", 1, "myuser") is False
+
 # ---------------------------------------------------------------------------
 # Notify functions are mockable
 # ---------------------------------------------------------------------------

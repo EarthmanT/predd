@@ -269,6 +269,21 @@ def gh_pr_view(repo: str, pr_number: int) -> str:
     return result.stdout
 
 
+def gh_pr_already_reviewed(repo: str, pr_number: int, github_user: str) -> bool:
+    """Return True if the PR is closed/merged or github_user has already reviewed it."""
+    result = gh_run([
+        "pr", "view", str(pr_number), "--repo", repo,
+        "--json", "state,reviews",
+    ])
+    data = json.loads(result.stdout)
+    if data.get("state", "OPEN") != "OPEN":
+        return True
+    return any(
+        r.get("author", {}).get("login") == github_user
+        for r in data.get("reviews", [])
+    )
+
+
 def gh_pr_diff(repo: str, pr_number: int) -> str:
     result = gh_run(["pr", "diff", str(pr_number), "--repo", repo])
     return result.stdout
@@ -649,6 +664,11 @@ def start(once: bool):
                     if entry_sha == head_sha and entry_status in (
                         "submitted", "rejected", "awaiting_approval", "reviewing"
                     ):
+                        continue
+
+                    if gh_pr_already_reviewed(repo, pr_number, cfg.github_user):
+                        logger.info("Skipping %s — already reviewed or closed", key)
+                        update_pr_state(state, key, head_sha=head_sha, status="rejected")
                         continue
 
                     _current_pr_key[:] = [key]
