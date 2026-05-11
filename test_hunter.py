@@ -1149,13 +1149,26 @@ class TestShutdown:
 
 class TestSkillHasCommits:
     def test_returns_true_when_unpushed_commits(self, tmp_path):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="abc123 feat: proposal\n")
+        results = [
+            MagicMock(returncode=0, stdout=""),           # git status --porcelain (clean)
+            MagicMock(returncode=0, stdout="abc123\n"),   # git log --not --remotes (has commits)
+        ]
+        with patch("subprocess.run", side_effect=results):
             assert h.skill_has_commits(tmp_path) is True
 
-    def test_returns_false_when_no_unpushed_commits(self, tmp_path):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="")
+    def test_returns_true_when_uncommitted_changes(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout="M  file.py\n"),  # git status (dirty)
+        ]
+        with patch("subprocess.run", side_effect=results):
+            assert h.skill_has_commits(tmp_path) is True
+
+    def test_returns_false_when_clean_and_no_unpushed(self, tmp_path):
+        results = [
+            MagicMock(returncode=0, stdout=""),   # git status (clean)
+            MagicMock(returncode=0, stdout=""),   # git log (no unpushed)
+        ]
+        with patch("subprocess.run", side_effect=results):
             assert h.skill_has_commits(tmp_path) is False
 
     def test_returns_false_on_git_error(self, tmp_path):

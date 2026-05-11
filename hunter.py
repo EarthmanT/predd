@@ -395,12 +395,20 @@ def _run_devin_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path)
 
 
 def skill_has_commits(worktree: Path) -> bool:
-    """Return True if the worktree has commits not yet pushed to remote."""
-    result = subprocess.run(
+    """Return True if the worktree has new commits or uncommitted changes since branch base."""
+    # Check for uncommitted changes (staged or unstaged)
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True, cwd=str(worktree),
+    )
+    if status.stdout.strip():
+        return True
+    # Check for commits not on remote (unpushed)
+    unpushed = subprocess.run(
         ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
         capture_output=True, text=True, cwd=str(worktree),
     )
-    return bool(result.stdout.strip())
+    return bool(unpushed.stdout.strip())
 
 
 def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> str:
