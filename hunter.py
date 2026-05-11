@@ -466,20 +466,31 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         logger.info("Could not claim issue %s — skipping", key)
         return
 
+    try:
+        base_branch = gh_repo_default_branch(repo)
+    except Exception as e:
+        logger.error("Failed to get default branch for %s: %s", repo, e)
+        return
+
+    branch = proposal_branch(cfg, issue_number, title)
+    worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
+
     update_issue_state(state, key,
                        status="in_progress",
                        issue_number=issue_number,
                        repo=repo,
                        title=title,
                        issue_author=issue.get("author", {}).get("login", ""),
+                       base_branch=base_branch,
+                       proposal_branch=branch,
+                       proposal_worktree=str(worktree),
+                       resume_attempts=0,
                        first_seen=_now_iso())
 
     try:
         notify_sound(cfg.sound_new_pr)
         notify_toast("New issue picked up", f"{key} — {title}")
 
-        base_branch = gh_repo_default_branch(repo)
-        branch = proposal_branch(cfg, issue_number, title)
         worktree = setup_new_branch_worktree(cfg, repo, branch, base_branch)
         logger.info("Proposal worktree at %s", worktree)
 
@@ -703,11 +714,179 @@ def check_impl_merged(
 
 
 # ---------------------------------------------------------------------------
-# Poll loop helpers
+# Resume and rollback
 # ---------------------------------------------------------------------------
 
 TERMINAL_STATES = {"merged", "awaiting_verification", "failed"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
+
+
+def worktree_has_commits_since(worktree: Path, base_branch: str) -> bool:
+    """Return True if the worktree has commits not on base_branch."""
+    result = subprocess.run(
+        ["git", "log", "--oneline", f"origin/{base_branch}..HEAD"],
+        capture_output=True, text=True, cwd=str(worktree),
+    )
+    if result.returncode != 0:
+        # Try without origin/ prefix (detached worktrees)
+        result = subprocess.run(
+            ["git", "log", "--oneline", f"{base_branch}..HEAD"],
+            capture_output=True, text=True, cwd=str(worktree),
+        )
+    return bool(result.stdout.strip())
+
+
+def rollback_issue(cfg: Config, state: dict, key: str, reason: str) -> None:
+    """Remove labels, delete worktree, clear state entry."""
+    entry = state.get(key, {})
+    repo = entry.get("repo", "")
+    issue_number = entry.get("issue_number")
+
+    logger.warning("Rolling back %s: %s", key, reason)
+
+    # Remove all hunter labels from GitHub
+    if repo and issue_number:
+        for suffix in (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification"):
+            label = f"{cfg.github_user}{suffix}"
+            try:
+                gh_issue_remove_label(repo, issue_number, label)
+            except Exception:
+                pass
+
+    # Delete worktrees
+    for wt_field in ("proposal_worktree", "impl_worktree"):
+        wt = entry.get(wt_field)
+        if wt and Path(wt).exists():
+            try:
+                shutil.rmtree(wt)
+                logger.info("Deleted worktree %s", wt)
+            except Exception as e:
+                logger.warning("Could not delete worktree %s: %s", wt, e)
+
+    # Remove from state so it will be picked up fresh
+    state.pop(key, None)
+    save_hunter_state(state)
+    logger.info("Rolled back %s — will retry on next poll", key)
+
+
+def resume_in_flight_issues(cfg: Config, state: dict) -> None:
+    """
+    Called at the start of each poll cycle.
+    Inspects non-terminal issues and either resumes them or rolls them back.
+    Also cleans up orphaned labels (in-progress label but no state entry).
+    """
+    for key, entry in list(state.items()):
+        status = entry.get("status", "")
+        if status in TERMINAL_STATES or status == "":
+            continue
+
+        resume_attempts = entry.get("resume_attempts", 0)
+        if resume_attempts >= cfg.max_resume_retries:
+            rollback_issue(cfg, state, key, f"exceeded max_resume_retries ({cfg.max_resume_retries})")
+            continue
+
+        repo = entry.get("repo", "")
+        issue_number = entry.get("issue_number")
+
+        if status == "in_progress":
+            # Was mid-proposal-creation — check if worktree has commits
+            wt = entry.get("proposal_worktree")
+            if wt and Path(wt).exists():
+                base = entry.get("base_branch", "main")
+                if worktree_has_commits_since(Path(wt), base):
+                    logger.info("Resuming %s from in_progress — worktree has commits, checking for existing PR", key)
+                    # Check if a PR already exists with our marker
+                    marker = f"hunter:issue-{issue_number}"
+                    try:
+                        prs = gh_list_prs_with_marker(repo, marker)
+                        if prs:
+                            pr_number = prs[0]["number"]
+                            logger.info("Found existing proposal PR #%d for %s — advancing to proposal_open", pr_number, key)
+                            update_issue_state(state, key,
+                                               status="proposal_open",
+                                               proposal_pr=pr_number,
+                                               resume_attempts=resume_attempts + 1)
+                        else:
+                            logger.info("No PR found for %s — incrementing resume_attempts", key)
+                            update_issue_state(state, key, resume_attempts=resume_attempts + 1)
+                    except Exception as e:
+                        logger.warning("Could not check PRs for %s: %s", key, e)
+                else:
+                    rollback_issue(cfg, state, key, "worktree exists but has no commits")
+            else:
+                rollback_issue(cfg, state, key, "in_progress with no worktree")
+
+        elif status == "proposal_open":
+            # Check proposal PR still exists
+            proposal_pr = entry.get("proposal_pr")
+            if not proposal_pr:
+                rollback_issue(cfg, state, key, "proposal_open with no proposal_pr")
+            # Otherwise fine — poll loop will check merge status
+
+        elif status in ("implementing", "self_reviewing"):
+            wt = entry.get("impl_worktree")
+            if not entry.get("impl_pr"):
+                # Implementation was started but PR not created yet
+                if wt and Path(wt).exists():
+                    logger.info("Resuming %s — impl worktree exists, checking for existing impl PR", key)
+                    marker = f"hunter:impl-{issue_number}"
+                    try:
+                        prs = gh_list_prs_with_marker(repo, marker)
+                        if prs:
+                            pr_number = prs[0]["number"]
+                            logger.info("Found existing impl PR #%d for %s", pr_number, key)
+                            update_issue_state(state, key,
+                                               impl_pr=pr_number,
+                                               resume_attempts=resume_attempts + 1)
+                        else:
+                            update_issue_state(state, key, resume_attempts=resume_attempts + 1)
+                    except Exception as e:
+                        logger.warning("Could not check impl PRs for %s: %s", key, e)
+                else:
+                    # Roll back to proposal_open so we re-run impl from scratch
+                    logger.warning("Resetting %s to proposal_open — impl worktree missing", key)
+                    update_issue_state(state, key,
+                                       status="proposal_open",
+                                       impl_pr=None,
+                                       impl_worktree=None,
+                                       resume_attempts=resume_attempts + 1)
+
+        elif status == "ready_for_review":
+            impl_pr = entry.get("impl_pr")
+            if not impl_pr:
+                rollback_issue(cfg, state, key, "ready_for_review with no impl_pr")
+
+
+def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
+    """
+    Remove in-progress labels from issues that have no hunter state entry.
+    Runs once on startup.
+    """
+    label = f"{cfg.github_user}:in-progress"
+    for repo in repos:
+        try:
+            result = gh_run([
+                "issue", "list",
+                "--repo", repo,
+                "--state", "open",
+                "--label", label,
+                "--json", "number",
+                "--limit", "50",
+            ], check=False)
+            if result.returncode != 0:
+                continue
+            issues = json.loads(result.stdout)
+            for issue in issues:
+                issue_number = issue["number"]
+                key = f"{repo}!{issue_number}"
+                if key not in state:
+                    logger.warning("Removing orphaned label %s from issue %s", label, key)
+                    try:
+                        gh_issue_remove_label(repo, issue_number, label)
+                    except Exception as e:
+                        logger.warning("Could not remove orphaned label from %s: %s", key, e)
+        except Exception as e:
+            logger.warning("Could not scan orphaned labels for %s: %s", repo, e)
 
 
 def _issue_has_hunter_labels(issue: dict) -> bool:
@@ -749,8 +928,16 @@ def start(once: bool):
 
     hunter_repos = list(dict.fromkeys(cfg.repos + cfg.hunter_only_repos))
 
+    # Scan for orphaned labels from crashed previous runs
+    state = load_hunter_state()
+    scan_orphaned_labels(cfg, state, hunter_repos)
+
     try:
         while not _stop.is_set():
+            state = load_hunter_state()
+
+            # Resume or rollback any in-flight issues from previous runs
+            resume_in_flight_issues(cfg, state)
             state = load_hunter_state()
 
             for repo in hunter_repos:

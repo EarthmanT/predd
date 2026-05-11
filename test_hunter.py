@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch, call, ANY
 
 import pytest
 
@@ -993,7 +993,8 @@ class TestProcessIssue:
         state = {}
 
         with patch.object(h, "try_claim_issue", return_value=True), \
-             patch.object(h, "gh_repo_default_branch", side_effect=RuntimeError("network")), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", side_effect=RuntimeError("disk full")), \
              patch.object(h, "notify_sound"), \
              patch.object(h, "notify_toast"), \
              patch.object(h, "save_hunter_state"):
@@ -1553,3 +1554,231 @@ class TestSelfReviewLoopExhaustionErrors:
             h.self_review_loop(cfg, state, "owner/repo", key, entry, worktree)
 
         assert state.get(key, {}).get("status") == "ready_for_review"
+
+
+# ---------------------------------------------------------------------------
+# TestResumeAndRollback
+# ---------------------------------------------------------------------------
+
+def _base_entry(repo="owner/repo", issue_number=10, status="in_progress", **kwargs):
+    return {
+        "repo": repo,
+        "issue_number": issue_number,
+        "title": "Test issue",
+        "status": status,
+        "base_branch": "main",
+        "resume_attempts": 0,
+        **kwargs,
+    }
+
+
+class TestWorktreeHasCommitsSince:
+    def test_returns_true_when_commits_present(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="abc1234 fix\n")
+            result = h.worktree_has_commits_since(tmp_path, "main")
+        assert result is True
+
+    def test_returns_false_when_no_commits(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            result = h.worktree_has_commits_since(tmp_path, "main")
+        assert result is False
+
+    def test_falls_back_when_origin_ref_fails(self, tmp_path):
+        results = [
+            MagicMock(returncode=128, stdout=""),  # origin/main fails
+            MagicMock(returncode=0, stdout="abc1234 fix\n"),  # fallback succeeds
+        ]
+        with patch("subprocess.run", side_effect=results):
+            result = h.worktree_has_commits_since(tmp_path, "main")
+        assert result is True
+
+
+class TestRollbackIssue:
+    def test_removes_labels_clears_state(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        state = {key: _base_entry(proposal_worktree=str(wt))}
+
+        with patch.object(h, "gh_issue_remove_label") as mock_remove, \
+             patch.object(h, "save_hunter_state"):
+            h.rollback_issue(cfg, state, key, "test reason")
+
+        assert key not in state
+        assert mock_remove.call_count >= 1
+
+    def test_deletes_worktree(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        wt = tmp_path / "proposal-wt"
+        wt.mkdir()
+        state = {key: _base_entry(proposal_worktree=str(wt))}
+
+        with patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "save_hunter_state"):
+            h.rollback_issue(cfg, state, key, "test")
+
+        assert not wt.exists()
+
+    def test_tolerates_missing_worktree(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry(proposal_worktree="/nonexistent/path")}
+
+        with patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "save_hunter_state"):
+            h.rollback_issue(cfg, state, key, "test")  # should not raise
+
+    def test_tolerates_label_removal_failure(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry()}
+
+        with patch.object(h, "gh_issue_remove_label", side_effect=Exception("network")), \
+             patch.object(h, "save_hunter_state"):
+            h.rollback_issue(cfg, state, key, "test")  # should not raise
+
+
+class TestResumeInFlightIssues:
+    def test_skips_terminal_states(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {
+            "owner/repo!1": _base_entry(status="awaiting_verification"),
+            "owner/repo!2": _base_entry(issue_number=2, status="failed"),
+        }
+        with patch.object(h, "rollback_issue") as mock_rb:
+            h.resume_in_flight_issues(cfg, state)
+        mock_rb.assert_not_called()
+
+    def test_rolls_back_exceeded_retries(self, tmp_path):
+        cfg = _make_cfg(tmp_path, max_resume_retries=2)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="in_progress", resume_attempts=3)}
+
+        with patch.object(h, "rollback_issue") as mock_rb, \
+             patch.object(h, "save_hunter_state"):
+            h.resume_in_flight_issues(cfg, state)
+        mock_rb.assert_called_once_with(cfg, state, key, ANY)
+
+    def test_in_progress_with_worktree_and_commits_finds_pr(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="in_progress", proposal_worktree=str(wt))}
+
+        with patch.object(h, "worktree_has_commits_since", return_value=True), \
+             patch.object(h, "gh_list_prs_with_marker", return_value=[{"number": 42}]), \
+             patch.object(h, "save_hunter_state"):
+            h.resume_in_flight_issues(cfg, state)
+
+        assert state[key]["status"] == "proposal_open"
+        assert state[key]["proposal_pr"] == 42
+
+    def test_in_progress_no_commits_rolls_back(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="in_progress", proposal_worktree=str(wt))}
+
+        with patch.object(h, "worktree_has_commits_since", return_value=False), \
+             patch.object(h, "rollback_issue") as mock_rb:
+            h.resume_in_flight_issues(cfg, state)
+        mock_rb.assert_called_once()
+
+    def test_in_progress_no_worktree_rolls_back(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="in_progress")}
+
+        with patch.object(h, "rollback_issue") as mock_rb:
+            h.resume_in_flight_issues(cfg, state)
+        mock_rb.assert_called_once()
+
+    def test_implementing_no_impl_pr_with_worktree_finds_pr(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="implementing", impl_worktree=str(wt))}
+
+        with patch.object(h, "gh_list_prs_with_marker", return_value=[{"number": 77}]), \
+             patch.object(h, "save_hunter_state"):
+            h.resume_in_flight_issues(cfg, state)
+
+        assert state[key]["impl_pr"] == 77
+
+    def test_implementing_no_impl_pr_no_worktree_resets_to_proposal_open(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="implementing")}
+
+        with patch.object(h, "save_hunter_state"):
+            h.resume_in_flight_issues(cfg, state)
+
+        assert state[key]["status"] == "proposal_open"
+
+    def test_ready_for_review_no_impl_pr_rolls_back(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        key = "owner/repo!10"
+        state = {key: _base_entry(status="ready_for_review")}
+
+        with patch.object(h, "rollback_issue") as mock_rb:
+            h.resume_in_flight_issues(cfg, state)
+        mock_rb.assert_called_once()
+
+
+class TestScanOrphanedLabels:
+    def test_removes_label_from_issue_not_in_state(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 42}])
+
+        with patch.object(h, "gh_run", return_value=fake) as mock_gh, \
+             patch.object(h, "gh_issue_remove_label") as mock_remove:
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])
+
+        mock_remove.assert_called_once_with("owner/repo", 42, f"{cfg.github_user}:in-progress")
+
+    def test_skips_issue_already_in_state(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!42": _base_entry(status="proposal_open")}
+
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 42}])
+
+        with patch.object(h, "gh_run", return_value=fake), \
+             patch.object(h, "gh_issue_remove_label") as mock_remove:
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])
+
+        mock_remove.assert_not_called()
+
+    def test_tolerates_gh_failure(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_run", side_effect=Exception("network")):
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])  # should not raise

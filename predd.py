@@ -179,6 +179,7 @@ class Config:
         self.branch_prefix: str = data.get("branch_prefix", "usr/at")
         self.max_review_fix_loops: int = data.get("max_review_fix_loops", 1)
         self.auto_review_draft: bool = data.get("auto_review_draft", False)
+        self.max_resume_retries: int = data.get("max_resume_retries", 2)
 
     def to_dict(self) -> dict:
         return {
@@ -199,6 +200,7 @@ class Config:
             "branch_prefix": self.branch_prefix,
             "max_review_fix_loops": self.max_review_fix_loops,
             "auto_review_draft": self.auto_review_draft,
+            "max_resume_retries": self.max_resume_retries,
         }
 
 
