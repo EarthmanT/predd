@@ -517,10 +517,21 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
 
 
 def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
-    return _run_proc(
-        ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model, prompt],
-        worktree,
-    )
+    # Write prompt to a temp file to avoid CLI arg length limits
+    prompt_file = worktree / ".hunter-prompt.txt"
+    prompt_file.write_text(prompt)
+    try:
+        # Strip ANTHROPIC_API_KEY so claude falls back to OAuth (subscription auth)
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        result = _run_proc(
+            ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model,
+             prompt_file.read_text()],
+            worktree,
+            env=env,
+        )
+    finally:
+        prompt_file.unlink(missing_ok=True)
+    return result
 
 
 def _run_devin(cfg: Config, prompt: str, worktree: Path) -> str:
