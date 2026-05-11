@@ -632,6 +632,7 @@ class TestCheckProposalMerged:
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
              patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
              patch.object(h, "run_skill", return_value="done"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
              patch.object(h, "gh_create_branch_and_pr", return_value=99), \
              patch.object(h, "gh_ensure_label_exists"), \
              patch.object(h, "gh_issue_add_label"), \
@@ -975,6 +976,7 @@ class TestProcessIssue:
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
              patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
              patch.object(h, "run_skill", return_value="proposal text"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
              patch.object(h, "gh_create_branch_and_pr", return_value=55), \
              patch.object(h, "gh_ensure_label_exists"), \
              patch.object(h, "gh_issue_add_label"), \
@@ -986,6 +988,30 @@ class TestProcessIssue:
 
         assert state.get("owner/repo!10", {}).get("proposal_pr") == 55
         assert state.get("owner/repo!10", {}).get("status") == "proposal_open"
+
+    def test_no_commits_after_proposal_skill_sets_failed(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        skill = tmp_path / "proposal-skill.md"
+        skill.write_text("Write proposal for $ARGUMENTS")
+        cfg.proposal_skill_path = skill
+        state = {}
+        worktree = tmp_path / "prop-wt"
+        worktree.mkdir()
+
+        with patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value=""), \
+             patch.object(h, "skill_has_commits", return_value=False), \
+             patch.object(h, "gh_create_branch_and_pr") as mock_create_pr, \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", self._issue())
+
+        mock_create_pr.assert_not_called()
+        assert state.get("owner/repo!10", {}).get("status") == "failed"
 
     def test_exception_sets_failed_status(self, tmp_path):
         cfg = _make_cfg(tmp_path)
@@ -1115,6 +1141,27 @@ class TestShutdown:
         h._stop.clear()
         h._active_proc_hunter = None
         h._current_issue_key.clear()
+
+
+# ---------------------------------------------------------------------------
+# TestSkillHasCommits
+# ---------------------------------------------------------------------------
+
+class TestSkillHasCommits:
+    def test_returns_true_when_unpushed_commits(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="abc123 feat: proposal\n")
+            assert h.skill_has_commits(tmp_path) is True
+
+    def test_returns_false_when_no_unpushed_commits(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            assert h.skill_has_commits(tmp_path) is False
+
+    def test_returns_false_on_git_error(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="")
+            assert h.skill_has_commits(tmp_path) is False
 
 
 # ---------------------------------------------------------------------------

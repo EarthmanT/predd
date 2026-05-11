@@ -247,11 +247,6 @@ def gh_create_branch_and_pr(
                 ["git", "checkout", "-b", branch],
                 check=True, capture_output=True, cwd=cwd,
             )
-    # Create an empty commit to ensure the branch diverges from base (required for PR creation)
-    subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "chore: open branch"],
-        check=True, capture_output=True, cwd=cwd,
-    )
     subprocess.run(
         ["git", "push", "-u", "origin", branch],
         check=True, capture_output=True, cwd=cwd,
@@ -399,6 +394,15 @@ def _run_devin_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path)
     )
 
 
+def skill_has_commits(worktree: Path) -> bool:
+    """Return True if the worktree has commits not yet pushed to remote."""
+    result = subprocess.run(
+        ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+        capture_output=True, text=True, cwd=str(worktree),
+    )
+    return bool(result.stdout.strip())
+
+
 def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> str:
     """Load skill, substitute $ARGUMENTS, run via configured backend."""
     if not skill_path.exists():
@@ -496,6 +500,9 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
 
         run_skill(cfg, cfg.proposal_skill_path, str(issue_number), worktree)
 
+        if not skill_has_commits(worktree):
+            raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
+
         marker = f"hunter:issue-{issue_number}"
         pr_body = f"Proposal for issue #{issue_number}\n\n{marker}"
         pr_number = gh_create_branch_and_pr(
@@ -552,6 +559,9 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         logger.info("Impl worktree at %s", worktree)
 
         run_skill(cfg, cfg.impl_skill_path, str(issue_number), worktree)
+
+        if not skill_has_commits(worktree):
+            raise RuntimeError("Impl skill produced no commits — not creating empty PR")
 
         marker = f"hunter:impl-{issue_number}"
         pr_body = f"Implementation for issue #{issue_number}\n\n{marker}"
