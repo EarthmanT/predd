@@ -65,6 +65,12 @@ repos = [
   "owner/repo",
 ]
 
+# Repos only watched by predd (not hunter)
+predd_only_repos = []
+
+# Repos only watched by hunter (not predd)
+hunter_only_repos = []
+
 # Polling interval in seconds
 poll_interval = 90
 
@@ -81,6 +87,12 @@ github_user = "<your-github-username>"
 # Path to the pr-review skill (SKILL.md)
 skill_path = "~/.windsurf/skills/pr-review/SKILL.md"
 
+# Path to the proposal skill (SKILL.md)
+proposal_skill_path = "~/.windsurf/skills/proposal/SKILL.md"
+
+# Path to the implementation skill (SKILL.md)
+impl_skill_path = "~/.windsurf/skills/impl/SKILL.md"
+
 # When to trigger a review:
 # "ready"     — any open non-draft PR (default)
 # "requested" — only PRs where you are an explicit reviewer
@@ -93,6 +105,15 @@ backend = "devin"
 # devin default: haiku-4-5
 # claude default: claude-opus-4-7
 model = "haiku-4-5"
+
+# Branch prefix for hunter-created branches
+branch_prefix = "usr/at"
+
+# Maximum self-review/fix loops before flagging for human
+max_review_fix_loops = 1
+
+# Whether to self-review draft implementation PRs (false = wait for ready)
+auto_review_draft = false
 """
 
 # ---------------------------------------------------------------------------
@@ -124,6 +145,8 @@ logger = logging.getLogger("predd")
 class Config:
     def __init__(self, data: dict):
         self.repos: list[str] = data["repos"]
+        self.predd_only_repos: list[str] = data.get("predd_only_repos", [])
+        self.hunter_only_repos: list[str] = data.get("hunter_only_repos", [])
         self.poll_interval: int = data.get("poll_interval", 90)
         self.sound_new_pr: str = data.get("sound_new_pr", "new_pr")
         self.sound_review_ready: str = data.get("sound_review_ready", "review_ready")
@@ -135,25 +158,47 @@ class Config:
                 "~/.windsurf/skills/pr-review/SKILL.md",
             )
         ).expanduser()
+        self.proposal_skill_path: Path = Path(
+            data.get(
+                "proposal_skill_path",
+                "~/.windsurf/skills/proposal/SKILL.md",
+            )
+        ).expanduser()
+        self.impl_skill_path: Path = Path(
+            data.get(
+                "impl_skill_path",
+                "~/.windsurf/skills/impl/SKILL.md",
+            )
+        ).expanduser()
         self.trigger: str = data.get("trigger", "ready")
         self.backend: str = data.get("backend", "devin")
         # model: per-backend default; claude_model is accepted as legacy alias
         self.model: str = data.get("model") or data.get("claude_model") or (
             "haiku-4-5" if data.get("backend", "devin") == "devin" else "claude-opus-4-7"
         )
+        self.branch_prefix: str = data.get("branch_prefix", "usr/at")
+        self.max_review_fix_loops: int = data.get("max_review_fix_loops", 1)
+        self.auto_review_draft: bool = data.get("auto_review_draft", False)
 
     def to_dict(self) -> dict:
         return {
             "repos": self.repos,
+            "predd_only_repos": self.predd_only_repos,
+            "hunter_only_repos": self.hunter_only_repos,
             "poll_interval": self.poll_interval,
             "sound_new_pr": self.sound_new_pr,
             "sound_review_ready": self.sound_review_ready,
             "worktree_base": str(self.worktree_base),
             "github_user": self.github_user,
             "skill_path": str(self.skill_path),
+            "proposal_skill_path": str(self.proposal_skill_path),
+            "impl_skill_path": str(self.impl_skill_path),
             "trigger": self.trigger,
             "backend": self.backend,
             "model": self.model,
+            "branch_prefix": self.branch_prefix,
+            "max_review_fix_loops": self.max_review_fix_loops,
+            "auto_review_draft": self.auto_review_draft,
         }
 
 
