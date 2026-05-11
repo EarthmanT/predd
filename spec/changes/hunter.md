@@ -106,12 +106,14 @@ This returns ownership to the reporter without requiring any manual step.
 
 ## Decisions
 
-- **Proposal format:** Follow the openspec process.
-- **Self-review loop:** 1 self-review pass, 1 fix cycle. If issues remain after the fix, flag for human and stop.
-- **Branch naming:** User-defined via config. Default pattern: `usr/at/<issue-number>-proposal-<short-name>` and `usr/at/<issue-number>-impl-<short-name>`.
+- **Proposal format:** Follow the openspec process. Skill path is configurable (`proposal_skill_path`) mirroring `skill_path` for pr-review.
+- **Self-review loop:** Configurable `max_review_fix_loops` (default: 1). If issues remain after max loops, post comment flagging for human and stop.
+- **Self-review trigger:** Self-review only starts after the impl PR is marked ready for review (not draft). Configurable via `auto_review_draft = false`.
+- **Branch naming:** User-defined via config (`branch_prefix`, default: `usr/at`). Full pattern: `{branch_prefix}/{issue}-proposal-{slug}` and `{branch_prefix}/{issue}-impl-{slug}`. Slug derived from issue title.
 - **Config:** Single `~/.config/predd/config.toml`. Hunter is an optional module within predd.
 - **Repo scope:** Three lists in config:
   - `repos` — watched by both predd and hunter
   - `predd_only_repos` — predd reviews only
   - `hunter_only_repos` — hunter issue tracking only
 - **Labels:** Namespaced by GitHub username, e.g. `adam:in-progress`, not `hunter:in-progress`. Avoids collisions on shared repos.
+- **Test coverage:** 80% unit test coverage required.
