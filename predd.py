@@ -81,6 +81,11 @@ github_user = "<your-github-username>"
 # Path to the pr-review skill (SKILL.md)
 skill_path = "~/.windsurf/skills/pr-review/SKILL.md"
 
+# When to trigger a review:
+# "ready"     — any open non-draft PR (default)
+# "requested" — only PRs where you are an explicit reviewer
+trigger = "ready"
+
 # Backend to use for reviews: "devin" or "claude"
 backend = "devin"
 
@@ -130,6 +135,7 @@ class Config:
                 "~/.windsurf/skills/pr-review/SKILL.md",
             )
         ).expanduser()
+        self.trigger: str = data.get("trigger", "ready")
         self.backend: str = data.get("backend", "devin")
         # model: per-backend default; claude_model is accepted as legacy alias
         self.model: str = data.get("model") or data.get("claude_model") or (
@@ -145,6 +151,7 @@ class Config:
             "worktree_base": str(self.worktree_base),
             "github_user": self.github_user,
             "skill_path": str(self.skill_path),
+            "trigger": self.trigger,
             "backend": self.backend,
             "model": self.model,
         }
@@ -257,7 +264,7 @@ def gh_list_open_prs(repo: str) -> list[dict]:
         "pr", "list",
         "--repo", repo,
         "--state", "open",
-        "--json", "number,title,author,headRefName,headRefOid,isDraft",
+        "--json", "number,title,author,headRefName,headRefOid,isDraft,reviewRequests",
         "--limit", "100",
     ])
     prs = json.loads(result.stdout)
@@ -652,6 +659,10 @@ def start(once: bool):
                         continue
                     if pr["isDraft"]:
                         continue
+                    if cfg.trigger == "requested":
+                        requested = [r.get("login") for r in pr.get("reviewRequests", [])]
+                        if cfg.github_user not in requested:
+                            continue
 
                     pr_number = pr["number"]
                     head_sha = pr["headRefOid"]

@@ -143,7 +143,7 @@ class TestStateAtomicWrite:
 class TestPRFilterLogic:
     """Tests for the skip conditions inside the daemon loop."""
 
-    def _make_pr(self, author="other", is_draft=False, number=1, sha="abc123"):
+    def _make_pr(self, author="other", is_draft=False, number=1, sha="abc123", review_requests=None):
         return {
             "number": number,
             "title": "Test PR",
@@ -151,14 +151,20 @@ class TestPRFilterLogic:
             "headRefOid": sha,
             "headRefName": "feature-branch",
             "isDraft": is_draft,
+            "reviewRequests": review_requests or [],
         }
 
-    def _should_process(self, pr: dict, state: dict, cfg_user: str, repo: str = "owner/repo") -> bool:
+    def _should_process(self, pr: dict, state: dict, cfg_user: str,
+                        trigger: str = "ready", repo: str = "owner/repo") -> bool:
         """Replicate the daemon loop filter logic."""
         if pr["author"]["login"] == cfg_user:
             return False
         if pr["isDraft"]:
             return False
+        if trigger == "requested":
+            requested = [r.get("login") for r in pr.get("reviewRequests", [])]
+            if cfg_user not in requested:
+                return False
         key = f"{repo}#{pr['number']}"
         entry = state.get(key, {})
         entry_sha = entry.get("head_sha", "")
@@ -212,6 +218,23 @@ class TestPRFilterLogic:
         pr = self._make_pr(sha="abc")
         state = {"owner/repo#1": {"head_sha": "abc", "status": "failed"}}
         assert self._should_process(pr, state, "myuser")
+
+    # trigger=requested
+    def test_requested_mode_skips_when_not_requested(self):
+        pr = self._make_pr(review_requests=[])
+        assert not self._should_process(pr, {}, "myuser", trigger="requested")
+
+    def test_requested_mode_skips_when_other_user_requested(self):
+        pr = self._make_pr(review_requests=[{"login": "otheruser"}])
+        assert not self._should_process(pr, {}, "myuser", trigger="requested")
+
+    def test_requested_mode_processes_when_user_requested(self):
+        pr = self._make_pr(review_requests=[{"login": "myuser"}])
+        assert self._should_process(pr, {}, "myuser", trigger="requested")
+
+    def test_ready_mode_ignores_review_requests(self):
+        pr = self._make_pr(review_requests=[])
+        assert self._should_process(pr, {}, "myuser", trigger="ready")
 
 # ---------------------------------------------------------------------------
 # gh subprocess wrapper
