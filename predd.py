@@ -518,7 +518,7 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
 
 def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
     return _run_proc(
-        ["claude", "-p", "--model", cfg.model, prompt],
+        ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model, prompt],
         worktree,
     )
 
