@@ -377,6 +377,8 @@ def find_local_repo(repo: str) -> Path | None:
         home / "repos" / repo_name,
         home / "projects" / repo_name,
         home / "code" / repo_name,
+        home / "windsurf" / "projects" / repo_name,
+        home / "windsurf" / repo_name,
     ]
     for candidate in candidates:
         if (candidate / ".git").exists():
