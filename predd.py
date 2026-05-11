@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "click",
+# ]
+# ///
+
+import json
+import logging
+import logging.handlers
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+import click
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path("~/.config/predd").expanduser()
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+STATE_FILE = CONFIG_DIR / "state.json"
+PID_FILE = CONFIG_DIR / "pid"
+LOG_FILE = CONFIG_DIR / "log.txt"
+
+DEFAULT_REVIEW_PROMPT = """\
+You are reviewing a pull request. Output a markdown document with this structure:
+
+## Verdict
+One of: APPROVE | COMMENT | REQUEST_CHANGES
+
+## Summary
+2-3 sentences on what this PR does.
+
+## Findings
+Bulleted list. Each finding: severity (blocker/concern/nit), file:line, description.
+Skip anything that's just style preference. Focus on:
+- Correctness bugs
+- Edge cases not handled
+- Missing or weak tests
+- Anything that would page someone at 3am
+- Security issues (auth, injection, secrets, etc.)
+
+## Questions for the author
+Anything ambiguous that needs clarification before merging.
+
+Be direct. No praise sandwich. No ceremony.
+"""
+
+DEFAULT_CONFIG_TEMPLATE = """\
+# Repos to watch. Format: "owner/name"
+repos = [
+  "owner/repo",
+]
+
+# Polling interval in seconds
+poll_interval = 90
+
+# Sound alerts — built-in chimes (no .wav needed), or set a Windows-side .wav path
+sound_new_pr = "new_pr"
+sound_review_ready = "review_ready"
+
+# Where to create git worktrees
+worktree_base = "/home/<you>/pr-reviews"
+
+# GitHub username (PRs authored by this user are skipped)
+github_user = "<your-github-username>"
+
+# Path to the pr-review skill (SKILL.md)
+skill_path = "~/.windsurf/skills/pr-review/SKILL.md"
+
+# Claude Code model for review
+claude_model = "claude-opus-4-7"
+"""
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> logging.Logger:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("predd")
+    logger.setLevel(logging.DEBUG)
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setLevel(logging.INFO)
+    stderr_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(stderr_handler)
+    return logger
+
+
+logger = logging.getLogger("predd")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+class Config:
+    def __init__(self, data: dict):
+        self.repos: list[str] = data["repos"]
+        self.poll_interval: int = data.get("poll_interval", 90)
+        self.sound_new_pr: str = data.get("sound_new_pr", "new_pr")
+        self.sound_review_ready: str = data.get("sound_review_ready", "review_ready")
+        self.worktree_base: Path = Path(data["worktree_base"])
+        self.github_user: str = data["github_user"]
+        self.skill_path: Path = Path(
+            data.get(
+                "skill_path",
+                "~/.windsurf/skills/pr-review/SKILL.md",
+            )
+        ).expanduser()
+        self.claude_model: str = data.get("claude_model", "claude-opus-4-7")
+
+    def to_dict(self) -> dict:
+        return {
+            "repos": self.repos,
+            "poll_interval": self.poll_interval,
+            "sound_new_pr": self.sound_new_pr,
+            "sound_review_ready": self.sound_review_ready,
+            "worktree_base": str(self.worktree_base),
+            "github_user": self.github_user,
+            "skill_path": str(self.skill_path),
+            "claude_model": self.claude_model,
+        }
+
+
+def load_config() -> Config:
+    if not CONFIG_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(DEFAULT_CONFIG_TEMPLATE)
+        review_prompt_path = CONFIG_DIR / "review-prompt.md"
+        review_prompt_path.write_text(DEFAULT_REVIEW_PROMPT)
+        click.echo(f"Created default config at {CONFIG_FILE}")
+        click.echo("Edit it to add your repos and settings, then re-run.")
+        sys.exit(0)
+
+    with open(CONFIG_FILE, "rb") as f:
+        data = tomllib.load(f)
+    return Config(data)
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        logger.warning("Failed to read state file; starting fresh")
+        return {}
+
+
+def save_state(state: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.rename(STATE_FILE)
+
+
+def state_key(repo: str, pr_number: int, head_sha: str) -> str:
+    return f"{repo}#{pr_number}"
+
+
+def update_pr_state(state: dict, key: str, **fields) -> None:
+    if key not in state:
+        state[key] = {}
+    state[key].update(fields)
+    save_state(state)
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+# Two-note chime: mid C then high E — audible but not jarring
+_CHIME_NEW_PR = "[Console]::Beep(523,180); Start-Sleep -Milliseconds 80; [Console]::Beep(659,350)"
+# Three-note ascending chime: C E G — signals something is ready
+_CHIME_REVIEW_READY = "[Console]::Beep(523,150); Start-Sleep -Milliseconds 60; [Console]::Beep(659,150); Start-Sleep -Milliseconds 60; [Console]::Beep(784,400)"
+
+
+def notify_sound(sound_path: str) -> None:
+    # sound_path may be a .wav path or one of the sentinel values "new_pr"/"review_ready"
+    if not sound_path:
+        return
+    if sound_path in ("new_pr", "review_ready"):
+        beep_cmd = _CHIME_NEW_PR if sound_path == "new_pr" else _CHIME_REVIEW_READY
+    else:
+        beep_cmd = f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"
+    try:
+        subprocess.run(
+            ["pwsh.exe", "-NoProfile", "-Command", beep_cmd],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning("Sound notification failed: %s", e)
+
+
+def notify_toast(title: str, body: str) -> None:
+    # Escape single quotes for PowerShell
+    title_esc = title.replace("'", "\\'")
+    body_esc = body.replace("'", "\\'")
+    try:
+        subprocess.run(
+            [
+                "pwsh.exe", "-NoProfile", "-Command",
+                f"New-BurntToastNotification -Text '{title_esc}', '{body_esc}'",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except Exception as e:
+        logger.warning("Toast notification failed: %s", e)
+
+# ---------------------------------------------------------------------------
+# GitHub helpers
+# ---------------------------------------------------------------------------
+
+def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["gh"] + args,
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def gh_list_open_prs(repo: str) -> list[dict]:
+    """Return list of open, non-draft PRs not authored by the current user."""
+    result = gh_run([
+        "pr", "list",
+        "--repo", repo,
+        "--state", "open",
+        "--json", "number,title,author,headRefName,headRefOid,isDraft",
+        "--limit", "100",
+    ])
+    prs = json.loads(result.stdout)
+    return prs
+
+
+def gh_pr_view(repo: str, pr_number: int) -> str:
+    result = gh_run(["pr", "view", str(pr_number), "--repo", repo])
+    return result.stdout
+
+
+def gh_pr_diff(repo: str, pr_number: int) -> str:
+    result = gh_run(["pr", "diff", str(pr_number), "--repo", repo])
+    return result.stdout
+
+
+def gh_pr_review(repo: str, pr_number: int, review_type: str, body_file: Path) -> None:
+    flag_map = {
+        "approve": "--approve",
+        "comment": "--comment",
+        "request-changes": "--request-changes",
+    }
+    flag = flag_map[review_type]
+    gh_run([
+        "pr", "review", str(pr_number),
+        "--repo", repo,
+        flag,
+        "--body-file", str(body_file),
+    ])
+
+# ---------------------------------------------------------------------------
+# Worktree helpers
+# ---------------------------------------------------------------------------
+
+def repo_slug(repo: str) -> str:
+    return repo.replace("/", "-")
+
+
+def worktree_path(cfg: Config, repo: str, pr_number: int, head_sha: str) -> Path:
+    return cfg.worktree_base / f"{repo_slug(repo)}-{pr_number}-{head_sha[:7]}"
+
+
+def find_local_repo(repo: str) -> Path | None:
+    """Try to find a local clone of the repo by checking common locations."""
+    home = Path.home()
+    repo_name = repo.split("/")[1]
+    candidates = [
+        home / repo_name,
+        home / "src" / repo_name,
+        home / "repos" / repo_name,
+        home / "projects" / repo_name,
+        home / "code" / repo_name,
+    ]
+    for candidate in candidates:
+        if (candidate / ".git").exists():
+            try:
+                result = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    capture_output=True, text=True, check=True, cwd=candidate
+                )
+                if repo_name in result.stdout:
+                    return candidate
+            except subprocess.CalledProcessError:
+                pass
+    return None
+
+
+def setup_worktree(cfg: Config, repo: str, pr_number: int, head_sha: str, head_ref: str) -> Path:
+    wt_path = worktree_path(cfg, repo, pr_number, head_sha)
+    cfg.worktree_base.mkdir(parents=True, exist_ok=True)
+
+    local_repo = find_local_repo(repo)
+    if local_repo:
+        # Fetch the PR branch then add worktree
+        subprocess.run(
+            ["git", "fetch", "origin", head_ref],
+            cwd=local_repo, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", str(wt_path), f"origin/{head_ref}"],
+            cwd=local_repo, check=True, capture_output=True,
+        )
+    else:
+        # Fall back: use gh pr checkout in a temp dir, then move
+        tmp_dir = cfg.worktree_base / f"_tmp-{repo_slug(repo)}-{pr_number}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["gh", "repo", "clone", repo, str(tmp_dir)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["gh", "pr", "checkout", str(pr_number)],
+            cwd=tmp_dir, check=True, capture_output=True,
+        )
+        tmp_dir.rename(wt_path)
+
+    return wt_path
+
+
+def remove_worktree(worktree: str | Path) -> None:
+    wt = Path(worktree)
+    # Find the git dir to run worktree remove from
+    try:
+        # Walk up to find parent repo
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=wt, capture_output=True, text=True, check=True,
+        )
+        git_common = Path(result.stdout.strip())
+        repo_root = git_common.parent if git_common.name == ".git" else git_common.parent.parent
+        subprocess.run(
+            ["git", "worktree", "remove", str(wt), "--force"],
+            cwd=repo_root, check=True, capture_output=True,
+        )
+    except Exception:
+        # If we can't use git worktree remove, just delete the directory
+        import shutil
+        shutil.rmtree(wt, ignore_errors=True)
+
+# ---------------------------------------------------------------------------
+# Review pipeline
+# ---------------------------------------------------------------------------
+
+def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
+    """Run the pr-review skill via `claude -p`, return the terminal summary output."""
+    skill_md = cfg.skill_path
+    if not skill_md.exists():
+        raise FileNotFoundError(f"Skill not found: {skill_md}")
+
+    skill_content = skill_md.read_text()
+    prompt = skill_content.replace("$ARGUMENTS", str(pr_number))
+
+    result = subprocess.run(
+        ["claude", "-p", "--model", cfg.claude_model, prompt],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=str(worktree),
+        timeout=600,
+    )
+    return result.stdout
+
+# ---------------------------------------------------------------------------
+# PR processing
+# ---------------------------------------------------------------------------
+
+def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
+    pr_number = pr["number"]
+    head_sha = pr["headRefOid"]
+    head_ref = pr["headRefName"]
+    title = pr["title"]
+    key = f"{repo}#{pr_number}"
+
+    logger.info("Processing %s: %s", key, title)
+    update_pr_state(state, key, head_sha=head_sha, status="reviewing",
+                    first_seen=_now_iso())
+
+    try:
+        notify_sound(cfg.sound_new_pr)
+        notify_toast("New PR", f"{key} — {title}")
+
+        worktree = setup_worktree(cfg, repo, pr_number, head_sha, head_ref)
+        logger.info("Worktree at %s", worktree)
+
+        review_text = run_review(cfg, repo, pr_number, worktree)
+
+        # Skill posts directly to GitHub; save output for reference
+        summary_path = worktree / "review-summary.md"
+        summary_path.write_text(review_text)
+
+        update_pr_state(state, key,
+                        status="submitted",
+                        worktree=str(worktree),
+                        draft_path=str(summary_path),
+                        review_completed=_now_iso())
+
+        notify_sound(cfg.sound_review_ready)
+        notify_toast("Review posted", f"{key} — run `predd show {pr_number}`")
+        logger.info("Review posted for %s", key)
+
+    except Exception as e:
+        logger.error("Failed processing %s: %s", key, e, exc_info=True)
+        update_pr_state(state, key, status="failed")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# ---------------------------------------------------------------------------
+# PID management
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def acquire_pid_file() -> None:
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            if _pid_alive(pid):
+                click.echo(f"predd already running (PID {pid}). Exiting.", err=True)
+                sys.exit(1)
+        except ValueError:
+            pass
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def release_pid_file() -> None:
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# PR key parsing
+# ---------------------------------------------------------------------------
+
+def parse_pr_arg(pr_arg: str) -> tuple[str | None, int]:
+    """Parse 'owner/repo#123' or '123'. Returns (repo_or_None, pr_number)."""
+    m = re.match(r"^([^#]+)#(\d+)$", pr_arg)
+    if m:
+        return m.group(1), int(m.group(2))
+    try:
+        return None, int(pr_arg)
+    except ValueError:
+        raise click.BadParameter(f"Cannot parse PR '{pr_arg}'. Use 'owner/repo#123' or '123'.")
+
+
+def resolve_pr_key(state: dict, pr_arg: str, cfg: Config | None = None) -> tuple[str, int, dict]:
+    """Return (repo, pr_number, entry) from state."""
+    repo_hint, pr_number = parse_pr_arg(pr_arg)
+
+    # Search state for matching entry
+    matches = []
+    for key, entry in state.items():
+        m = re.match(r"^(.+)#(\d+)$", key)
+        if not m:
+            continue
+        repo, num = m.group(1), int(m.group(2))
+        if num != pr_number:
+            continue
+        if repo_hint and repo != repo_hint:
+            continue
+        matches.append((repo, num, entry))
+
+    if not matches:
+        raise click.ClickException(f"PR {pr_arg} not found in state.")
+    if len(matches) > 1:
+        keys = [f"{r}#{n}" for r, n, _ in matches]
+        raise click.ClickException(
+            f"Ambiguous PR number {pr_number}. Specify repo: {', '.join(keys)}"
+        )
+    return matches[0]
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+@click.group()
+def cli():
+    """predd: daemon that drafts PR reviews for human approval."""
+    pass
+
+
+@cli.command()
+@click.option("--once", is_flag=True, help="Run a single poll iteration then exit.")
+def start(once: bool):
+    """Run the polling daemon."""
+    setup_logging()
+    cfg = load_config()
+    cfg.worktree_base.mkdir(parents=True, exist_ok=True)
+
+    if not once:
+        acquire_pid_file()
+
+    def _shutdown(signum, frame):
+        logger.info("Shutting down (signal %d)", signum)
+        release_pid_file()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    logger.info("predd started (once=%s)", once)
+
+    try:
+        while True:
+            state = load_state()
+            for repo in cfg.repos:
+                try:
+                    prs = gh_list_open_prs(repo)
+                except Exception as e:
+                    logger.error("Failed to list PRs for %s: %s", repo, e)
+                    continue
+
+                for pr in prs:
+                    if pr["author"]["login"] == cfg.github_user:
+                        continue
+                    if pr["isDraft"]:
+                        continue
+
+                    pr_number = pr["number"]
+                    head_sha = pr["headRefOid"]
+                    key = f"{repo}#{pr_number}"
+
+                    entry = state.get(key, {})
+                    entry_sha = entry.get("head_sha", "")
+                    entry_status = entry.get("status", "")
+
+                    # Skip if same sha and terminal/in-progress status
+                    if entry_sha == head_sha and entry_status in (
+                        "submitted", "rejected", "awaiting_approval", "reviewing"
+                    ):
+                        continue
+
+                    process_pr(cfg, state, repo, pr)
+
+            if once:
+                break
+            time.sleep(cfg.poll_interval)
+    finally:
+        if not once:
+            release_pid_file()
+
+
+@cli.command(name="list")
+def list_cmd():
+    """Print pending reviews as JSON."""
+    state = load_state()
+    pending = {k: v for k, v in state.items() if v.get("status") == "awaiting_approval"}
+    click.echo(json.dumps(pending, indent=2))
+
+
+@cli.command()
+@click.argument("pr")
+def show(pr: str):
+    """Print the draft review for a PR."""
+    state = load_state()
+    repo, pr_number, entry = resolve_pr_key(state, pr)
+    draft_path = entry.get("draft_path")
+    if not draft_path or not Path(draft_path).exists():
+        raise click.ClickException("Draft not found. Has the review completed?")
+    click.echo(Path(draft_path).read_text())
+
+
+def _submit_review(pr_arg: str, review_type: str) -> None:
+    state = load_state()
+    repo, pr_number, entry = resolve_pr_key(state, pr_arg)
+    key = f"{repo}#{pr_number}"
+
+    if entry.get("status") != "awaiting_approval":
+        raise click.ClickException(
+            f"PR is in status '{entry.get('status')}', not awaiting_approval."
+        )
+
+    draft_path = Path(entry["draft_path"])
+    if not draft_path.exists():
+        raise click.ClickException(f"Draft file not found: {draft_path}")
+
+    # Extract body: everything after the first ## heading (skip Verdict line area)
+    draft_text = draft_path.read_text()
+    # Use from ## Summary onward as the review body
+    m = re.search(r"(## Summary.*)", draft_text, re.DOTALL)
+    body_text = m.group(1) if m else draft_text
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(body_text)
+        body_file = Path(f.name)
+
+    try:
+        gh_pr_review(repo, pr_number, review_type, body_file)
+    finally:
+        body_file.unlink(missing_ok=True)
+
+    state[key]["status"] = "submitted"
+    save_state(state)
+
+    worktree = entry.get("worktree")
+    if worktree:
+        try:
+            remove_worktree(worktree)
+        except Exception as e:
+            logger.warning("Failed to remove worktree %s: %s", worktree, e)
+
+    click.echo("Submitted.")
+
+
+@cli.command()
+@click.argument("pr")
+def approve(pr: str):
+    """Submit draft as approval."""
+    _submit_review(pr, "approve")
+
+
+@cli.command()
+@click.argument("pr")
+def comment(pr: str):
+    """Submit draft as comment-only."""
+    _submit_review(pr, "comment")
+
+
+@cli.command(name="request-changes")
+@click.argument("pr")
+def request_changes(pr: str):
+    """Submit draft as request-changes."""
+    _submit_review(pr, "request-changes")
+
+
+@cli.command()
+@click.argument("pr")
+def reject(pr: str):
+    """Discard draft and mark PR as reviewed without submitting."""
+    state = load_state()
+    repo, pr_number, entry = resolve_pr_key(state, pr)
+    key = f"{repo}#{pr_number}"
+
+    state[key]["status"] = "rejected"
+    save_state(state)
+
+    worktree = entry.get("worktree")
+    if worktree:
+        try:
+            remove_worktree(worktree)
+        except Exception as e:
+            logger.warning("Failed to remove worktree %s: %s", worktree, e)
+
+    click.echo("Discarded.")
+
+
+@cli.command(name="config")
+def config_cmd():
+    """Print resolved config."""
+    cfg = load_config()
+    # Print as TOML-ish key = value
+    d = cfg.to_dict()
+    lines = []
+    for k, v in d.items():
+        if isinstance(v, list):
+            items = ", ".join(f'"{x}"' for x in v)
+            lines.append(f"{k} = [{items}]")
+        elif isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        else:
+            lines.append(f"{k} = {v}")
+    click.echo("\n".join(lines))
+
+
+if __name__ == "__main__":
+    cli()
