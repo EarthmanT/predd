@@ -449,8 +449,13 @@ def setup_new_branch_worktree(
     local_repo = find_local_repo(repo)
     if local_repo:
         subprocess.run(
-            ["git", "fetch", "origin", base_branch],
+            ["git", "fetch", "origin"],
             cwd=local_repo, check=True, capture_output=True,
+        )
+        # Delete local branch if it exists from a previous run
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            cwd=local_repo, capture_output=True,
         )
         subprocess.run(
             ["git", "worktree", "add", "-b", branch, str(wt_path), f"origin/{base_branch}"],
