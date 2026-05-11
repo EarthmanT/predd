@@ -28,7 +28,7 @@ import click
 # ---------------------------------------------------------------------------
 
 _predd_spec = importlib.util.spec_from_file_location(
-    "predd", Path(__file__).parent / "predd.py"
+    "predd", Path(__file__).resolve().parent / "predd.py"
 )
 _predd = importlib.util.module_from_spec(_predd_spec)
 _predd_spec.loader.exec_module(_predd)
@@ -230,11 +230,21 @@ def gh_create_branch_and_pr(
     """Create branch, push it, create PR. Returns PR number."""
     cwd = str(worktree) if worktree else None
 
-    # Create and push branch
-    subprocess.run(
-        ["git", "checkout", "-b", branch],
-        check=True, capture_output=True, cwd=cwd,
+    # Create branch if it doesn't already exist
+    existing = subprocess.run(
+        ["git", "rev-parse", "--verify", branch],
+        capture_output=True, cwd=cwd,
     )
+    if existing.returncode != 0:
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            check=True, capture_output=True, cwd=cwd,
+        )
+    else:
+        subprocess.run(
+            ["git", "checkout", branch],
+            check=True, capture_output=True, cwd=cwd,
+        )
     subprocess.run(
         ["git", "push", "-u", "origin", branch],
         check=True, capture_output=True, cwd=cwd,
