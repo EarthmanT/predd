@@ -230,21 +230,23 @@ def gh_create_branch_and_pr(
     """Create branch, push it, create PR. Returns PR number."""
     cwd = str(worktree) if worktree else None
 
-    # Create branch if it doesn't already exist
-    existing = subprocess.run(
-        ["git", "rev-parse", "--verify", branch],
-        capture_output=True, cwd=cwd,
+    # Check current branch; if already on target branch, nothing to do
+    current = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True, cwd=cwd,
     )
-    if existing.returncode != 0:
-        subprocess.run(
-            ["git", "checkout", "-b", branch],
-            check=True, capture_output=True, cwd=cwd,
-        )
-    else:
-        subprocess.run(
+    current_branch = current.stdout.strip()
+    if current_branch != branch:
+        # Try to checkout existing branch, or create it
+        co = subprocess.run(
             ["git", "checkout", branch],
-            check=True, capture_output=True, cwd=cwd,
+            capture_output=True, cwd=cwd,
         )
+        if co.returncode != 0:
+            subprocess.run(
+                ["git", "checkout", "-b", branch],
+                check=True, capture_output=True, cwd=cwd,
+            )
     # Create an empty commit to ensure the branch diverges from base (required for PR creation)
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "chore: open branch"],
