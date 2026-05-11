@@ -245,17 +245,11 @@ def gh_create_branch_and_pr(
             ["git", "checkout", branch],
             check=True, capture_output=True, cwd=cwd,
         )
-    # Ensure there's at least one commit on the branch before pushing
-    ahead = subprocess.run(
-        ["git", "rev-list", "--count", f"origin/{base}..HEAD"],
-        capture_output=True, text=True, cwd=cwd,
+    # Create an empty commit to ensure the branch diverges from base (required for PR creation)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "chore: open branch"],
+        check=True, capture_output=True, cwd=cwd,
     )
-    if ahead.returncode != 0 or int(ahead.stdout.strip() or "0") == 0:
-        # No commits ahead — create an empty commit so the branch can be pushed
-        subprocess.run(
-            ["git", "commit", "--allow-empty", "-m", f"chore: open proposal branch for issue"],
-            check=True, capture_output=True, cwd=cwd,
-        )
     subprocess.run(
         ["git", "push", "-u", "origin", branch],
         check=True, capture_output=True, cwd=cwd,
