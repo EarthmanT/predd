@@ -452,7 +452,11 @@ def setup_new_branch_worktree(
             ["git", "fetch", "origin"],
             cwd=local_repo, check=True, capture_output=True,
         )
-        # Prune stale worktree refs then delete local branch if it exists from a previous run
+        # Remove existing worktree and branch if they exist from a previous run
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt_path)],
+            cwd=local_repo, capture_output=True,
+        )
         subprocess.run(["git", "worktree", "prune"], cwd=local_repo, capture_output=True)
         subprocess.run(["git", "branch", "-D", branch], cwd=local_repo, capture_output=True)
         subprocess.run(
