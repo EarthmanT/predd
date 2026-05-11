@@ -1144,6 +1144,43 @@ class TestShutdown:
 
 
 # ---------------------------------------------------------------------------
+# TestBuildIssueContext
+# ---------------------------------------------------------------------------
+
+class TestBuildIssueContext:
+    def test_basic_output(self):
+        result = h.build_issue_context(42, "Fix the bug", "Some description", {})
+        assert "Issue #42: Fix the bug" in result
+        assert "Description:" in result
+        assert "Some description" in result
+
+    def test_includes_optional_fields(self):
+        entry = {"type": "Story", "epic": "DAP09A-100", "sprint": "Sprint-10", "capability": "99 auth"}
+        result = h.build_issue_context(1, "Title", "Body", entry)
+        assert "Type: Story" in result
+        assert "Epic: DAP09A-100" in result
+        assert "Sprint: Sprint-10" in result
+        assert "Capability: 99 auth" in result
+
+    def test_omits_missing_fields(self):
+        result = h.build_issue_context(1, "Title", "Body", {"type": "Story"})
+        assert "Epic" not in result
+        assert "Sprint" not in result
+
+    def test_fallback_when_no_body(self):
+        result = h.build_issue_context(1, "Title", "", {})
+        assert "(no description)" in result
+
+    def test_arguments_substitution_compatible(self):
+        # Verify $ARGUMENTS replacement works with multi-line context
+        context = h.build_issue_context(1, "Title", "Body", {})
+        skill = "Review this: $ARGUMENTS. Done."
+        result = skill.replace("$ARGUMENTS", context)
+        assert "Issue #1: Title" in result
+        assert "$ARGUMENTS" not in result
+
+
+# ---------------------------------------------------------------------------
 # TestSkillHasCommits
 # ---------------------------------------------------------------------------
 

@@ -394,6 +394,17 @@ def _run_devin_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path)
     )
 
 
+def build_issue_context(issue_number: int, title: str, body: str, entry: dict) -> str:
+    """Build a rich context string to pass as $ARGUMENTS to proposal/impl skills."""
+    lines = [f"Issue #{issue_number}: {title}", ""]
+    for field in ("type", "epic", "sprint", "capability"):
+        val = entry.get(field)
+        if val:
+            lines.append(f"{field.capitalize()}: {val}")
+    lines += ["", "Description:", body or "(no description)"]
+    return "\n".join(lines)
+
+
 def skill_has_commits(worktree: Path) -> bool:
     """Return True if the worktree has new commits or uncommitted changes since branch base."""
     # Check for uncommitted changes (staged or unstaged)
@@ -487,11 +498,14 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     branch = proposal_branch(cfg, issue_number, title)
     worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
 
+    issue_body = issue.get("body") or ""
+
     update_issue_state(state, key,
                        status="in_progress",
                        issue_number=issue_number,
                        repo=repo,
                        title=title,
+                       issue_body=issue_body,
                        issue_author=issue.get("author", {}).get("login", ""),
                        base_branch=base_branch,
                        proposal_branch=branch,
@@ -506,7 +520,12 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         worktree = setup_new_branch_worktree(cfg, repo, branch, base_branch)
         logger.info("Proposal worktree at %s", worktree)
 
-        run_skill(cfg, cfg.proposal_skill_path, str(issue_number), worktree)
+        context = build_issue_context(
+            issue_number, title,
+            state.get(key, {}).get("issue_body", ""),
+            state.get(key, {}),
+        )
+        run_skill(cfg, cfg.proposal_skill_path, context, worktree)
 
         if not skill_has_commits(worktree):
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
@@ -566,7 +585,12 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         worktree = setup_new_branch_worktree(cfg, repo, branch, base_branch)
         logger.info("Impl worktree at %s", worktree)
 
-        run_skill(cfg, cfg.impl_skill_path, str(issue_number), worktree)
+        context = build_issue_context(
+            issue_number, title,
+            entry.get("issue_body", ""),
+            entry,
+        )
+        run_skill(cfg, cfg.impl_skill_path, context, worktree)
 
         if not skill_has_commits(worktree):
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
