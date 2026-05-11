@@ -2,11 +2,11 @@
 
 ## Problem
 
-When hunter creates GitHub issues from Jira stories, there's no structured metadata linking back to Jira. Reviewers can't quickly see the Jira ID, type, epic, sprint, or capability without clicking through.
+When hunter creates proposal and implementation PRs for assigned GitHub issues, there's no structured metadata linking back to Jira. Reviewers can't quickly see the Jira ID, type, epic, sprint, or capability without clicking through.
 
 ## Proposed Behaviour
 
-When hunter creates a GitHub issue, it adds a frontmatter block at the top of the issue body:
+When hunter creates a proposal or implementation PR, it adds a frontmatter block at the top of the PR body:
 
 ```markdown
 | Field | Value |
@@ -80,14 +80,10 @@ require_jira_conformance = true
 
 ## Implementation Notes
 
-- Hunter already fetches the GitHub issue via `gh issue view`. Jira data requires a separate `GET /rest/api/2/issue/{key}` call using the Jira REST API.
-- Jira auth: personal access token stored as `JIRA_TOKEN` env var. Basic auth header: `Authorization: Bearer {token}`.
-- Sprint field: Jira returns sprint as an array in `customfield_10020` (or similar). Hunter takes the last entry's `name`.
-- Epic field: may be in `customfield_10014` (epic link key) or `parent` depending on Jira config. Hunter tries both.
-- The Jira issue key is expected to already be in the GitHub issue title (e.g. `[DAP09A-1184]`). Hunter parses it with regex `\[([A-Z]+-\d+)\]`.
+- Hunter parses the Jira key from the GH issue title with regex `\[([A-Z]+-\d+)\]`.
+- Jira data fetched via `GET /rest/api/2/issue/{key}` using the Jira REST API.
+- Jira auth: personal access token stored as `JIRA_TOKEN` env var. Header: `Authorization: Bearer {token}`.
+- Sprint field: returned in `customfield_10020` (or similar) as an array. Hunter takes the last entry's `name`. Field ID discovered at runtime via `/rest/api/2/issue/{key}?expand=names` and cached.
+- Epic field: may be `customfield_10014` (epic link key) or `parent.key` depending on Jira config. Hunter tries both.
+- Frontmatter is prepended to the PR body in `gh_create_branch_and_pr` — hunter builds the body string before calling it.
 - Add `jira_base_url` and `require_jira_conformance` to `Config`.
-
-## Open Questions
-
-- What's the Jira custom field ID for sprint in this instance? (Can discover at runtime via `/rest/api/2/issue/{key}?expand=names`)
-- What's the Jira custom field ID for epic link?
