@@ -442,10 +442,11 @@ def _make_cfg(tmp_path: Path, backend: str, model: str = "haiku-4-5") -> pw.Conf
 def _fake_run_proc(output=""):
     """Patch target for _run_proc — captures cmd and worktree."""
     captured = {}
-    def _inner(cmd, worktree, env=None):
+    def _inner(cmd, worktree, env=None, stdin_text=None):
         captured["cmd"] = cmd
         captured["worktree"] = worktree
         captured["env"] = env
+        captured["stdin_text"] = stdin_text
         return output
     return _inner, captured
 
@@ -466,6 +467,7 @@ class TestClaudeDriver:
         assert "-p" in cap["cmd"]
         assert "--model" in cap["cmd"]
         assert "claude-opus-4-7" in cap["cmd"]
+        assert cap["stdin_text"] == "Review PR 42 please."
         assert result == "LGTM"
 
     def test_runs_in_worktree(self, tmp_path):
