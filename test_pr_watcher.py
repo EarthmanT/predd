@@ -51,12 +51,27 @@ class TestConfigLoading:
         assert cfg.poll_interval == 90  # default
 
     def test_load_full_config(self, tmp_path, monkeypatch):
-        content = MINIMAL_CONFIG + 'poll_interval = 120\nclaude_model = "claude-haiku-4-5"\n'
+        content = MINIMAL_CONFIG + 'poll_interval = 120\nbackend = "claude"\nmodel = "claude-haiku-4-5"\n'
         cfg_file = _write_config(tmp_path, content)
         monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
         cfg = pw.load_config()
         assert cfg.poll_interval == 120
-        assert cfg.claude_model == "claude-haiku-4-5"
+        assert cfg.backend == "claude"
+        assert cfg.model == "claude-haiku-4-5"
+
+    def test_legacy_claude_model_key(self, tmp_path, monkeypatch):
+        content = MINIMAL_CONFIG + 'claude_model = "claude-opus-4-7"\n'
+        cfg_file = _write_config(tmp_path, content)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        cfg = pw.load_config()
+        assert cfg.model == "claude-opus-4-7"
+
+    def test_default_backend_is_devin(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(tmp_path, MINIMAL_CONFIG)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        cfg = pw.load_config()
+        assert cfg.backend == "devin"
+        assert cfg.model == "haiku-4-5"
 
     def test_missing_config_writes_template_and_exits(self, tmp_path, monkeypatch):
         missing = tmp_path / "nonexistent" / "config.toml"
@@ -270,7 +285,7 @@ class TestNotifyFunctions:
     """Ensure notify_sound and notify_toast are standalone functions (mockable)."""
 
     def test_notify_sound_calls_pwsh(self):
-        with patch("subprocess.run") as mock_run:
+        with patch.object(pw, "_PWSH", "pwsh.exe"), patch("subprocess.run") as mock_run:
             pw.notify_sound("C:\\sounds\\ping.wav")
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
@@ -278,7 +293,7 @@ class TestNotifyFunctions:
         assert "SoundPlayer" in " ".join(args)
 
     def test_notify_toast_calls_pwsh(self):
-        with patch("subprocess.run") as mock_run:
+        with patch.object(pw, "_PWSH", "pwsh.exe"), patch("subprocess.run") as mock_run:
             pw.notify_toast("Title", "Body text")
         mock_run.assert_called_once()
         args = mock_run.call_args[0][0]
@@ -286,13 +301,19 @@ class TestNotifyFunctions:
         assert "BurntToast" in " ".join(args)
 
     def test_notify_sound_empty_path_skips(self):
-        with patch("subprocess.run") as mock_run:
+        with patch.object(pw, "_PWSH", "pwsh.exe"), patch("subprocess.run") as mock_run:
             pw.notify_sound("")
         mock_run.assert_not_called()
 
+    def test_notify_skips_when_pwsh_not_found(self):
+        with patch.object(pw, "_PWSH", None), patch("subprocess.run") as mock_run:
+            pw.notify_sound("C:\\sounds\\ping.wav")
+            pw.notify_toast("Title", "Body")
+        mock_run.assert_not_called()
+
     def test_notify_failures_do_not_raise(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError("pwsh.exe not found")):
-            # Should not raise
+        with patch.object(pw, "_PWSH", "pwsh.exe"), \
+             patch("subprocess.run", side_effect=Exception("boom")):
             pw.notify_sound("C:\\sounds\\ping.wav")
             pw.notify_toast("Title", "Body")
 
@@ -352,3 +373,173 @@ class TestResolvePrKey:
         }
         with pytest.raises(click.ClickException):
             pw.resolve_pr_key(state, "5")
+
+# ---------------------------------------------------------------------------
+# Backend drivers
+# ---------------------------------------------------------------------------
+
+def _make_cfg(tmp_path: Path, backend: str, model: str = "haiku-4-5") -> pw.Config:
+    return pw.Config({
+        "repos": ["owner/repo"],
+        "worktree_base": str(tmp_path / "worktrees"),
+        "github_user": "testuser",
+        "backend": backend,
+        "model": model,
+        "skill_path": str(tmp_path / "SKILL.md"),
+    })
+
+
+def _fake_run_proc(output=""):
+    """Patch target for _run_proc — captures cmd and worktree."""
+    captured = {}
+    def _inner(cmd, worktree, env=None):
+        captured["cmd"] = cmd
+        captured["worktree"] = worktree
+        captured["env"] = env
+        return output
+    return _inner, captured
+
+
+class TestClaudeDriver:
+    def test_invokes_claude_p(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS please.")
+        cfg = _make_cfg(tmp_path, "claude", "claude-opus-4-7")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fn, cap = _fake_run_proc("LGTM")
+        with patch.object(pw, "_run_proc", side_effect=fn):
+            result = pw._run_claude(cfg, "Review PR 42 please.", worktree)
+
+        assert cap["cmd"][0] == "claude"
+        assert "-p" in cap["cmd"]
+        assert "--model" in cap["cmd"]
+        assert "claude-opus-4-7" in cap["cmd"]
+        assert result == "LGTM"
+
+    def test_runs_in_worktree(self, tmp_path):
+        cfg = _make_cfg(tmp_path, "claude")
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        fn, cap = _fake_run_proc()
+        with patch.object(pw, "_run_proc", side_effect=fn):
+            pw._run_claude(cfg, "prompt", worktree)
+        assert cap["worktree"] == worktree
+
+
+class TestDevinDriver:
+    def test_invokes_setsid_devin(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS please.")
+        cfg = _make_cfg(tmp_path, "devin", "haiku-4-5")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fn, cap = _fake_run_proc("Review posted.")
+        with patch.object(pw, "_run_proc", side_effect=fn):
+            result = pw._run_devin(cfg, "Review PR 42 please.", worktree)
+
+        assert cap["cmd"][0] == "setsid"
+        assert cap["cmd"][1] == "devin"
+        assert "-p" in cap["cmd"]
+        assert "--permission-mode" in cap["cmd"]
+        assert "auto" in cap["cmd"]
+        assert "--model" in cap["cmd"]
+        assert "haiku-4-5" in cap["cmd"]
+        assert "--" in cap["cmd"]
+        assert result == "Review posted."
+
+    def test_strips_claude_env_vars(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("prompt")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fn, cap = _fake_run_proc()
+        with patch.dict(os.environ, {
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "HOME": "/home/testuser",
+        }):
+            with patch.object(pw, "_run_proc", side_effect=fn):
+                pw._run_devin(cfg, "prompt", worktree)
+
+        assert "CLAUDECODE" not in cap["env"]
+        assert "CLAUDE_CODE_ENTRYPOINT" not in cap["env"]
+        assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in cap["env"]
+        assert "HOME" in cap["env"]
+
+    def test_places_skill_in_devin_skills_dir(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("the skill content")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fn, _ = _fake_run_proc()
+        with patch.object(pw, "_run_proc", side_effect=fn):
+            pw._run_devin(cfg, "prompt", worktree)
+
+        placed = worktree / ".devin" / "skills" / "pr-review.md"
+        assert placed.exists()
+        assert placed.read_text() == "the skill content"
+
+    def test_runs_in_worktree(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("prompt")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        fn, cap = _fake_run_proc()
+        with patch.object(pw, "_run_proc", side_effect=fn):
+            pw._run_devin(cfg, "prompt", worktree)
+        assert cap["worktree"] == worktree
+
+
+class TestRunReviewDispatch:
+    def test_dispatches_to_devin(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        with patch.object(pw, "_run_devin", return_value="ok") as mock_devin:
+            pw.run_review(cfg, "owner/repo", 42, worktree)
+        mock_devin.assert_called_once()
+
+    def test_dispatches_to_claude(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS")
+        cfg = _make_cfg(tmp_path, "claude")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        with patch.object(pw, "_run_claude", return_value="ok") as mock_claude:
+            pw.run_review(cfg, "owner/repo", 42, worktree)
+        mock_claude.assert_called_once()
+
+    def test_unknown_backend_raises(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("prompt")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        cfg.backend = "gpt-banana"
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        with pytest.raises(ValueError, match="Unknown backend"):
+            pw.run_review(cfg, "owner/repo", 42, worktree)
+
+    def test_arguments_substituted_in_prompt(self, tmp_path):
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS now.")
+        cfg = _make_cfg(tmp_path, "devin")
+        cfg.skill_path = skill
+        worktree = tmp_path / "wt"; worktree.mkdir()
+        captured = {}
+        def fake_devin(cfg, prompt, wt):
+            captured["prompt"] = prompt
+            return ""
+        with patch.object(pw, "_run_devin", side_effect=fake_devin):
+            pw.run_review(cfg, "owner/repo", 99, worktree)
+        assert "99" in captured["prompt"]
+        assert "$ARGUMENTS" not in captured["prompt"]

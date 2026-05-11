@@ -1,3 +1,4 @@
 ~/.config/predd/
 __pycache__/
 *.pyc
+.aider*
