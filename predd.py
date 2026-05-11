@@ -12,10 +12,12 @@ import logging.handlers
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from datetime import datetime, timezone
@@ -79,8 +81,13 @@ github_user = "<your-github-username>"
 # Path to the pr-review skill (SKILL.md)
 skill_path = "~/.windsurf/skills/pr-review/SKILL.md"
 
-# Claude Code model for review
-claude_model = "claude-opus-4-7"
+# Backend to use for reviews: "devin" or "claude"
+backend = "devin"
+
+# Model passed to the backend
+# devin default: haiku-4-5
+# claude default: claude-opus-4-7
+model = "haiku-4-5"
 """
 
 # ---------------------------------------------------------------------------
@@ -123,7 +130,11 @@ class Config:
                 "~/.windsurf/skills/pr-review/SKILL.md",
             )
         ).expanduser()
-        self.claude_model: str = data.get("claude_model", "claude-opus-4-7")
+        self.backend: str = data.get("backend", "devin")
+        # model: per-backend default; claude_model is accepted as legacy alias
+        self.model: str = data.get("model") or data.get("claude_model") or (
+            "haiku-4-5" if data.get("backend", "devin") == "devin" else "claude-opus-4-7"
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -134,7 +145,8 @@ class Config:
             "worktree_base": str(self.worktree_base),
             "github_user": self.github_user,
             "skill_path": str(self.skill_path),
-            "claude_model": self.claude_model,
+            "backend": self.backend,
+            "model": self.model,
         }
 
 
@@ -193,9 +205,11 @@ _CHIME_NEW_PR = "[Console]::Beep(523,180); Start-Sleep -Milliseconds 80; [Consol
 _CHIME_REVIEW_READY = "[Console]::Beep(523,150); Start-Sleep -Milliseconds 60; [Console]::Beep(659,150); Start-Sleep -Milliseconds 60; [Console]::Beep(784,400)"
 
 
+_PWSH = shutil.which("pwsh.exe")
+
+
 def notify_sound(sound_path: str) -> None:
-    # sound_path may be a .wav path or one of the sentinel values "new_pr"/"review_ready"
-    if not sound_path:
+    if not sound_path or not _PWSH:
         return
     if sound_path in ("new_pr", "review_ready"):
         beep_cmd = _CHIME_NEW_PR if sound_path == "new_pr" else _CHIME_REVIEW_READY
@@ -203,31 +217,26 @@ def notify_sound(sound_path: str) -> None:
         beep_cmd = f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"
     try:
         subprocess.run(
-            ["pwsh.exe", "-NoProfile", "-Command", beep_cmd],
-            check=False,
-            capture_output=True,
-            timeout=10,
+            [_PWSH, "-NoProfile", "-Command", beep_cmd],
+            check=False, capture_output=True, timeout=10,
         )
-    except Exception as e:
-        logger.warning("Sound notification failed: %s", e)
+    except Exception:
+        pass
 
 
 def notify_toast(title: str, body: str) -> None:
-    # Escape single quotes for PowerShell
+    if not _PWSH:
+        return
     title_esc = title.replace("'", "\\'")
     body_esc = body.replace("'", "\\'")
     try:
         subprocess.run(
-            [
-                "pwsh.exe", "-NoProfile", "-Command",
-                f"New-BurntToastNotification -Text '{title_esc}', '{body_esc}'",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=15,
+            [_PWSH, "-NoProfile", "-Command",
+             f"New-BurntToastNotification -Text '{title_esc}', '{body_esc}'"],
+            check=False, capture_output=True, timeout=15,
         )
-    except Exception as e:
-        logger.warning("Toast notification failed: %s", e)
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # GitHub helpers
@@ -334,7 +343,12 @@ def setup_worktree(cfg: Config, repo: str, pr_number: int, head_sha: str, head_r
     else:
         # Fall back: use gh pr checkout in a temp dir, then move
         tmp_dir = cfg.worktree_base / f"_tmp-{repo_slug(repo)}-{pr_number}"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        # Clean up any leftover tmp or target dirs from previous killed runs
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        if wt_path.exists():
+            shutil.rmtree(wt_path)
+        tmp_dir.mkdir(parents=True)
         subprocess.run(
             ["gh", "repo", "clone", repo, str(tmp_dir)],
             check=True, capture_output=True,
@@ -372,24 +386,71 @@ def remove_worktree(worktree: str | Path) -> None:
 # Review pipeline
 # ---------------------------------------------------------------------------
 
-def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
-    """Run the pr-review skill via `claude -p`, return the terminal summary output."""
-    skill_md = cfg.skill_path
-    if not skill_md.exists():
-        raise FileNotFoundError(f"Skill not found: {skill_md}")
+_DEVIN_STRIP_ENV = {
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+}
 
-    skill_content = skill_md.read_text()
-    prompt = skill_content.replace("$ARGUMENTS", str(pr_number))
 
-    result = subprocess.run(
-        ["claude", "-p", "--model", cfg.claude_model, prompt],
-        capture_output=True,
+def _load_skill(cfg: Config, pr_number: int) -> str:
+    if not cfg.skill_path.exists():
+        raise FileNotFoundError(f"Skill not found: {cfg.skill_path}")
+    return cfg.skill_path.read_text().replace("$ARGUMENTS", str(pr_number))
+
+
+# Active subprocess handle — set while a review is running so the shutdown
+# handler can terminate it on a second signal.
+_active_proc: subprocess.Popen | None = None
+
+
+def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
+    global _active_proc
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=True,
         cwd=str(worktree),
-        timeout=600,
+        env=env,
     )
-    return result.stdout
+    _active_proc = proc
+    try:
+        stdout, _ = proc.communicate(timeout=900)
+    finally:
+        _active_proc = None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    return stdout
+
+
+def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
+    return _run_proc(
+        ["claude", "-p", "--model", cfg.model, prompt],
+        worktree,
+    )
+
+
+def _run_devin(cfg: Config, prompt: str, worktree: Path) -> str:
+    skill_dir = worktree / ".devin" / "skills"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "pr-review.md").write_text(cfg.skill_path.read_text())
+    env = {k: v for k, v in os.environ.items() if k not in _DEVIN_STRIP_ENV}
+    return _run_proc(
+        ["setsid", "devin", "-p", "--permission-mode", "auto",
+         "--model", cfg.model, "--", prompt],
+        worktree,
+        env=env,
+    )
+
+
+def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
+    prompt = _load_skill(cfg, pr_number)
+    if cfg.backend == "claude":
+        return _run_claude(cfg, prompt, worktree)
+    if cfg.backend == "devin":
+        return _run_devin(cfg, prompt, worktree)
+    raise ValueError(f"Unknown backend '{cfg.backend}'. Valid values: claude, devin")
 
 # ---------------------------------------------------------------------------
 # PR processing
@@ -529,10 +590,28 @@ def start(once: bool):
     if not once:
         acquire_pid_file()
 
+    _stop = threading.Event()
+    _current_pr_key: list[str] = []  # mutable container so inner functions can write it
+
     def _shutdown(signum, frame):
-        logger.info("Shutting down (signal %d)", signum)
-        release_pid_file()
-        sys.exit(0)
+        if _stop.is_set():
+            # Second signal — force quit
+            key = _current_pr_key[0] if _current_pr_key else None
+            if _active_proc is not None:
+                logger.warning("Force quit — killing review subprocess")
+                _active_proc.terminate()
+            if key:
+                logger.warning("Force quit — rolling back %s to unprocessed", key)
+                state = load_state()
+                state.pop(key, None)
+                save_state(state)
+            release_pid_file()
+            sys.exit(1)
+        _stop.set()
+        if _active_proc is not None:
+            logger.info("Finishing current review before exiting (^C again to force quit)...")
+        else:
+            logger.info("Shutting down cleanly.")
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -540,9 +619,11 @@ def start(once: bool):
     logger.info("predd started (once=%s)", once)
 
     try:
-        while True:
+        while not _stop.is_set():
             state = load_state()
             for repo in cfg.repos:
+                if _stop.is_set():
+                    break
                 try:
                     prs = gh_list_open_prs(repo)
                 except Exception as e:
@@ -550,6 +631,8 @@ def start(once: bool):
                     continue
 
                 for pr in prs:
+                    if _stop.is_set():
+                        break
                     if pr["author"]["login"] == cfg.github_user:
                         continue
                     if pr["isDraft"]:
@@ -563,17 +646,20 @@ def start(once: bool):
                     entry_sha = entry.get("head_sha", "")
                     entry_status = entry.get("status", "")
 
-                    # Skip if same sha and terminal/in-progress status
                     if entry_sha == head_sha and entry_status in (
                         "submitted", "rejected", "awaiting_approval", "reviewing"
                     ):
                         continue
 
+                    _current_pr_key[:] = [key]
                     process_pr(cfg, state, repo, pr)
+                    _current_pr_key.clear()
 
-            if once:
+            if once or _stop.is_set():
                 break
             time.sleep(cfg.poll_interval)
+
+        logger.info("Shutting down cleanly.")
     finally:
         if not once:
             release_pid_file()
