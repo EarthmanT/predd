@@ -402,6 +402,27 @@ def _load_skill(cfg: Config, pr_number: int) -> str:
 # Active subprocess handle — set while a review is running so the shutdown
 # handler can terminate it on a second signal.
 _active_proc: subprocess.Popen | None = None
+_stop = threading.Event()
+_current_pr_key: list[str] = []  # mutable container so inner functions can write it
+
+
+def _shutdown(signum, frame):
+    if _stop.is_set():
+        # Second signal — force quit
+        key = _current_pr_key[0] if _current_pr_key else None
+        if _active_proc is not None:
+            logger.warning("Force quit — killing review subprocess")
+            _active_proc.terminate()
+        if key:
+            logger.warning("Force quit — rolling back %s to unprocessed", key)
+            state = load_state()
+            state.pop(key, None)
+            save_state(state)
+        release_pid_file()
+        sys.exit(1)
+    _stop.set()
+    if _active_proc is not None:
+        logger.info("Finishing current review before exiting (^C again to force quit)...")
 
 
 def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
@@ -590,31 +611,10 @@ def start(once: bool):
     if not once:
         acquire_pid_file()
 
-    _stop = threading.Event()
-    _current_pr_key: list[str] = []  # mutable container so inner functions can write it
-
-    def _shutdown(signum, frame):
-        if _stop.is_set():
-            # Second signal — force quit
-            key = _current_pr_key[0] if _current_pr_key else None
-            if _active_proc is not None:
-                logger.warning("Force quit — killing review subprocess")
-                _active_proc.terminate()
-            if key:
-                logger.warning("Force quit — rolling back %s to unprocessed", key)
-                state = load_state()
-                state.pop(key, None)
-                save_state(state)
-            release_pid_file()
-            sys.exit(1)
-        _stop.set()
-        if _active_proc is not None:
-            logger.info("Finishing current review before exiting (^C again to force quit)...")
-        else:
-            logger.info("Shutting down cleanly.")
-
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+    _stop.clear()
+    _current_pr_key[:] = []
 
     logger.info("predd started (once=%s)", once)
 
@@ -655,9 +655,8 @@ def start(once: bool):
                     process_pr(cfg, state, repo, pr)
                     _current_pr_key.clear()
 
-            if once or _stop.is_set():
+            if once or _stop.wait(cfg.poll_interval):
                 break
-            time.sleep(cfg.poll_interval)
 
         logger.info("Shutting down cleanly.")
     finally:
