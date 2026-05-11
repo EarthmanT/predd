@@ -496,19 +496,21 @@ def _shutdown(signum, frame):
         logger.info("Finishing current review before exiting (^C again to force quit)...")
 
 
-def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
+def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None,
+              stdin_text: str | None = None) -> str:
     global _active_proc
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
         text=True,
         cwd=str(worktree),
         env=env,
     )
     _active_proc = proc
     try:
-        stdout, _ = proc.communicate(timeout=900)
+        stdout, _ = proc.communicate(input=stdin_text, timeout=900)
     finally:
         _active_proc = None
     if proc.returncode != 0:
@@ -517,21 +519,15 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None) -> str:
 
 
 def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
-    # Write prompt to a temp file to avoid CLI arg length limits
-    prompt_file = worktree / ".hunter-prompt.txt"
-    prompt_file.write_text(prompt)
-    try:
-        # Strip ANTHROPIC_API_KEY so claude falls back to OAuth (subscription auth)
-        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-        result = _run_proc(
-            ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model,
-             prompt_file.read_text()],
-            worktree,
-            env=env,
-        )
-    finally:
-        prompt_file.unlink(missing_ok=True)
-    return result
+    # Strip ANTHROPIC_API_KEY so claude falls back to OAuth (subscription auth)
+    # Pass prompt via stdin to avoid OS arg length limits
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    return _run_proc(
+        ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model],
+        worktree,
+        env=env,
+        stdin_text=prompt,
+    )
 
 
 def _run_devin(cfg: Config, prompt: str, worktree: Path) -> str:
