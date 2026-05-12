@@ -71,7 +71,7 @@ class TestConfigLoading:
         monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
         cfg = pw.load_config()
         assert cfg.backend == "devin"
-        assert cfg.model == "haiku-4-5"
+        assert cfg.model == "swe-1.6"
 
     def test_missing_config_writes_template_and_exits(self, tmp_path, monkeypatch):
         missing = tmp_path / "nonexistent" / "config.toml"
