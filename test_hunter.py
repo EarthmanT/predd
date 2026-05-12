@@ -20,6 +20,9 @@ _spec = importlib.util.spec_from_file_location("hunter", Path(__file__).parent /
 h = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(h)
 
+# Access the predd module that hunter imported
+_predd = h._predd
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1300,7 +1303,7 @@ class TestSetupNewBranchWorktree:
         local_repo.mkdir()
         branch = "usr/at/1-proposal-test"
 
-        with patch.object(h, "find_local_repo", return_value=local_repo), \
+        with patch.object(_predd, "find_local_repo", return_value=local_repo), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
             h.setup_new_branch_worktree(cfg, "owner/repo", branch, "main")
 

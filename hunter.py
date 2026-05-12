@@ -45,6 +45,7 @@ _PWSH = _predd._PWSH
 _DEVIN_STRIP_ENV = _predd._DEVIN_STRIP_ENV
 repo_slug = _predd.repo_slug
 find_local_repo = _predd.find_local_repo
+setup_new_branch_worktree = _predd.setup_new_branch_worktree
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -451,51 +452,6 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
     if cfg.backend == "devin":
         return _run_devin_skill(cfg, prompt, skill_path, worktree)
     raise ValueError(f"Unknown backend: {cfg.backend}")
-
-
-# ---------------------------------------------------------------------------
-# Worktree setup for new branches
-# ---------------------------------------------------------------------------
-
-
-def setup_new_branch_worktree(
-    cfg: Config, repo: str, branch: str, base_branch: str
-) -> Path:
-    """Clone/fetch repo and create a new branch for proposal/impl work."""
-    wt_path = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
-    cfg.worktree_base.mkdir(parents=True, exist_ok=True)
-
-    local_repo = find_local_repo(repo)
-    if local_repo:
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            cwd=local_repo, check=True, capture_output=True,
-        )
-        # Remove existing worktree and branch if they exist from a previous run
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(wt_path)],
-            cwd=local_repo, capture_output=True,
-        )
-        subprocess.run(["git", "worktree", "prune"], cwd=local_repo, capture_output=True)
-        subprocess.run(["git", "branch", "-D", branch], cwd=local_repo, capture_output=True)
-        subprocess.run(
-            ["git", "worktree", "add", "-b", branch, str(wt_path), f"origin/{base_branch}"],
-            cwd=local_repo, check=True, capture_output=True,
-        )
-    else:
-        if wt_path.exists():
-            shutil.rmtree(wt_path)
-        wt_path.mkdir(parents=True)
-        subprocess.run(
-            ["gh", "repo", "clone", repo, str(wt_path)],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "checkout", "-b", branch],
-            cwd=str(wt_path), check=True, capture_output=True,
-        )
-
-    return wt_path
 
 
 # ---------------------------------------------------------------------------

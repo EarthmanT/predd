@@ -396,25 +396,35 @@ def find_local_repo(repo: str) -> Path | None:
     return None
 
 
+def _worktree_cleanup(local_repo: Path, wt_path: Path, branch: str | None = None) -> None:
+    """Remove stale worktree registration and optionally delete the local branch."""
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt_path)],
+        cwd=local_repo, capture_output=True,
+    )
+    subprocess.run(["git", "worktree", "prune"], cwd=local_repo, capture_output=True)
+    if branch:
+        subprocess.run(["git", "branch", "-D", branch], cwd=local_repo, capture_output=True)
+
+
 def setup_worktree(cfg: Config, repo: str, pr_number: int, head_sha: str, head_ref: str) -> Path:
+    """Check out an existing PR branch into a new worktree."""
     wt_path = worktree_path(cfg, repo, pr_number, head_sha)
     cfg.worktree_base.mkdir(parents=True, exist_ok=True)
 
     local_repo = find_local_repo(repo)
     if local_repo:
-        # Fetch the PR branch then add worktree
         subprocess.run(
             ["git", "fetch", "origin", head_ref],
             cwd=local_repo, check=True, capture_output=True,
         )
+        _worktree_cleanup(local_repo, wt_path)
         subprocess.run(
             ["git", "worktree", "add", str(wt_path), f"origin/{head_ref}"],
             cwd=local_repo, check=True, capture_output=True,
         )
     else:
-        # Fall back: use gh pr checkout in a temp dir, then move
         tmp_dir = cfg.worktree_base / f"_tmp-{repo_slug(repo)}-{pr_number}"
-        # Clean up any leftover tmp or target dirs from previous killed runs
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         if wt_path.exists():
@@ -429,6 +439,38 @@ def setup_worktree(cfg: Config, repo: str, pr_number: int, head_sha: str, head_r
             cwd=tmp_dir, check=True, capture_output=True,
         )
         tmp_dir.rename(wt_path)
+
+    return wt_path
+
+
+def setup_new_branch_worktree(cfg: Config, repo: str, branch: str, base_branch: str) -> Path:
+    """Create a new branch and worktree for proposal/impl work."""
+    wt_path = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
+    cfg.worktree_base.mkdir(parents=True, exist_ok=True)
+
+    local_repo = find_local_repo(repo)
+    if local_repo:
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=local_repo, check=True, capture_output=True,
+        )
+        _worktree_cleanup(local_repo, wt_path, branch=branch)
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch, str(wt_path), f"origin/{base_branch}"],
+            cwd=local_repo, check=True, capture_output=True,
+        )
+    else:
+        if wt_path.exists():
+            shutil.rmtree(wt_path)
+        wt_path.mkdir(parents=True)
+        subprocess.run(
+            ["gh", "repo", "clone", repo, str(wt_path)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            cwd=str(wt_path), check=True, capture_output=True,
+        )
 
     return wt_path
 
