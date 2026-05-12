@@ -405,6 +405,16 @@ def build_issue_context(issue_number: int, title: str, body: str, entry: dict) -
     return "\n".join(lines)
 
 
+def commit_skill_output(worktree: Path, message: str) -> bool:
+    """Stage all changes and commit. Returns True if there was anything to commit."""
+    subprocess.run(["git", "add", "-A"], cwd=str(worktree), capture_output=True)
+    result = subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=str(worktree), capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
 def skill_has_commits(worktree: Path) -> bool:
     """Return True if the worktree has new commits or uncommitted changes since branch base."""
     # Check for uncommitted changes (staged or unstaged)
@@ -542,6 +552,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             state.get(key, {}),
         )
         run_skill(cfg, cfg.proposal_skill_path, context, worktree)
+        commit_skill_output(worktree, f"proposal: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
@@ -607,6 +618,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             entry,
         )
         run_skill(cfg, cfg.impl_skill_path, context, worktree)
+        commit_skill_output(worktree, f"impl: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
