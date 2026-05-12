@@ -363,10 +363,8 @@ class TestRunSkill:
         with patch.object(h, "_run_claude", return_value="done") as mock_claude:
             result = h.run_skill(cfg, skill, "42", worktree)
         mock_claude.assert_called_once()
-        # Verify $ARGUMENTS was substituted in prompt
         prompt_arg = mock_claude.call_args[0][1]
         assert "42" in prompt_arg
-        assert "$ARGUMENTS" not in prompt_arg
         assert result == "done"
 
     def test_dispatches_to_devin(self, tmp_path):
@@ -381,9 +379,9 @@ class TestRunSkill:
         mock_devin.assert_called_once()
         assert result == "done"
 
-    def test_arguments_substituted(self, tmp_path):
+    def test_arguments_in_prompt(self, tmp_path):
         skill = tmp_path / "SKILL.md"
-        skill.write_text("Review PR $ARGUMENTS now.")
+        skill.write_text("Workflow instructions here.")
         cfg = _make_cfg(tmp_path, backend="claude")
         worktree = tmp_path / "wt"
         worktree.mkdir()
@@ -392,9 +390,9 @@ class TestRunSkill:
             captured["prompt"] = prompt
             return ""
         with patch.object(h, "_run_claude", side_effect=fake_claude):
-            h.run_skill(cfg, skill, "7", worktree)
-        assert "7" in captured["prompt"]
-        assert "$ARGUMENTS" not in captured["prompt"]
+            h.run_skill(cfg, skill, "Issue #7: Fix the thing", worktree)
+        assert "Issue #7: Fix the thing" in captured["prompt"]
+        assert "Workflow instructions here." in captured["prompt"]
 
     def test_skill_not_found_raises(self, tmp_path):
         cfg = _make_cfg(tmp_path)
