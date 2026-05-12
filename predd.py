@@ -341,14 +341,16 @@ def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
             return result
         stderr = result.stderr.lower()
         if any(x in stderr for x in _PERMANENT_ERRORS):
+            # Permanent failure — don't retry
             result.check_returncode()
-        if any(x in stderr for x in _TRANSIENT_ERRORS):
+        elif any(x in stderr for x in _TRANSIENT_ERRORS):
             wait = 2 ** attempt * 5
             logger.warning("gh transient error (attempt %d), retrying in %ds: %s",
                            attempt + 1, wait, result.stderr.strip())
             time.sleep(wait)
-            continue
-        result.check_returncode()
+        else:
+            # Unknown error — don't retry
+            result.check_returncode()
     if check:
         result.check_returncode()
     return result

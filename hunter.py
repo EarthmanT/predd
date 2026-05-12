@@ -239,13 +239,13 @@ def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         stderr = result.stderr.lower()
         if any(x in stderr for x in _PERMANENT_ERRORS):
             result.check_returncode()
-        if any(x in stderr for x in _TRANSIENT_ERRORS):
+        elif any(x in stderr for x in _TRANSIENT_ERRORS):
             wait = 2 ** attempt * 5
             logger.warning("gh transient error (attempt %d), retrying in %ds: %s",
                            attempt + 1, wait, result.stderr.strip())
             time.sleep(wait)
-            continue
-        result.check_returncode()
+        else:
+            result.check_returncode()
     if check:
         result.check_returncode()
     return result
@@ -401,8 +401,13 @@ def gh_pr_mark_ready(repo: str, pr_number: int) -> None:
 def gh_issue_is_closed(repo: str, issue_number: int) -> bool:
     """Return True if the issue is in CLOSED state on GitHub."""
     result = gh_run(["issue", "view", str(issue_number), "--repo", repo,
-                     "--json", "state", "--jq", ".state"], check=False)
-    return result.returncode == 0 and result.stdout.strip() == "CLOSED"
+                     "--json", "state"], check=False)
+    if result.returncode != 0:
+        return False
+    try:
+        return json.loads(result.stdout).get("state") == "CLOSED"
+    except (json.JSONDecodeError, AttributeError):
+        return False
 
 
 def gh_issue_reopen_and_reassign(
@@ -822,6 +827,10 @@ def check_impl_merged(
     logger.info("Impl PR #%d merged for %s — closing issue", impl_pr, key)
 
     try:
+        # Remove hunter labels before closing
+        for label_suffix in (":implementing", ":proposal-open", ":in-progress"):
+            gh_issue_remove_label(repo, issue_number,
+                                  f"{cfg.github_user}{label_suffix}")
         gh_issue_comment(repo, issue_number,
                          f"Implemented in #{impl_pr}. Closing.")
         gh_run(["issue", "close", str(issue_number), "--repo", repo])
@@ -1156,7 +1165,7 @@ def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
                     key = f"{repo}!{issue_number}"
                     entry = state.get(key, {})
                     status = entry.get("status", "")
-                    if not entry or status in ("submitted", "failed"):
+                    if not entry or status == "failed":
                         logger.warning("Removing orphaned label %s from issue %s",
                                        label, key)
                         try:
@@ -1208,11 +1217,10 @@ def _is_obviously_implementation(pr: dict) -> bool:
     branch = pr.get("headRefName") or ""
     files = pr.get("files") or []
     file_paths = [f.get("path", "") for f in files]
-    if _IMPL_TITLE_RE.match(title) and ("/impl" in branch or "-impl" in branch):
+    # impl branch with matching title
+    if ("/impl" in branch or "-impl" in branch) and _IMPL_TITLE_RE.match(title):
         return True
-    if "/impl" in branch or "-impl" in branch:
-        return True
-    # archives a proposal (moves from openspec/changes/ to openspec/archive/)
+    # archives a proposal (explicit signal of implementation completion)
     if any("openspec/archive/" in p for p in file_paths):
         return True
     return False
@@ -1225,6 +1233,7 @@ def auto_label_prs(cfg: Config, repos: list[str]) -> None:
         try:
             result = gh_run([
                 "pr", "list", "--repo", repo, "--state", "open",
+                "--author", cfg.github_user,
                 "--json", "number,title,headRefName,labels,files",
                 "--limit", "100",
             ], check=False)

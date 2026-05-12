@@ -230,8 +230,20 @@ class TestAutoLabelPrs:
         assert h._is_obviously_proposal(pr) is True
 
     def test_impl_branch_match(self):
-        pr = self._pr(branch="usr/at/1-impl-fix")
+        # Branch + matching title required
+        pr = self._pr(title="feat: fix thing", branch="usr/at/1-impl-fix")
         assert h._is_obviously_implementation(pr) is True
+
+    def test_impl_branch_only_no_match(self):
+        # Branch alone without impl title is not enough
+        pr = self._pr(title="chore: update deps", branch="usr/at/1-impl-fix")
+        # chore matches _IMPL_TITLE_RE so this should still match
+        assert h._is_obviously_implementation(pr) is True
+
+    def test_impl_branch_non_impl_title_no_match(self):
+        # Random title with impl branch — should NOT match
+        pr = self._pr(title="Update README", branch="usr/at/1-impl-fix")
+        assert h._is_obviously_implementation(pr) is False
 
     def test_impl_archives_proposal_file_match(self):
         pr = self._pr(files=["openspec/archive/my-spec.md"])
@@ -1742,7 +1754,7 @@ class TestSkipClosedIssues:
         }
 
     def test_gh_issue_is_closed_returns_true_when_closed(self):
-        r = MagicMock(); r.returncode = 0; r.stdout = "CLOSED\n"
+        r = MagicMock(); r.returncode = 0; r.stdout = '{"state":"CLOSED"}'
         with patch.object(h, "gh_run", return_value=r):
             assert h.gh_issue_is_closed("owner/repo", 42) is True
 
@@ -2254,10 +2266,10 @@ class TestScanOrphanedLabels:
         assert f"{cfg.github_user}:proposal-open" in remove_calls
 
     def test_scan_orphaned_labels_cleans_implementing(self, tmp_path):
-        """Issue with implementing label but submitted state should be cleaned."""
+        """Issue with implementing label but failed state should be cleaned."""
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)
-        state = {"owner/repo!8": _base_entry(issue_number=8, status="submitted")}
+        state = {"owner/repo!8": _base_entry(issue_number=8, status="failed")}
 
         def fake_gh_run(args, check=True):
             r = MagicMock()
