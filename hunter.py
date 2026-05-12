@@ -821,6 +821,156 @@ TERMINAL_STATES = {"merged", "awaiting_verification", "failed"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
 
 
+# ---------------------------------------------------------------------------
+# Jira CSV ingestion
+# ---------------------------------------------------------------------------
+
+def _parse_csv_row(row: dict) -> dict:
+    """Normalise a CSV row to lowercase keys."""
+    return {k.lower().strip(): v.strip() for k, v in row.items()}
+
+
+def _parse_capability(description: str) -> str | None:
+    m = re.search(r"capability:\s*(\d+)\s+(.+)", description, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} — {m.group(2).strip()}"
+    return None
+
+
+def _build_issue_body(row: dict, jira_base_url: str) -> tuple[str, list[str]]:
+    """Build the GH issue body and return (body, missing_fields)."""
+    jira_key = row.get("issue key", "")
+    summary = row.get("summary", "")
+    issue_type = row.get("issue type", "")
+    epic = row.get("epic link", "") or row.get("epic name", "")
+    sprint = row.get("sprint", "")
+    description = row.get("description", "")
+    capability = _parse_capability(description)
+
+    missing = []
+    if not epic:
+        missing.append("Epic not set")
+    if not sprint:
+        missing.append("Sprint not set")
+    if not capability:
+        missing.append("No `capability: <id> <name>` line in description")
+
+    lines = ["| Field | Value |", "|-------|-------|"]
+    if jira_key:
+        lines.append(f"| Jira | [{jira_key}]({jira_base_url}/browse/{jira_key}) |")
+    if issue_type:
+        lines.append(f"| Type | {issue_type} |")
+    if epic:
+        # Epic link is a key — hyperlink it; epic name is plain text
+        if re.match(r"^[A-Z]+-\d+$", epic):
+            lines.append(f"| Epic | [{epic}]({jira_base_url}/browse/{epic}) |")
+        else:
+            lines.append(f"| Epic | {epic} |")
+    if sprint:
+        lines.append(f"| Sprint | {sprint} |")
+    if capability:
+        lines.append(f"| Capability | {capability} |")
+
+    body = "\n".join(lines)
+
+    if missing:
+        warning = "\n\n> ⚠️ **Missing required fields:**\n" + \
+                  "".join(f"\n> - {m}" for m in missing)
+        body += warning
+
+    if description:
+        body += f"\n\n---\n\n{description}"
+
+    return body, missing
+
+
+def gh_issue_exists(repo: str, jira_key: str) -> bool:
+    """Return True if an open or closed GH issue with this Jira key already exists."""
+    result = gh_run([
+        "issue", "list",
+        "--repo", repo,
+        "--state", "all",
+        "--search", f"[{jira_key}]",
+        "--json", "number,title",
+        "--limit", "10",
+    ], check=False)
+    if result.returncode != 0:
+        return False
+    issues = json.loads(result.stdout)
+    return any(f"[{jira_key}]" in (i.get("title") or "") for i in issues)
+
+
+def gh_issue_create(repo: str, title: str, body: str, assignee: str | None = None) -> int | None:
+    """Create a GH issue. Returns issue number or None on failure."""
+    cmd = ["issue", "create", "--repo", repo, "--title", title, "--body", body]
+    if assignee:
+        cmd += ["--assignee", assignee]
+    result = gh_run(cmd, check=False)
+    if result.returncode != 0:
+        return None
+    m = re.search(r"/issues/(\d+)", result.stdout)
+    return int(m.group(1)) if m else None
+
+
+def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
+    """Read CSV files from jira_csv_dir and create missing GH issues."""
+    if not cfg.jira_csv_dir or not cfg.jira_csv_dir.exists():
+        return
+
+    csv_files = sorted(cfg.jira_csv_dir.glob("*.csv"))
+    if not csv_files:
+        return
+
+    logger.info("CSV ingest: scanning %d file(s) in %s", len(csv_files), cfg.jira_csv_dir)
+
+    for csv_file in csv_files:
+        try:
+            import csv as _csv
+            with open(csv_file, newline="", encoding="utf-8-sig") as f:
+                reader = _csv.DictReader(f)
+                rows = [_parse_csv_row(r) for r in reader]
+        except Exception as e:
+            logger.warning("CSV ingest: failed to read %s: %s", csv_file, e)
+            continue
+
+        for row in rows:
+            jira_key = row.get("issue key", "").strip()
+            summary = row.get("summary", "").strip()
+            if not jira_key or not summary:
+                continue
+
+            title = f"[{jira_key}] {summary}"
+            body, missing = _build_issue_body(row, cfg.jira_base_url)
+            conformant = len(missing) == 0
+
+            for repo in repos:
+                try:
+                    if gh_issue_exists(repo, jira_key):
+                        continue
+
+                    assignee = cfg.github_user if (conformant or not cfg.require_jira_conformance) else None
+                    issue_number = gh_issue_create(repo, title, body, assignee=assignee)
+
+                    if issue_number is None:
+                        logger.warning("CSV ingest: failed to create issue for %s in %s", jira_key, repo)
+                        continue
+
+                    logger.info("CSV ingest: created issue #%d for %s in %s%s",
+                                issue_number, jira_key, repo,
+                                " (non-conformant, not assigned)" if not conformant else "")
+
+                    if not conformant:
+                        needs_label = f"{cfg.github_user}:needs-jira-info"
+                        try:
+                            gh_ensure_label_exists(repo, needs_label, color="e11d48")
+                            gh_issue_add_label(repo, issue_number, needs_label)
+                        except Exception as e:
+                            logger.warning("CSV ingest: could not add needs-jira-info label: %s", e)
+
+                except Exception as e:
+                    logger.error("CSV ingest: error processing %s in %s: %s", jira_key, repo, e)
+
+
 def worktree_has_commits_since(worktree: Path, base_branch: str) -> bool:
     """Return True if the worktree has commits not on base_branch."""
     result = subprocess.run(
@@ -1035,6 +1185,9 @@ def start(once: bool):
     try:
         while not _stop.is_set():
             state = load_hunter_state()
+
+            # Ingest new issues from Jira CSV exports
+            ingest_jira_csv(cfg, hunter_repos)
 
             # Resume or rollback any in-flight issues from previous runs
             resume_in_flight_issues(cfg, state)

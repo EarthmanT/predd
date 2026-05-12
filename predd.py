@@ -114,6 +114,11 @@ max_review_fix_loops = 1
 
 # Whether to self-review draft implementation PRs (false = wait for ready)
 auto_review_draft = false
+
+# Jira CSV ingestion (optional)
+# jira_csv_dir = "./jira"
+# jira_base_url = "https://jira.cec.lab.emc.com"
+# require_jira_conformance = true
 """
 
 # ---------------------------------------------------------------------------
@@ -180,6 +185,11 @@ class Config:
         self.max_review_fix_loops: int = data.get("max_review_fix_loops", 1)
         self.auto_review_draft: bool = data.get("auto_review_draft", False)
         self.max_resume_retries: int = data.get("max_resume_retries", 2)
+        self.jira_csv_dir: Path | None = (
+            Path(data["jira_csv_dir"]).expanduser() if "jira_csv_dir" in data else None
+        )
+        self.jira_base_url: str = data.get("jira_base_url", "https://jira.cec.lab.emc.com")
+        self.require_jira_conformance: bool = data.get("require_jira_conformance", True)
 
     def to_dict(self) -> dict:
         return {
@@ -201,6 +211,9 @@ class Config:
             "max_review_fix_loops": self.max_review_fix_loops,
             "auto_review_draft": self.auto_review_draft,
             "max_resume_retries": self.max_resume_retries,
+            "jira_csv_dir": str(self.jira_csv_dir) if self.jira_csv_dir else None,
+            "jira_base_url": self.jira_base_url,
+            "require_jira_conformance": self.require_jira_conformance,
         }
 
 

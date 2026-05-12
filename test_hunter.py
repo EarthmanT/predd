@@ -1932,3 +1932,212 @@ class TestScanOrphanedLabels:
 
         with patch.object(h, "gh_run", side_effect=Exception("network")):
             h.scan_orphaned_labels(cfg, state, ["owner/repo"])  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# TestJiraCsvIngestion
+# ---------------------------------------------------------------------------
+
+class TestParseCsvRow:
+    def test_lowercases_keys(self):
+        row = {"Issue Key": "DAP-1", "Summary": "Fix it"}
+        result = h._parse_csv_row(row)
+        assert result["issue key"] == "DAP-1"
+        assert result["summary"] == "Fix it"
+
+    def test_strips_whitespace(self):
+        row = {"  Issue Key  ": "  DAP-1  "}
+        result = h._parse_csv_row(row)
+        assert result["issue key"] == "DAP-1"
+
+
+class TestParseCapability:
+    def test_parses_capability_line(self):
+        result = h._parse_capability("Some text\ncapability: 123 cool feature\nmore")
+        assert result == "123 — cool feature"
+
+    def test_case_insensitive(self):
+        result = h._parse_capability("Capability: 42 auth system")
+        assert result == "42 — auth system"
+
+    def test_returns_none_when_missing(self):
+        assert h._parse_capability("no capability here") is None
+
+
+class TestBuildIssueBody:
+    def _row(self, **kwargs):
+        base = {
+            "issue key": "DAP-1",
+            "summary": "Fix bug",
+            "issue type": "Story",
+            "epic link": "DAP-100",
+            "sprint": "DAP Sprint-1 2026-05-12",
+            "description": "capability: 42 payments\nDo the thing.",
+        }
+        base.update(kwargs)
+        return base
+
+    def test_full_conformant_row(self):
+        body, missing = h._build_issue_body(self._row(), "https://jira.example.com")
+        assert "DAP-1" in body
+        assert "Story" in body
+        assert "DAP-100" in body
+        assert "Sprint-1" in body
+        assert "42 — payments" in body
+        assert missing == []
+
+    def test_missing_epic_sprint_capability(self):
+        row = self._row(epic_link="", sprint="", description="no cap here")
+        row.pop("epic link", None)
+        row["epic link"] = ""
+        row["sprint"] = ""
+        body, missing = h._build_issue_body(row, "https://jira.example.com")
+        assert len(missing) == 3
+
+    def test_epic_key_is_hyperlinked(self):
+        body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
+        assert "[DAP-100](https://jira.example.com/browse/DAP-100)" in body
+
+    def test_epic_name_is_plain_text(self):
+        row = self._row()
+        row["epic link"] = "My Epic Name"
+        body, _ = h._build_issue_body(row, "https://jira.example.com")
+        assert "My Epic Name" in body
+        assert "browse/My Epic Name" not in body
+
+    def test_description_appended(self):
+        body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
+        assert "Do the thing" in body
+
+    def test_warning_block_on_missing(self):
+        row = self._row(sprint="")
+        row["sprint"] = ""
+        body, missing = h._build_issue_body(row, "https://jira.example.com")
+        assert "⚠️" in body
+        assert "Sprint not set" in body
+
+
+class TestGhIssueExists:
+    def test_returns_true_when_found(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 1, "title": "[DAP-1] Fix bug"}])
+        with patch("subprocess.run", return_value=fake):
+            assert h.gh_issue_exists("owner/repo", "DAP-1") is True
+
+    def test_returns_false_when_not_found(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([])
+        with patch("subprocess.run", return_value=fake):
+            assert h.gh_issue_exists("owner/repo", "DAP-1") is False
+
+    def test_returns_false_on_gh_failure(self):
+        fake = MagicMock(); fake.returncode = 1; fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            assert h.gh_issue_exists("owner/repo", "DAP-1") is False
+
+    def test_does_not_match_substring(self):
+        # DAP-1 should not match DAP-10
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 2, "title": "[DAP-10] Other issue"}])
+        with patch("subprocess.run", return_value=fake):
+            assert h.gh_issue_exists("owner/repo", "DAP-1") is False
+
+
+class TestGhIssueCreate:
+    def test_returns_issue_number(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "https://github.com/owner/repo/issues/42\n"
+        with patch("subprocess.run", return_value=fake):
+            result = h.gh_issue_create("owner/repo", "Title", "Body", assignee="adam")
+        assert result == 42
+
+    def test_returns_none_on_failure(self):
+        fake = MagicMock(); fake.returncode = 1; fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            assert h.gh_issue_create("owner/repo", "Title", "Body") is None
+
+
+class TestIngestJiraCsv:
+    def _make_cfg_with_csv(self, tmp_path):
+        csv_dir = tmp_path / "jira"
+        csv_dir.mkdir()
+        cfg = _make_cfg(tmp_path)
+        cfg.jira_csv_dir = csv_dir
+        cfg.jira_base_url = "https://jira.example.com"
+        cfg.require_jira_conformance = True
+        return cfg, csv_dir
+
+    def _write_csv(self, csv_dir, filename, rows):
+        import csv as _csv
+        path = csv_dir / filename
+        with open(path, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
+
+    def test_skips_when_no_csv_dir(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.jira_csv_dir = None
+        with patch.object(h, "gh_issue_exists") as mock_exists:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_exists.assert_not_called()
+
+    def test_skips_existing_issues(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-1", "Summary": "Fix", "Issue Type": "Story",
+            "Status": "Open", "Epic Link": "DAP-100",
+            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
+        }])
+        with patch.object(h, "gh_issue_exists", return_value=True), \
+             patch.object(h, "gh_issue_create") as mock_create:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_create.assert_not_called()
+
+    def test_creates_conformant_issue_with_assignee(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-1", "Summary": "Fix", "Issue Type": "Story",
+            "Status": "Open", "Epic Link": "DAP-100",
+            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
+        }])
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=10) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"):
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_create.assert_called_once()
+        assert mock_create.call_args.kwargs.get("assignee") == cfg.github_user
+
+    def test_non_conformant_not_assigned_when_require_conformance(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        cfg.require_jira_conformance = True
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-2", "Summary": "Missing fields", "Issue Type": "Story",
+            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "no cap",
+        }])
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=11) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"):
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        assert mock_create.call_args.kwargs.get("assignee") is None
+
+    def test_needs_jira_info_label_added_for_non_conformant(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-3", "Summary": "Bad", "Issue Type": "Story",
+            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
+        }])
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=12), \
+             patch.object(h, "gh_ensure_label_exists") as mock_ensure, \
+             patch.object(h, "gh_issue_add_label") as mock_label:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        label_calls = [str(c) for c in mock_label.call_args_list]
+        assert any("needs-jira-info" in c for c in label_calls)
