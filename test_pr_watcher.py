@@ -534,7 +534,8 @@ class TestDevinDriver:
         with patch.object(pw, "_run_proc", side_effect=fn):
             pw._run_devin(cfg, "prompt", worktree)
 
-        placed = worktree / ".devin" / "skills" / "pr-review.md"
+        # stem of "SKILL.md" is "SKILL", lowercased → "skill"
+        placed = worktree / ".devin" / "skills" / "skill.md"
         assert placed.exists()
         assert placed.read_text() == "the skill content"
 

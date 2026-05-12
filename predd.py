@@ -239,10 +239,6 @@ def save_state(state: dict) -> None:
     tmp.rename(STATE_FILE)
 
 
-def state_key(repo: str, pr_number: int, head_sha: str) -> str:
-    return f"{repo}#{pr_number}"
-
-
 def update_pr_state(state: dict, key: str, **fields) -> None:
     if key not in state:
         state[key] = {}
@@ -267,26 +263,34 @@ def notify_sound(sound_path: str) -> None:
         return
     if sound_path in ("new_pr", "review_ready"):
         beep_cmd = _CHIME_NEW_PR if sound_path == "new_pr" else _CHIME_REVIEW_READY
+        try:
+            subprocess.run(
+                [_PWSH, "-NoProfile", "-Command", beep_cmd],
+                check=False, capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
     else:
-        beep_cmd = f"(New-Object Media.SoundPlayer '{sound_path}').PlaySync()"
-    try:
-        subprocess.run(
-            [_PWSH, "-NoProfile", "-Command", beep_cmd],
-            check=False, capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass
+        # Pass .wav path out-of-band via -ArgumentList to avoid injection
+        try:
+            subprocess.run(
+                [_PWSH, "-NoProfile", "-Command",
+                 "param($p); (New-Object Media.SoundPlayer $p).PlaySync()",
+                 "-ArgumentList", sound_path],
+                check=False, capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
 
 
 def notify_toast(title: str, body: str) -> None:
     if not _PWSH:
         return
-    title_esc = title.replace("'", "\\'")
-    body_esc = body.replace("'", "\\'")
     try:
         subprocess.run(
             [_PWSH, "-NoProfile", "-Command",
-             f"New-BurntToastNotification -Text '{title_esc}', '{body_esc}'"],
+             "param($t,$b); New-BurntToastNotification -Text $t,$b",
+             "-ArgumentList", title, body],
             check=False, capture_output=True, timeout=15,
         )
     except Exception:
@@ -297,12 +301,23 @@ def notify_toast(title: str, body: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["gh"] + args,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    result = None
+    for attempt in range(3):
+        result = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        if result.returncode == 0 or not check:
+            return result
+        stderr = result.stderr.lower()
+        if any(x in stderr for x in ("rate limit", "502", "503", "504", "timeout")):
+            wait = 2 ** attempt * 5
+            logger.warning("gh transient error (attempt %d), retrying in %ds", attempt + 1, wait)
+            time.sleep(wait)
+            continue
+        if check:
+            result.check_returncode()
+        return result
+    if check:
+        result.check_returncode()
+    return result
 
 
 def gh_list_open_prs(repo: str) -> list[dict]:
@@ -389,7 +404,7 @@ def find_local_repo(repo: str) -> Path | None:
                     ["git", "remote", "get-url", "origin"],
                     capture_output=True, text=True, check=True, cwd=candidate
                 )
-                if repo_name in result.stdout:
+                if f"/{repo_name}" in result.stdout or f":{repo_name}" in result.stdout:
                     return candidate
             except subprocess.CalledProcessError:
                 pass
@@ -487,7 +502,11 @@ def remove_worktree(worktree: str | Path) -> None:
             ["git", "rev-parse", "--git-common-dir"],
             cwd=wt, capture_output=True, text=True, check=True,
         )
-        git_common = Path(result.stdout.strip())
+        git_common_raw = result.stdout.strip()
+        if os.path.isabs(git_common_raw):
+            git_common = Path(git_common_raw)
+        else:
+            git_common = (wt / git_common_raw).resolve()
         repo_root = git_common.parent if git_common.name == ".git" else git_common.parent.parent
         subprocess.run(
             ["git", "worktree", "remove", str(wt), "--force"],
@@ -495,7 +514,6 @@ def remove_worktree(worktree: str | Path) -> None:
         )
     except Exception:
         # If we can't use git worktree remove, just delete the directory
-        import shutil
         shutil.rmtree(wt, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
@@ -555,11 +573,15 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None,
     )
     _active_proc = proc
     try:
-        stdout, _ = proc.communicate(input=stdin_text, timeout=900)
+        stdout, stderr_out = proc.communicate(input=stdin_text, timeout=900)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
     finally:
         _active_proc = None
     if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr_out)
     return stdout
 
 
@@ -576,7 +598,7 @@ def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
 def _run_devin(cfg: Config, prompt: str, worktree: Path) -> str:
     skill_dir = worktree / ".devin" / "skills"
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "pr-review.md").write_text(cfg.skill_path.read_text())
+    (skill_dir / (cfg.skill_path.stem.lower() + ".md")).write_text(cfg.skill_path.read_text())
     env = {k: v for k, v in os.environ.items() if k not in _DEVIN_STRIP_ENV}
     return _run_proc(
         ["setsid", "devin", "-p", "--permission-mode", "auto",

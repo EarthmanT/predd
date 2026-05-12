@@ -18,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -40,12 +39,65 @@ save_state = _predd.save_state
 notify_sound = _predd.notify_sound
 notify_toast = _predd.notify_toast
 _run_proc = _predd._run_proc
-_run_claude = _predd._run_claude
 _PWSH = _predd._PWSH
 _DEVIN_STRIP_ENV = _predd._DEVIN_STRIP_ENV
 repo_slug = _predd.repo_slug
 find_local_repo = _predd.find_local_repo
 setup_new_branch_worktree = _predd.setup_new_branch_worktree
+_now_iso = _predd._now_iso
+
+
+# ---------------------------------------------------------------------------
+# Hunter-local subprocess runner — tracks _active_proc_hunter for shutdown
+# ---------------------------------------------------------------------------
+
+def _run_proc_hunter(cmd: list[str], worktree: Path, env: dict | None = None,
+                     stdin_text: str | None = None) -> str:
+    global _active_proc_hunter
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE if stdin_text is not None else None,
+        text=True,
+        cwd=str(worktree),
+        env=env,
+    )
+    _active_proc_hunter = proc
+    try:
+        stdout, stderr_out = proc.communicate(input=stdin_text, timeout=900)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    finally:
+        _active_proc_hunter = None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=stdout, stderr=stderr_out)
+    return stdout
+
+
+def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    return _run_proc_hunter(
+        ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model],
+        worktree, env=env, stdin_text=prompt,
+    )
+
+
+def _run_devin_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path) -> str:
+    """Run a skill via Devin, placing skill file in .devin/skills/."""
+    skill_dir = worktree / ".devin" / "skills"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_name = skill_path.stem.lower()
+    (skill_dir / f"{skill_name}.md").write_text(skill_path.read_text())
+    env = {k: v for k, v in os.environ.items() if k not in _DEVIN_STRIP_ENV}
+    return _run_proc_hunter(
+        ["setsid", "devin", "-p", "--permission-mode", "auto",
+         "--model", cfg.model, "--", prompt],
+        worktree,
+        env=env,
+    )
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -106,10 +158,6 @@ def update_issue_state(state: dict, key: str, **fields) -> None:
         state[key] = {}
     state[key].update(fields)
     save_hunter_state(state)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +226,23 @@ def _shutdown(signum, frame):
 
 
 def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["gh"] + args,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    result = None
+    for attempt in range(3):
+        result = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        if result.returncode == 0 or not check:
+            return result
+        stderr = result.stderr.lower()
+        if any(x in stderr for x in ("rate limit", "502", "503", "504", "timeout")):
+            wait = 2 ** attempt * 5
+            logger.warning("gh transient error (attempt %d), retrying in %ds", attempt + 1, wait)
+            time.sleep(wait)
+            continue
+        if check:
+            result.check_returncode()
+        return result
+    if check:
+        result.check_returncode()
+    return result
 
 
 def gh_list_assigned_issues(repo: str) -> list[dict]:
@@ -237,11 +296,11 @@ def gh_find_merged_proposal(repo: str, issue_number: int, title: str) -> int | N
     if result.returncode != 0:
         return None
     prs = json.loads(result.stdout)
-    issue_marker = f"#{issue_number}"
+    pattern = re.compile(rf"#{issue_number}\b")
     for pr in prs:
         body = pr.get("body") or ""
         pr_title = pr.get("title") or ""
-        if issue_marker in body or issue_marker in pr_title:
+        if pattern.search(body) or pattern.search(pr_title):
             return pr["number"]
     return None
 
@@ -403,21 +462,6 @@ def impl_branch(cfg: Config, issue_number: int, title: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _run_devin_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path) -> str:
-    """Run a skill via Devin, placing skill file in .devin/skills/."""
-    skill_dir = worktree / ".devin" / "skills"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    skill_name = skill_path.stem.lower()
-    (skill_dir / f"{skill_name}.md").write_text(skill_path.read_text())
-    env = {k: v for k, v in os.environ.items() if k not in _DEVIN_STRIP_ENV}
-    return _run_proc(
-        ["setsid", "devin", "-p", "--permission-mode", "auto",
-         "--model", cfg.model, "--", prompt],
-        worktree,
-        env=env,
-    )
-
-
 def build_issue_context(issue_number: int, title: str, body: str, entry: dict) -> str:
     """Build a rich context string to pass as $ARGUMENTS to proposal/impl skills."""
     lines = [f"Issue #{issue_number}: {title}", ""]
@@ -431,6 +475,15 @@ def build_issue_context(issue_number: int, title: str, body: str, entry: dict) -
 
 def commit_skill_output(worktree: Path, message: str) -> bool:
     """Stage all changes and commit. Returns True if there was anything to commit."""
+    # Ensure sensitive files are not staged
+    gitignore = worktree / ".gitignore"
+    ignore_patterns = "\n.env\n.env.*\n*.key\n*.pem\n.devin/\n.hunter-prompt.txt\n"
+    if gitignore.exists():
+        existing = gitignore.read_text()
+        if ".devin/" not in existing:
+            gitignore.write_text(existing + ignore_patterns)
+    else:
+        gitignore.write_text(ignore_patterns)
     subprocess.run(["git", "add", "-A"], cwd=str(worktree), capture_output=True)
     result = subprocess.run(
         ["git", "commit", "-m", message],
@@ -713,10 +766,12 @@ def check_impl_ready_for_review(
         return
 
     worktree_str = entry.get("impl_worktree")
-    worktree = Path(worktree_str) if worktree_str else cfg.worktree_base / "hunter-review"
-    if not Path(worktree).exists():
-        Path(worktree).mkdir(parents=True, exist_ok=True)
+    if not worktree_str or not Path(worktree_str).exists():
+        logger.warning("Impl worktree missing for %s — resetting to re-run impl", key)
+        update_issue_state(state, key, status="implementing", impl_pr=None, impl_worktree=None)
+        return
 
+    worktree = Path(worktree_str)
     self_review_loop(cfg, state, repo, key, entry, worktree)
 
 

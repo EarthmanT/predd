@@ -422,11 +422,11 @@ class TestRunSkill:
         worktree.mkdir()
 
         captured_cmd = {}
-        def fake_run_proc(cmd, wt, env=None):
+        def fake_run_proc_hunter(cmd, wt, env=None, stdin_text=None):
             captured_cmd["cmd"] = cmd
             return "ok"
 
-        with patch.object(h, "_run_proc", side_effect=fake_run_proc):
+        with patch.object(h, "_run_proc_hunter", side_effect=fake_run_proc_hunter):
             h._run_devin_skill(cfg, "prompt text", skill, worktree)
 
         placed = worktree / ".devin" / "skills" / "skill.md"
@@ -441,7 +441,7 @@ class TestRunSkill:
         worktree.mkdir()
 
         captured = {}
-        def fake_run_proc(cmd, wt, env=None):
+        def fake_run_proc_hunter(cmd, wt, env=None, stdin_text=None):
             captured["env"] = env
             return "ok"
 
@@ -449,7 +449,7 @@ class TestRunSkill:
             "CLAUDECODE": "1",
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "HOME": "/home/testuser",
-        }), patch.object(h, "_run_proc", side_effect=fake_run_proc):
+        }), patch.object(h, "_run_proc_hunter", side_effect=fake_run_proc_hunter):
             h._run_devin_skill(cfg, "prompt", skill, worktree)
 
         assert "CLAUDECODE" not in captured["env"]
