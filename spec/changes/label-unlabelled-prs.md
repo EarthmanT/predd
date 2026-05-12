@@ -9,11 +9,13 @@ PRs created manually (not by hunter) don't get `sdd-proposal` or `sdd-implementa
 **Obviously a proposal:**
 - Title matches `^(Proposal|Propose|SDD|Design|RFC|Spec)[:\ ]` (case-insensitive)
 - OR branch name contains `/proposal` or `-proposal`
+- Or it add's a proposal to spec changes
 - AND not already labeled `sdd-proposal` or `sdd-implementation`
 
 **Obviously an implementation:**
 - Title matches `^(Impl|Implement|feat|fix|chore)[:\ ]` (case-insensitive) AND branch contains `-impl` or `/impl`
 - OR branch name contains `/impl` or `-impl`
+- OR archives a proposal
 - AND not already labeled `sdd-proposal` or `sdd-implementation`
 
 ## Behaviour

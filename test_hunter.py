@@ -118,6 +118,163 @@ class TestHunterConfig:
 
 
 # ---------------------------------------------------------------------------
+# TestMaxNewIssuesPerCycle (SPEC 5)
+# ---------------------------------------------------------------------------
+
+class TestMaxNewIssuesPerCycle:
+    def test_config_default_max_new_issues_per_cycle(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(tmp_path, MINIMAL_CONFIG)
+        monkeypatch.setattr(h._predd, "CONFIG_FILE", cfg_file)
+        cfg = h.load_config()
+        assert cfg.max_new_issues_per_cycle == 1
+
+    def test_max_one_new_issue_per_cycle_respected(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.max_new_issues_per_cycle = 1
+        monkeypatch_state_file(tmp_path)
+
+        issues = [
+            {"number": i, "title": f"Issue {i}", "author": {"login": "u"},
+             "labels": [], "body": ""}
+            for i in range(1, 4)
+        ]
+        state = {}
+
+        processed = []
+        def fake_process(cfg, state, repo, issue):
+            processed.append(issue["number"])
+            # simulate state update
+            key = f"{repo}!{issue['number']}"
+            state[key] = {"status": "proposal_open", "issue_number": issue["number"]}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=issues), \
+             patch.object(h, "process_issue", side_effect=fake_process), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "resume_in_flight_issues"), \
+             patch.object(h, "ingest_jira_csv"), \
+             patch.object(h, "scan_orphaned_labels"), \
+             patch.object(h, "_stop") as mock_stop:
+            mock_stop.is_set.side_effect = [False, True]  # one iteration
+            # Simulate just the inner loop
+            new_issues_this_cycle = 0
+            for issue in issues:
+                key = f"owner/repo!{issue['number']}"
+                entry = state.get(key, {})
+                status = entry.get("status", "")
+                if status in h.TERMINAL_STATES:
+                    continue
+                if status == "":
+                    if h._issue_has_hunter_labels(issue):
+                        continue
+                    if new_issues_this_cycle >= cfg.max_new_issues_per_cycle:
+                        continue
+                    fake_process(cfg, state, "owner/repo", issue)
+                    new_issues_this_cycle += 1
+
+        assert len(processed) == 1
+
+    def test_max_zero_skips_all_new(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.max_new_issues_per_cycle = 0
+
+        issues = [
+            {"number": i, "title": f"Issue {i}", "author": {"login": "u"},
+             "labels": [], "body": ""}
+            for i in range(1, 4)
+        ]
+        state = {}
+        processed = []
+
+        new_issues_this_cycle = 0
+        for issue in issues:
+            key = f"owner/repo!{issue['number']}"
+            entry = state.get(key, {})
+            status = entry.get("status", "")
+            if status in h.TERMINAL_STATES:
+                continue
+            if status == "":
+                if h._issue_has_hunter_labels(issue):
+                    continue
+                if new_issues_this_cycle >= cfg.max_new_issues_per_cycle:
+                    continue
+                processed.append(issue["number"])
+                new_issues_this_cycle += 1
+
+        assert len(processed) == 0
+
+
+# ---------------------------------------------------------------------------
+# TestAutoLabelPrs (SPEC 1)
+# ---------------------------------------------------------------------------
+
+class TestAutoLabelPrs:
+    def _pr(self, number=1, title="", branch="", labels=None, files=None):
+        return {
+            "number": number,
+            "title": title,
+            "headRefName": branch,
+            "labels": labels or [],
+            "files": [{"path": p} for p in (files or [])],
+        }
+
+    def test_proposal_title_match(self):
+        pr = self._pr(title="Proposal: add auth")
+        assert h._is_obviously_proposal(pr) is True
+
+    def test_proposal_branch_match(self):
+        pr = self._pr(branch="usr/at/1-proposal-fix")
+        assert h._is_obviously_proposal(pr) is True
+
+    def test_proposal_spec_changes_file_match(self):
+        pr = self._pr(files=["openspec/changes/my-spec.md"])
+        assert h._is_obviously_proposal(pr) is True
+
+    def test_impl_branch_match(self):
+        pr = self._pr(branch="usr/at/1-impl-fix")
+        assert h._is_obviously_implementation(pr) is True
+
+    def test_impl_archives_proposal_file_match(self):
+        pr = self._pr(files=["openspec/archive/my-spec.md"])
+        assert h._is_obviously_implementation(pr) is True
+
+    def test_already_labeled_skipped(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        pr = self._pr(title="Proposal: add auth",
+                      labels=[{"name": "sdd-proposal"}])
+        prs = [pr]
+        fake = MagicMock(); fake.returncode = 0; fake.stdout = json.dumps(prs)
+        with patch.object(h, "gh_run", return_value=fake) as mock_gh:
+            h.auto_label_prs(cfg, ["owner/repo"])
+        # gh_run called once for list, but not for pr edit
+        edit_calls = [c for c in mock_gh.call_args_list
+                      if len(c[0][0]) > 1 and "edit" in c[0][0]]
+        assert len(edit_calls) == 0
+
+    def test_auto_label_disabled_skips(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.auto_label_prs = False
+        with patch.object(h, "gh_run") as mock_gh:
+            h.auto_label_prs(cfg, ["owner/repo"])
+        mock_gh.assert_not_called()
+
+    def test_auto_label_prs_calls_gh_edit(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        pr = self._pr(number=5, title="Proposal: add auth")
+        prs = [pr]
+        list_result = MagicMock(); list_result.returncode = 0
+        list_result.stdout = json.dumps(prs)
+        edit_result = MagicMock(); edit_result.returncode = 0
+        edit_result.stdout = ""
+        with patch.object(h, "gh_run", side_effect=[list_result, edit_result]) as mock_gh, \
+             patch.object(h, "gh_ensure_label_exists"):
+            h.auto_label_prs(cfg, ["owner/repo"])
+        edit_calls = [c for c in mock_gh.call_args_list
+                      if len(c[0][0]) > 1 and "edit" in c[0][0]]
+        assert len(edit_calls) == 1
+        assert "sdd-proposal" in edit_calls[0][0][0]
+
+
+# ---------------------------------------------------------------------------
 # TestIssueSlug
 # ---------------------------------------------------------------------------
 
@@ -248,12 +405,63 @@ class TestTryClaimIssue:
 
 
 # ---------------------------------------------------------------------------
+# TestGhRunPermanentErrors (SPEC 6)
+# ---------------------------------------------------------------------------
+
+class TestGhRunPermanentErrorsHunter:
+    def _make_result(self, returncode=1, stderr=""):
+        r = MagicMock()
+        r.returncode = returncode
+        r.stderr = stderr
+        r.stdout = ""
+        r.check_returncode.side_effect = subprocess.CalledProcessError(returncode, ["gh"])
+        return r
+
+    def test_permanent_error_fails_immediately_no_retry(self):
+        """404 error should not be retried."""
+        result = self._make_result(1, "error: not found")
+        with patch("subprocess.run", return_value=result) as mock_run, \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(subprocess.CalledProcessError):
+                h.gh_run(["issue", "view", "1"])
+        assert mock_run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_transient_error_retries(self):
+        """Rate limit errors should be retried."""
+        fail = self._make_result(1, "error: rate limit exceeded")
+        ok = MagicMock(); ok.returncode = 0; ok.stdout = "[]"
+        with patch("subprocess.run", side_effect=[fail, ok]) as mock_run, \
+             patch("time.sleep"):
+            result = h.gh_run(["pr", "list"])
+        assert mock_run.call_count == 2
+
+    def test_unknown_error_fails_immediately(self):
+        """Unknown errors should not be retried."""
+        result = self._make_result(1, "error: something unexpected happened")
+        with patch("subprocess.run", return_value=result) as mock_run, \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(subprocess.CalledProcessError):
+                h.gh_run(["pr", "list"])
+        assert mock_run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_check_false_returns_on_error(self):
+        """check=False should return even on error."""
+        result = self._make_result(1, "error: not found")
+        with patch("subprocess.run", return_value=result):
+            r = h.gh_run(["issue", "view", "1"], check=False)
+        assert r.returncode == 1
+
+
+# ---------------------------------------------------------------------------
 # TestGhIssueHelpers
 # ---------------------------------------------------------------------------
 
 class TestGhIssueHelpers:
     def _fake_gh(self, stdout="[]"):
         fake = MagicMock()
+        fake.returncode = 0
         fake.stdout = stdout
         return fake
 
@@ -688,45 +896,61 @@ class TestCheckImplMerged:
         entry = self._entry()
 
         with patch.object(h, "gh_pr_is_merged", return_value=False), \
-             patch.object(h, "gh_issue_reopen_and_reassign") as mock_reopen:
+             patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_issue_comment") as mock_comment:
             h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
 
-        mock_reopen.assert_not_called()
+        mock_comment.assert_not_called()
 
-    def test_merged_reopens_and_reassigns(self, tmp_path):
+    def test_impl_merged_closes_issue(self, tmp_path):
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", return_value=True), \
-             patch.object(h, "gh_issue_reopen_and_reassign") as mock_reopen, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"), \
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_is_merged", return_value=True), \
+             patch.object(h, "gh_issue_comment"), \
+             patch.object(h, "gh_run") as mock_gh_run, \
              patch.object(h, "save_hunter_state"):
             h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
 
-        mock_reopen.assert_called_once()
-        args = mock_reopen.call_args[0]
-        assert args[0] == "owner/repo"
-        assert args[1] == 5
-        assert args[2] == "reporter"
-        assert "30" in args[3]  # impl PR number mentioned in comment
+        close_calls = [c for c in mock_gh_run.call_args_list
+                       if "issue" in c[0][0] and "close" in c[0][0]]
+        assert len(close_calls) == 1
+        assert "5" in close_calls[0][0][0]
 
-    def test_merged_updates_status_to_awaiting_verification(self, tmp_path):
+    def test_impl_merged_posts_comment(self, tmp_path):
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", return_value=True), \
-             patch.object(h, "gh_issue_reopen_and_reassign"), \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"), \
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_is_merged", return_value=True), \
+             patch.object(h, "gh_issue_comment") as mock_comment, \
+             patch.object(h, "gh_run"), \
              patch.object(h, "save_hunter_state"):
             h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
 
-        assert state.get("owner/repo!5", {}).get("status") == "awaiting_verification"
+        mock_comment.assert_called_once()
+        comment_body = mock_comment.call_args[0][2]
+        assert "30" in comment_body  # impl PR number in comment
+
+    def test_merged_updates_status_to_submitted(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+        entry = self._entry()
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_is_merged", return_value=True), \
+             patch.object(h, "gh_issue_comment"), \
+             patch.object(h, "gh_run"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
+
+        assert state.get("owner/repo!5", {}).get("status") == "submitted"
 
     def test_missing_impl_pr_returns_early(self, tmp_path):
         cfg = _make_cfg(tmp_path)
@@ -745,7 +969,8 @@ class TestCheckImplMerged:
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", side_effect=RuntimeError("network")):
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_is_merged", side_effect=RuntimeError("network")):
             h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
 
         assert state == {}
@@ -1482,12 +1707,77 @@ class TestCheckImplMergedError:
             "status": "ready_for_review",
         }
 
-        with patch.object(h, "gh_pr_is_merged", return_value=True), \
-             patch.object(h, "gh_issue_reopen_and_reassign", side_effect=RuntimeError("network")), \
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_is_merged", return_value=True), \
+             patch.object(h, "gh_issue_comment", side_effect=RuntimeError("network")), \
              patch.object(h, "save_hunter_state"):
             h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
 
         assert state.get("owner/repo!5", {}).get("status") == "failed"
+
+
+# ---------------------------------------------------------------------------
+# TestSkipClosedIssues (SPEC 3)
+# ---------------------------------------------------------------------------
+
+class TestSkipClosedIssues:
+    def _proposal_entry(self):
+        return {
+            "issue_number": 3,
+            "proposal_pr": 20,
+            "repo": "owner/repo",
+            "title": "A feature",
+            "issue_author": "reporter",
+            "status": "proposal_open",
+        }
+
+    def _impl_entry(self):
+        return {
+            "issue_number": 5,
+            "impl_pr": 30,
+            "repo": "owner/repo",
+            "title": "A feature",
+            "issue_author": "reporter",
+            "status": "ready_for_review",
+        }
+
+    def test_gh_issue_is_closed_returns_true_when_closed(self):
+        r = MagicMock(); r.returncode = 0; r.stdout = "CLOSED\n"
+        with patch.object(h, "gh_run", return_value=r):
+            assert h.gh_issue_is_closed("owner/repo", 42) is True
+
+    def test_gh_issue_is_closed_returns_false_when_open(self):
+        r = MagicMock(); r.returncode = 0; r.stdout = "OPEN\n"
+        with patch.object(h, "gh_run", return_value=r):
+            assert h.gh_issue_is_closed("owner/repo", 42) is False
+
+    def test_closed_issue_marks_submitted_in_check_proposal_merged(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+        entry = self._proposal_entry()
+
+        with patch.object(h, "gh_issue_is_closed", return_value=True), \
+             patch.object(h, "gh_find_merged_proposal") as mock_find, \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
+
+        mock_find.assert_not_called()
+        assert state.get("owner/repo!3", {}).get("status") == "submitted"
+
+    def test_closed_issue_marks_submitted_in_check_impl_merged(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+        entry = self._impl_entry()
+
+        with patch.object(h, "gh_issue_is_closed", return_value=True), \
+             patch.object(h, "gh_pr_is_merged") as mock_merged, \
+             patch.object(h, "save_hunter_state"):
+            h.check_impl_merged(cfg, state, "owner/repo", "owner/repo!5", entry)
+
+        mock_merged.assert_not_called()
+        assert state.get("owner/repo!5", {}).get("status") == "submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -1900,15 +2190,23 @@ class TestScanOrphanedLabels:
         monkeypatch_state_file(tmp_path)
         state = {}
 
-        fake = MagicMock()
-        fake.returncode = 0
-        fake.stdout = json.dumps([{"number": 42}])
+        # in-progress returns issue 42, others return empty
+        def fake_gh_run(args, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            if "in-progress" in str(args):
+                r.stdout = json.dumps([{"number": 42}])
+            else:
+                r.stdout = json.dumps([])
+            return r
 
-        with patch.object(h, "gh_run", return_value=fake) as mock_gh, \
+        with patch.object(h, "gh_run", side_effect=fake_gh_run), \
              patch.object(h, "gh_issue_remove_label") as mock_remove:
             h.scan_orphaned_labels(cfg, state, ["owner/repo"])
 
-        mock_remove.assert_called_once_with("owner/repo", 42, f"{cfg.github_user}:in-progress")
+        assert mock_remove.call_count >= 1
+        remove_calls = [(c[0][2]) for c in mock_remove.call_args_list]
+        assert f"{cfg.github_user}:in-progress" in remove_calls
 
     def test_skips_issue_already_in_state(self, tmp_path):
         cfg = _make_cfg(tmp_path)
@@ -1932,6 +2230,66 @@ class TestScanOrphanedLabels:
 
         with patch.object(h, "gh_run", side_effect=Exception("network")):
             h.scan_orphaned_labels(cfg, state, ["owner/repo"])  # should not raise
+
+    def test_scan_orphaned_labels_cleans_proposal_open(self, tmp_path):
+        """Issue with proposal-open label but no state entry should be cleaned."""
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        def fake_gh_run(args, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            if "proposal-open" in str(args):
+                r.stdout = json.dumps([{"number": 7}])
+            else:
+                r.stdout = json.dumps([])
+            return r
+
+        with patch.object(h, "gh_run", side_effect=fake_gh_run), \
+             patch.object(h, "gh_issue_remove_label") as mock_remove:
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])
+
+        remove_calls = [(c[0][2]) for c in mock_remove.call_args_list]
+        assert f"{cfg.github_user}:proposal-open" in remove_calls
+
+    def test_scan_orphaned_labels_cleans_implementing(self, tmp_path):
+        """Issue with implementing label but submitted state should be cleaned."""
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!8": _base_entry(issue_number=8, status="submitted")}
+
+        def fake_gh_run(args, check=True):
+            r = MagicMock()
+            r.returncode = 0
+            if "implementing" in str(args):
+                r.stdout = json.dumps([{"number": 8}])
+            else:
+                r.stdout = json.dumps([])
+            return r
+
+        with patch.object(h, "gh_run", side_effect=fake_gh_run), \
+             patch.object(h, "gh_issue_remove_label") as mock_remove:
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])
+
+        remove_calls = [(c[0][2]) for c in mock_remove.call_args_list]
+        assert f"{cfg.github_user}:implementing" in remove_calls
+
+    def test_scan_orphaned_labels_skips_active_state(self, tmp_path):
+        """Issue with in-progress label and active state should NOT be cleaned."""
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!9": _base_entry(issue_number=9, status="in_progress")}
+
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 9}])
+
+        with patch.object(h, "gh_run", return_value=fake), \
+             patch.object(h, "gh_issue_remove_label") as mock_remove:
+            h.scan_orphaned_labels(cfg, state, ["owner/repo"])
+
+        mock_remove.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

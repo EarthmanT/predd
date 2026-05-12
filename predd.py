@@ -119,6 +119,15 @@ auto_review_draft = false
 # jira_csv_dir = "./jira"
 # jira_base_url = "https://jira.cec.lab.emc.com"
 # require_jira_conformance = true
+
+# Max new issues to pick up per repo per poll cycle
+max_new_issues_per_cycle = 1
+
+# How many poll cycles between orphaned-label scans (0 = startup only)
+orphan_scan_interval = 10
+
+# Auto-label unlabelled proposal/implementation PRs
+auto_label_prs = true
 """
 
 # ---------------------------------------------------------------------------
@@ -190,6 +199,9 @@ class Config:
         )
         self.jira_base_url: str = data.get("jira_base_url", "https://jira.cec.lab.emc.com")
         self.require_jira_conformance: bool = data.get("require_jira_conformance", True)
+        self.max_new_issues_per_cycle: int = data.get("max_new_issues_per_cycle", 1)
+        self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
+        self.auto_label_prs: bool = data.get("auto_label_prs", True)
 
     def to_dict(self) -> dict:
         return {
@@ -214,6 +226,9 @@ class Config:
             "jira_csv_dir": str(self.jira_csv_dir) if self.jira_csv_dir else None,
             "jira_base_url": self.jira_base_url,
             "require_jira_conformance": self.require_jira_conformance,
+            "max_new_issues_per_cycle": self.max_new_issues_per_cycle,
+            "orphan_scan_interval": self.orphan_scan_interval,
+            "auto_label_prs": self.auto_label_prs,
         }
 
 
@@ -313,6 +328,11 @@ def notify_toast(title: str, body: str) -> None:
 # GitHub helpers
 # ---------------------------------------------------------------------------
 
+_TRANSIENT_ERRORS = ("rate limit", "502", "503", "504", "timeout", "connection")
+_PERMANENT_ERRORS = ("not found", "404", "401", "403", "unauthorized",
+                     "forbidden", "422", "unprocessable", "already exists")
+
+
 def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = None
     for attempt in range(3):
@@ -320,14 +340,15 @@ def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         if result.returncode == 0 or not check:
             return result
         stderr = result.stderr.lower()
-        if any(x in stderr for x in ("rate limit", "502", "503", "504", "timeout")):
+        if any(x in stderr for x in _PERMANENT_ERRORS):
+            result.check_returncode()
+        if any(x in stderr for x in _TRANSIENT_ERRORS):
             wait = 2 ** attempt * 5
-            logger.warning("gh transient error (attempt %d), retrying in %ds", attempt + 1, wait)
+            logger.warning("gh transient error (attempt %d), retrying in %ds: %s",
+                           attempt + 1, wait, result.stderr.strip())
             time.sleep(wait)
             continue
-        if check:
-            result.check_returncode()
-        return result
+        result.check_returncode()
     if check:
         result.check_returncode()
     return result

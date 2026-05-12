@@ -225,6 +225,11 @@ def _shutdown(signum, frame):
 # ---------------------------------------------------------------------------
 
 
+_TRANSIENT_ERRORS = ("rate limit", "502", "503", "504", "timeout", "connection")
+_PERMANENT_ERRORS = ("not found", "404", "401", "403", "unauthorized",
+                     "forbidden", "422", "unprocessable", "already exists")
+
+
 def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = None
     for attempt in range(3):
@@ -232,14 +237,15 @@ def gh_run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
         if result.returncode == 0 or not check:
             return result
         stderr = result.stderr.lower()
-        if any(x in stderr for x in ("rate limit", "502", "503", "504", "timeout")):
+        if any(x in stderr for x in _PERMANENT_ERRORS):
+            result.check_returncode()
+        if any(x in stderr for x in _TRANSIENT_ERRORS):
             wait = 2 ** attempt * 5
-            logger.warning("gh transient error (attempt %d), retrying in %ds", attempt + 1, wait)
+            logger.warning("gh transient error (attempt %d), retrying in %ds: %s",
+                           attempt + 1, wait, result.stderr.strip())
             time.sleep(wait)
             continue
-        if check:
-            result.check_returncode()
-        return result
+        result.check_returncode()
     if check:
         result.check_returncode()
     return result
@@ -390,6 +396,13 @@ def gh_pr_is_draft(repo: str, pr_number: int) -> bool:
 
 def gh_pr_mark_ready(repo: str, pr_number: int) -> None:
     gh_run(["pr", "ready", str(pr_number), "--repo", repo])
+
+
+def gh_issue_is_closed(repo: str, issue_number: int) -> bool:
+    """Return True if the issue is in CLOSED state on GitHub."""
+    result = gh_run(["issue", "view", str(issue_number), "--repo", repo,
+                     "--json", "state", "--jq", ".state"], check=False)
+    return result.returncode == 0 and result.stdout.strip() == "CLOSED"
 
 
 def gh_issue_reopen_and_reassign(
@@ -625,6 +638,14 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
     issue_number = entry["issue_number"]
     title = entry["title"]
 
+    try:
+        if gh_issue_is_closed(repo, issue_number):
+            logger.info("Issue %s was closed manually — stopping", key)
+            update_issue_state(state, key, status="submitted")
+            return
+    except Exception:
+        pass  # if we can't check, proceed normally
+
     merged_pr = gh_find_merged_proposal(repo, issue_number, title)
     if not merged_pr:
         return
@@ -778,10 +799,19 @@ def check_impl_ready_for_review(
 def check_impl_merged(
     cfg: Config, state: dict, repo: str, key: str, entry: dict
 ) -> None:
-    """If impl PR merged, hand back to reporter."""
+    """If impl PR merged, close the issue."""
     impl_pr = entry.get("impl_pr")
     if not impl_pr:
         return
+
+    issue_number = entry["issue_number"]
+    try:
+        if gh_issue_is_closed(repo, issue_number):
+            logger.info("Issue %s was closed manually — stopping", key)
+            update_issue_state(state, key, status="submitted")
+            return
+    except Exception:
+        pass  # if we can't check, proceed normally
 
     try:
         if not gh_pr_is_merged(repo, impl_pr):
@@ -789,27 +819,17 @@ def check_impl_merged(
     except Exception as e:
         logger.warning("Could not check impl PR %d for %s: %s", impl_pr, key, e)
         return
-
-    issue_number = entry["issue_number"]
-    issue_author = entry.get("issue_author", "")
-    logger.info("Impl PR #%d merged for %s — handing back to reporter", impl_pr, key)
+    logger.info("Impl PR #%d merged for %s — closing issue", impl_pr, key)
 
     try:
-        comment = (
-            f"Implementation merged in #{impl_pr}. "
-            "Please verify and close when confirmed."
-        )
-        gh_issue_reopen_and_reassign(repo, issue_number, issue_author, comment)
-
-        awaiting_label = f"{cfg.github_user}:awaiting-verification"
-        gh_ensure_label_exists(repo, awaiting_label)
-        gh_issue_add_label(repo, issue_number, awaiting_label)
-
-        update_issue_state(state, key, status="awaiting_verification")
-        logger.info("Issue %s handed back to %s", key, issue_author)
+        gh_issue_comment(repo, issue_number,
+                         f"Implemented in #{impl_pr}. Closing.")
+        gh_run(["issue", "close", str(issue_number), "--repo", repo])
+        update_issue_state(state, key, status="submitted")
+        logger.info("Issue %s closed", key)
 
     except Exception as e:
-        logger.error("Failed post-merge handoff for %s: %s", key, e, exc_info=True)
+        logger.error("Failed closing issue %s: %s", key, e, exc_info=True)
         update_issue_state(state, key, status="failed")
 
 
@@ -817,7 +837,7 @@ def check_impl_merged(
 # Resume and rollback
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATES = {"merged", "awaiting_verification", "failed"}
+TERMINAL_STATES = {"merged", "awaiting_verification", "submitted", "failed"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
 
 
@@ -1109,34 +1129,44 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
 
 def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
     """
-    Remove in-progress labels from issues that have no hunter state entry.
-    Runs once on startup.
+    Remove hunter-owned labels from issues that have no matching hunter state entry
+    or are in a terminal state. Runs at startup and periodically.
     """
-    label = f"{cfg.github_user}:in-progress"
+    labels_to_check = [
+        f"{cfg.github_user}:in-progress",
+        f"{cfg.github_user}:proposal-open",
+        f"{cfg.github_user}:implementing",
+    ]
     for repo in repos:
-        try:
-            result = gh_run([
-                "issue", "list",
-                "--repo", repo,
-                "--state", "open",
-                "--label", label,
-                "--json", "number",
-                "--limit", "50",
-            ], check=False)
-            if result.returncode != 0:
-                continue
-            issues = json.loads(result.stdout)
-            for issue in issues:
-                issue_number = issue["number"]
-                key = f"{repo}!{issue_number}"
-                if key not in state:
-                    logger.warning("Removing orphaned label %s from issue %s", label, key)
-                    try:
-                        gh_issue_remove_label(repo, issue_number, label)
-                    except Exception as e:
-                        logger.warning("Could not remove orphaned label from %s: %s", key, e)
-        except Exception as e:
-            logger.warning("Could not scan orphaned labels for %s: %s", repo, e)
+        for label in labels_to_check:
+            try:
+                result = gh_run([
+                    "issue", "list",
+                    "--repo", repo,
+                    "--state", "open",
+                    "--label", label,
+                    "--json", "number",
+                    "--limit", "50",
+                ], check=False)
+                if result.returncode != 0:
+                    continue
+                issues = json.loads(result.stdout)
+                for issue in issues:
+                    issue_number = issue["number"]
+                    key = f"{repo}!{issue_number}"
+                    entry = state.get(key, {})
+                    status = entry.get("status", "")
+                    if not entry or status in ("submitted", "failed"):
+                        logger.warning("Removing orphaned label %s from issue %s",
+                                       label, key)
+                        try:
+                            gh_issue_remove_label(repo, issue_number, label)
+                        except Exception as e:
+                            logger.warning("Could not remove orphaned label from %s: %s",
+                                           key, e)
+            except Exception as e:
+                logger.warning("Could not scan orphaned labels for %s/%s: %s",
+                               repo, label, e)
 
 
 def _issue_has_hunter_labels(issue: dict) -> bool:
@@ -1146,6 +1176,90 @@ def _issue_has_hunter_labels(issue: dict) -> bool:
         any(lbl.endswith(suffix) for suffix in HUNTER_LABEL_PREFIXES)
         for lbl in label_names
     )
+
+
+# ---------------------------------------------------------------------------
+# Auto-label PR helpers (SPEC 1)
+# ---------------------------------------------------------------------------
+
+_PROPOSAL_TITLE_RE = re.compile(
+    r"^(proposal|propose|sdd|design|rfc|spec)[:\s]", re.IGNORECASE)
+_IMPL_TITLE_RE = re.compile(
+    r"^(impl|implement|feat|fix|chore)[:\s]", re.IGNORECASE)
+
+
+def _is_obviously_proposal(pr: dict) -> bool:
+    title = pr.get("title") or ""
+    branch = pr.get("headRefName") or ""
+    files = pr.get("files") or []
+    file_paths = [f.get("path", "") for f in files]
+    if _PROPOSAL_TITLE_RE.match(title):
+        return True
+    if "/proposal" in branch or "-proposal" in branch:
+        return True
+    # adds files under openspec/changes/
+    if any("openspec/changes/" in p for p in file_paths):
+        return True
+    return False
+
+
+def _is_obviously_implementation(pr: dict) -> bool:
+    title = pr.get("title") or ""
+    branch = pr.get("headRefName") or ""
+    files = pr.get("files") or []
+    file_paths = [f.get("path", "") for f in files]
+    if _IMPL_TITLE_RE.match(title) and ("/impl" in branch or "-impl" in branch):
+        return True
+    if "/impl" in branch or "-impl" in branch:
+        return True
+    # archives a proposal (moves from openspec/changes/ to openspec/archive/)
+    if any("openspec/archive/" in p for p in file_paths):
+        return True
+    return False
+
+
+def auto_label_prs(cfg: Config, repos: list[str]) -> None:
+    if not cfg.auto_label_prs:
+        return
+    for repo in repos:
+        try:
+            result = gh_run([
+                "pr", "list", "--repo", repo, "--state", "open",
+                "--json", "number,title,headRefName,labels,files",
+                "--limit", "100",
+            ], check=False)
+            if result.returncode != 0:
+                continue
+            prs = json.loads(result.stdout)
+        except Exception as e:
+            logger.warning("auto_label_prs: failed to list PRs for %s: %s", repo, e)
+            continue
+
+        for pr in prs:
+            label_names = {lbl.get("name", "") for lbl in pr.get("labels") or []}
+            if "sdd-proposal" in label_names or "sdd-implementation" in label_names:
+                continue
+
+            if _is_obviously_proposal(pr):
+                try:
+                    gh_ensure_label_exists(repo, "sdd-proposal")
+                    gh_run(["pr", "edit", str(pr["number"]), "--repo", repo,
+                            "--add-label", "sdd-proposal"])
+                    logger.info("Auto-labeled PR #%d as sdd-proposal in %s",
+                                pr["number"], repo)
+                except Exception as e:
+                    logger.warning("auto_label_prs: could not label PR #%d: %s",
+                                   pr["number"], e)
+            elif _is_obviously_implementation(pr):
+                try:
+                    gh_ensure_label_exists(repo, "sdd-implementation", color="e4e669")
+                    gh_run(["pr", "edit", str(pr["number"]), "--repo", repo,
+                            "--add-label", "sdd-implementation"])
+                    logger.info("Auto-labeled PR #%d as sdd-implementation in %s",
+                                pr["number"], repo)
+                except Exception as e:
+                    logger.warning("auto_label_prs: could not label PR #%d: %s",
+                                   pr["number"], e)
 
 
 # ---------------------------------------------------------------------------
@@ -1178,16 +1292,26 @@ def start(once: bool):
 
     hunter_repos = list(dict.fromkeys(cfg.repos + cfg.hunter_only_repos))
 
+    poll_cycle_count = 0
     # Scan for orphaned labels from crashed previous runs
     state = load_hunter_state()
     scan_orphaned_labels(cfg, state, hunter_repos)
 
     try:
         while not _stop.is_set():
+            poll_cycle_count += 1
             state = load_hunter_state()
+
+            # Periodic orphaned-label scan
+            if cfg.orphan_scan_interval > 0 and poll_cycle_count % cfg.orphan_scan_interval == 0:
+                scan_orphaned_labels(cfg, state, hunter_repos)
+                state = load_hunter_state()
 
             # Ingest new issues from Jira CSV exports
             ingest_jira_csv(cfg, hunter_repos)
+
+            # Auto-label unlabelled proposal/implementation PRs
+            auto_label_prs(cfg, hunter_repos)
 
             # Resume or rollback any in-flight issues from previous runs
             resume_in_flight_issues(cfg, state)
@@ -1196,6 +1320,8 @@ def start(once: bool):
             for repo in hunter_repos:
                 if _stop.is_set():
                     break
+
+                new_issues_this_cycle = 0
 
                 # --- Poll assigned issues ---
                 try:
@@ -1221,9 +1347,12 @@ def start(once: bool):
                         # New issue: only process if no competing labels
                         if _issue_has_hunter_labels(issue):
                             continue
+                        if new_issues_this_cycle >= cfg.max_new_issues_per_cycle:
+                            continue
                         _current_issue_key[:] = [key]
                         process_issue(cfg, state, repo, issue)
                         _current_issue_key.clear()
+                        new_issues_this_cycle += 1
                         # Reload state after processing
                         state = load_hunter_state()
 

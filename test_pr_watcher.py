@@ -247,6 +247,7 @@ class TestGhSubprocessWrapper:
              "headRefOid": "abc123", "headRefName": "fix-bug", "isDraft": False}
         ]
         fake_result = MagicMock()
+        fake_result.returncode = 0
         fake_result.stdout = json.dumps(fake_prs)
 
         with patch("subprocess.run", return_value=fake_result) as mock_run:
@@ -263,6 +264,7 @@ class TestGhSubprocessWrapper:
 
     def test_gh_pr_view_calls_gh_correctly(self):
         fake_result = MagicMock()
+        fake_result.returncode = 0
         fake_result.stdout = "PR title: Fix bug\n"
         with patch("subprocess.run", return_value=fake_result) as mock_run:
             result = pw.gh_pr_view("owner/repo", 42)
@@ -274,6 +276,7 @@ class TestGhSubprocessWrapper:
 
     def test_gh_pr_diff_calls_gh_correctly(self):
         fake_result = MagicMock()
+        fake_result.returncode = 0
         fake_result.stdout = "diff --git a/foo.py b/foo.py\n"
         with patch("subprocess.run", return_value=fake_result) as mock_run:
             pw.gh_pr_diff("owner/repo", 42)
@@ -285,6 +288,7 @@ class TestGhSubprocessWrapper:
         body_file = tmp_path / "body.md"
         body_file.write_text("LGTM")
         fake_result = MagicMock()
+        fake_result.returncode = 0
         with patch("subprocess.run", return_value=fake_result) as mock_run:
             pw.gh_pr_review("owner/repo", 42, "approve", body_file)
         args = mock_run.call_args[0][0]
@@ -295,6 +299,7 @@ class TestGhSubprocessWrapper:
         body_file = tmp_path / "body.md"
         body_file.write_text("Needs work")
         fake_result = MagicMock()
+        fake_result.returncode = 0
         with patch("subprocess.run", return_value=fake_result) as mock_run:
             pw.gh_pr_review("owner/repo", 42, "request-changes", body_file)
         args = mock_run.call_args[0][0]
@@ -302,6 +307,7 @@ class TestGhSubprocessWrapper:
 
     def _fake_view(self, state="OPEN", reviews=None):
         fake = MagicMock()
+        fake.returncode = 0
         fake.stdout = json.dumps({"state": state, "reviews": reviews or []})
         return fake
 
@@ -596,3 +602,62 @@ class TestRunReviewDispatch:
             pw.run_review(cfg, "owner/repo", 99, worktree)
         assert "99" in captured["prompt"]
         assert "$ARGUMENTS" not in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# gh_run permanent error detection (SPEC 6)
+# ---------------------------------------------------------------------------
+
+class TestGhRunPermanentErrors:
+    def _make_result(self, returncode=1, stderr=""):
+        r = MagicMock()
+        r.returncode = returncode
+        r.stderr = stderr
+        r.stdout = ""
+        r.check_returncode.side_effect = subprocess.CalledProcessError(returncode, ["gh"])
+        return r
+
+    def test_permanent_error_fails_immediately_no_retry(self):
+        """404 error should not be retried."""
+        result = self._make_result(1, "error: not found")
+        with patch("subprocess.run", return_value=result) as mock_run, \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(subprocess.CalledProcessError):
+                pw.gh_run(["issue", "view", "1"])
+        assert mock_run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_transient_error_retries(self):
+        """Rate limit errors should be retried."""
+        fail = self._make_result(1, "error: rate limit exceeded")
+        ok = MagicMock(); ok.returncode = 0; ok.stdout = "[]"
+        with patch("subprocess.run", side_effect=[fail, ok]) as mock_run, \
+             patch("time.sleep"):
+            result = pw.gh_run(["pr", "list"])
+        assert mock_run.call_count == 2
+
+    def test_unknown_error_fails_immediately(self):
+        """Unknown errors should not be retried."""
+        result = self._make_result(1, "error: something unexpected happened")
+        with patch("subprocess.run", return_value=result) as mock_run, \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(subprocess.CalledProcessError):
+                pw.gh_run(["pr", "list"])
+        assert mock_run.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_check_false_returns_on_error(self):
+        """check=False should return even on error."""
+        result = self._make_result(1, "error: not found")
+        with patch("subprocess.run", return_value=result):
+            r = pw.gh_run(["issue", "view", "1"], check=False)
+        assert r.returncode == 1
+
+    def test_403_fails_immediately(self):
+        result = self._make_result(1, "error: 403 forbidden")
+        with patch("subprocess.run", return_value=result) as mock_run, \
+             patch("time.sleep") as mock_sleep:
+            with pytest.raises(subprocess.CalledProcessError):
+                pw.gh_run(["pr", "list"])
+        assert mock_run.call_count == 1
+        mock_sleep.assert_not_called()

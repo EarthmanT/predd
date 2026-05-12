@@ -2,7 +2,7 @@
 
 ## Problem
 
-`scan_orphaned_labels` only removes `{user}:in-progress` labels. Crashes during later workflow steps leave `{user}:proposal-open` and `{user}:implementing` labels on issues with no matching hunter state. These issues appear permanently stuck on GitHub.
+`scan_orphaned_labels` only removes `{github_user}:in-progress` labels. Crashes during later workflow steps leave `{github_user}:proposal-open` and `{github_user}:implementing` labels on issues with no matching hunter state. These issues appear permanently stuck on GitHub.
 
 ## Fix
 
