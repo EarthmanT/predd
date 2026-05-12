@@ -518,19 +518,10 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None,
     return stdout
 
 
-_CLAUDE_SYSTEM = (
-    "You are running in non-interactive automation mode. "
-    "Never use AskUserQuestion or any interactive tool. "
-    "All context you need is in the prompt. Proceed immediately without asking questions."
-)
-
-
 def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     return _run_proc(
-        ["claude", "-p", "--dangerously-skip-permissions",
-         "--system-prompt", _CLAUDE_SYSTEM,
-         "--model", cfg.model],
+        ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model],
         worktree,
         env=env,
         stdin_text=prompt,

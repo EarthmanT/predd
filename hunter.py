@@ -423,10 +423,19 @@ def skill_has_commits(worktree: Path) -> bool:
 
 
 def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> str:
-    """Load skill, substitute $ARGUMENTS, run via configured backend."""
+    """Load skill and run with arguments as the task context."""
     if not skill_path.exists():
         raise FileNotFoundError(f"Skill not found: {skill_path}")
-    prompt = skill_path.read_text().replace("$ARGUMENTS", arguments)
+    skill_text = skill_path.read_text()
+    # Strip YAML frontmatter if present
+    if skill_text.startswith("---"):
+        parts = skill_text.split("---", 2)
+        skill_body = parts[2].lstrip("\n") if len(parts) >= 3 else skill_text
+    else:
+        skill_body = skill_text
+    # Task-first structure: give the concrete task before the skill instructions
+    # so the model doesn't wait for user input
+    prompt = f"Run the following workflow for this task:\n\n{arguments}\n\n---\n\n{skill_body}"
     if cfg.backend == "claude":
         return _run_claude(cfg, prompt, worktree)
     if cfg.backend == "devin":
