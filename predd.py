@@ -519,8 +519,6 @@ def _run_proc(cmd: list[str], worktree: Path, env: dict | None = None,
 
 
 def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
-    # Strip ANTHROPIC_API_KEY so claude falls back to OAuth (subscription auth)
-    # Pass prompt via stdin to avoid OS arg length limits
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     return _run_proc(
         ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model],
