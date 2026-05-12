@@ -21,7 +21,8 @@ Windsurf will run the steps below.
 
 - Python 3.12+ and `uv`
 - `gh` CLI — run `gh auth login` once
-- `claude` CLI — run `claude login` once (uses your subscription, no API key needed)
+- `devin` CLI — authenticated (`devin auth login` or equivalent)
+- `claude` CLI — run `claude login` once (optional, used if backend is set to `claude`)
 
 ### 2. Install
 
@@ -50,8 +51,8 @@ skill_path          = "/path/to/pr-review/SKILL.md"
 proposal_skill_path = "/path/to/sdd-proposal/SKILL.md"
 impl_skill_path     = "/path/to/sdd-implementation/SKILL.md"
 
-backend = "claude"
-model   = "claude-haiku-4-5"
+backend = "devin"
+model   = "haiku-4-5"
 ```
 
 Verify:
@@ -106,8 +107,8 @@ trigger = "requested"  # only PRs where you are an explicit reviewer
 ## Backends
 
 ```toml
+backend = "devin"    # uses devin CLI (default)
 backend = "claude"   # uses claude CLI with your subscription
-backend = "devin"    # uses devin CLI
 ```
 
 ## hunter config options
