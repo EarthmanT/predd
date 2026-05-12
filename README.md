@@ -1,138 +1,120 @@
 # predd
 
-Polls GitHub for open PRs, drafts reviews via Claude, waits for your approval before submitting.
+Two daemons that run in the background and do your GitHub work:
 
-## Prerequisites
+- **predd** — reviews every open PR assigned to you, posts inline comments via Claude
+- **hunter** — picks up issues assigned to you, writes proposals, implements them, self-reviews
 
-- WSL2 with Python 3.12+ and `uv` installed
-- `gh` CLI authenticated: `gh auth login`
-- `claude` CLI authenticated: `claude login`
-- `BurntToast` PowerShell module on Windows: `Install-Module BurntToast`
-- `.wav` files for notification sounds (optional)
+---
 
-## Install
+## Setup (tell Windsurf: "set this up for me")
+
+> Clone this repo, then set up predd and hunter for my GitHub account. My username is `<your-github-username>`, my repos are `["owner/repo"]`, my worktrees go in `~/pr-reviews`, and my pr-review skill is at `<path-to-skill>`.
+
+Windsurf will run the steps below.
+
+---
+
+## Manual setup
+
+### 1. Prerequisites
+
+- Python 3.12+ and `uv`
+- `gh` CLI — run `gh auth login` once
+- `claude` CLI — run `claude login` once (uses your subscription, no API key needed)
+
+### 2. Install
 
 ```bash
-# Make executable and symlink to PATH
-chmod +x /path/to/predd.py
-ln -s /path/to/predd.py ~/.local/bin/predd
+git clone https://github.com/your-org/predd ~/windsurf/projects/predd
+chmod +x ~/windsurf/projects/predd/predd.py ~/windsurf/projects/predd/hunter.py
+ln -s ~/windsurf/projects/predd/predd.py ~/.local/bin/predd
+ln -s ~/windsurf/projects/predd/hunter.py ~/.local/bin/hunter
 ```
 
-## 1. Configure repos
-
-On first run, a config template is created automatically:
+### 3. Configure
 
 ```bash
-predd config
-# → writes ~/.config/predd/config.toml and exits
+predd start --once   # generates ~/.config/predd/config.toml then exits
 ```
 
 Edit `~/.config/predd/config.toml`:
 
 ```toml
-repos = [
-  "owner/repo-one",
-  "owner/repo-two",
-]
+repos            = ["owner/repo"]          # watched by both predd and hunter
+github_user      = "your-github-username"
+worktree_base    = "/home/you/pr-reviews"
 
-github_user = "your-github-username"   # your PRs are skipped
-worktree_base = "/home/you/pr-reviews" # where PR branches are checked out
+# Skills — point these at your actual skill files
+skill_path          = "/path/to/pr-review/SKILL.md"
+proposal_skill_path = "/path/to/sdd-proposal/SKILL.md"
+impl_skill_path     = "/path/to/sdd-implementation/SKILL.md"
 
-poll_interval = 90                     # seconds between polls
-
-# Optional: Windows-side .wav paths for sound alerts
-sound_new_pr    = "C:\\Users\\you\\sounds\\new-pr.wav"
-sound_review_ready = "C:\\Users\\you\\sounds\\review-ready.wav"
-
-claude_model = "claude-opus-4-7"
+backend = "claude"
+model   = "claude-haiku-4-5"
 ```
 
-Verify the resolved config loads cleanly:
+Verify:
 
 ```bash
 predd config
+gh pr list --repo owner/repo   # confirm gh auth works
 ```
 
-## 2. Verify repo access
-
-The daemon uses `gh` as a subprocess and inherits your existing auth — no extra setup needed.
-Just confirm `gh` can already see the repo:
+### 4. Run
 
 ```bash
-gh pr list --repo fusion-e/ai-bp-toolkit
-```
-
-If that works, the daemon will work.
-
-## 3. Set up the daemon
-
-Run in a `tmux` session (recommended):
-
-```bash
+# predd — reviews PRs
 tmux new -s predd
 predd start
-# Ctrl-B D to detach
+# Ctrl-B then d to detach
+
+# hunter — picks up issues and writes proposals
+tmux new -s hunter
+hunter start
+# Ctrl-B then d to detach
 ```
 
-Or with `nohup`:
+### 5. Verify
 
 ```bash
-nohup predd start >> ~/.config/predd/log.txt 2>&1 &
+tail -f ~/.config/predd/log.txt         # predd activity
+tail -f ~/.config/predd/hunter-log.txt  # hunter activity
+predd list                               # pending reviews
+hunter status                            # issue pipeline state
 ```
 
-Or write a systemd user unit (`~/.config/systemd/user/predd.service`):
+---
 
-```ini
-[Unit]
-Description=predd daemon
+## Day-to-day
 
-[Service]
-ExecStart=%h/.local/bin/predd start
-Restart=on-failure
+**predd** — runs silently, posts reviews on GitHub as they come in. Check `predd list` if you want to see what it has reviewed today.
 
-[Install]
-WantedBy=default.target
+**hunter** — when you're assigned an issue, hunter claims it, runs the proposal skill, opens a draft PR for you to review, then waits. Once you merge the proposal, it implements and self-reviews.
+
+**Graceful shutdown:** `Ctrl-C` once waits for the current task to finish. `Ctrl-C` twice force-quits and rolls back.
+
+---
+
+## Trigger modes (predd)
+
+```toml
+trigger = "ready"      # review all open non-draft PRs (default)
+trigger = "requested"  # only PRs where you are an explicit reviewer
 ```
 
-```bash
-systemctl --user enable --now predd
+## Backends
+
+```toml
+backend = "claude"   # uses claude CLI with your subscription
+backend = "devin"    # uses devin CLI
 ```
 
-## 4. Verify it's working
+## hunter config options
 
-**Single poll (no daemon needed):**
-
-```bash
-predd start --once
-# Should exit cleanly; check log for any errors
+```toml
+max_review_fix_loops = 1      # self-review cycles before flagging human
+auto_review_draft    = false  # wait for PR to leave draft before self-reviewing
+branch_prefix        = "usr/at"
+max_resume_retries   = 2      # retries before rolling back a stuck issue
 ```
-
-**Check the log:**
-
-```bash
-tail -f ~/.config/predd/log.txt
-```
-
-**List pending reviews:**
-
-```bash
-predd list
-```
-
-**When a review is ready:**
-
-```bash
-predd show 123           # read the draft
-# edit ~/.../review-draft.md if you want changes
-predd approve 123        # submit as approval
-predd comment 123        # submit as comment
-predd request-changes 123 # submit as request-changes
-predd reject 123         # discard (no GitHub submission)
-```
-
-PR argument accepts `owner/repo#123` or just `123` (unambiguous within your watched repos).
-
-## Customize the review prompt
-
-Edit `~/.config/predd/review-prompt.md` to change what Claude looks for.
-The default prompt asks for a Verdict, Summary, Findings (with severity), and Questions for the author.
