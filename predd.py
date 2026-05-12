@@ -102,9 +102,9 @@ trigger = "ready"
 backend = "devin"
 
 # Model passed to the backend
-# devin default: haiku-4-5
+# devin default: swe-1.6
 # claude default: claude-opus-4-7
-model = "haiku-4-5"
+model = "swe-1.6"
 
 # Branch prefix for hunter-created branches
 branch_prefix = "usr/at"
@@ -174,7 +174,7 @@ class Config:
         self.backend: str = data.get("backend", "devin")
         # model: per-backend default; claude_model is accepted as legacy alias
         self.model: str = data.get("model") or data.get("claude_model") or (
-            "haiku-4-5" if data.get("backend", "devin") == "devin" else "claude-opus-4-7"
+            "swe-1.6" if data.get("backend", "devin") == "devin" else "claude-opus-4-7"
         )
         self.branch_prefix: str = data.get("branch_prefix", "usr/at")
         self.max_review_fix_loops: int = data.get("max_review_fix_loops", 1)
