@@ -224,9 +224,31 @@ def gh_ensure_label_exists(repo: str, label: str, color: str = "0075ca") -> None
     gh_run(["label", "create", label, "--repo", repo, "--color", color, "--force"])
 
 
+def gh_find_merged_proposal(repo: str, issue_number: int, title: str) -> int | None:
+    """Find a merged sdd-proposal PR for this issue. Returns PR number or None."""
+    result = gh_run([
+        "pr", "list",
+        "--repo", repo,
+        "--state", "merged",
+        "--label", "sdd-proposal",
+        "--json", "number,title,body",
+        "--limit", "100",
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    prs = json.loads(result.stdout)
+    issue_marker = f"#{issue_number}"
+    for pr in prs:
+        body = pr.get("body") or ""
+        pr_title = pr.get("title") or ""
+        if issue_marker in body or issue_marker in pr_title:
+            return pr["number"]
+    return None
+
+
 def gh_create_branch_and_pr(
     repo: str, base: str, branch: str, title: str, body: str, draft: bool = True,
-    worktree: Path | None = None,
+    worktree: Path | None = None, label: str | None = None,
 ) -> int:
     """Create branch, push it, create PR. Returns PR number."""
     cwd = str(worktree) if worktree else None
@@ -238,7 +260,6 @@ def gh_create_branch_and_pr(
     )
     current_branch = current.stdout.strip()
     if current_branch != branch:
-        # Try to checkout existing branch, or create it
         co = subprocess.run(
             ["git", "checkout", branch],
             capture_output=True, cwd=cwd,
@@ -263,6 +284,8 @@ def gh_create_branch_and_pr(
     ]
     if draft:
         cmd.append("--draft")
+    if label:
+        cmd += ["--label", label]
 
     result = gh_run(cmd)
     # Output is the PR URL; parse number from it
@@ -513,8 +536,8 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         if not skill_has_commits(worktree):
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
 
-        marker = f"hunter:issue-{issue_number}"
-        pr_body = f"Proposal for issue #{issue_number}\n\n{marker}"
+        pr_body = f"Proposal for issue #{issue_number}"
+        gh_ensure_label_exists(repo, "sdd-proposal", color="0075ca")
         pr_number = gh_create_branch_and_pr(
             repo=repo,
             base=base_branch,
@@ -523,6 +546,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             body=pr_body,
             draft=True,
             worktree=worktree,
+            label="sdd-proposal",
         )
 
         in_progress_label = f"{cfg.github_user}:in-progress"
@@ -544,21 +568,15 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
 
 
 def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: dict) -> None:
-    """If proposal PR merged, kick off implementation."""
-    proposal_pr = entry.get("proposal_pr")
-    if not proposal_pr:
-        return
-
-    try:
-        if not gh_pr_is_merged(repo, proposal_pr):
-            return
-    except Exception as e:
-        logger.warning("Could not check proposal PR %d for %s: %s", proposal_pr, key, e)
-        return
-
+    """If a merged sdd-proposal PR exists for this issue, kick off implementation."""
     issue_number = entry["issue_number"]
     title = entry["title"]
-    logger.info("Proposal PR #%d merged for %s — starting implementation", proposal_pr, key)
+
+    merged_pr = gh_find_merged_proposal(repo, issue_number, title)
+    if not merged_pr:
+        return
+
+    logger.info("Proposal PR #%d merged for %s — starting implementation", merged_pr, key)
 
     update_issue_state(state, key, status="implementing")
 
@@ -579,8 +597,8 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         if not skill_has_commits(worktree):
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
 
-        marker = f"hunter:impl-{issue_number}"
-        pr_body = f"Implementation for issue #{issue_number}\n\n{marker}"
+        pr_body = f"Implementation for issue #{issue_number}"
+        gh_ensure_label_exists(repo, "sdd-implementation", color="e4e669")
         pr_number = gh_create_branch_and_pr(
             repo=repo,
             base=base_branch,
@@ -589,6 +607,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             body=pr_body,
             draft=True,
             worktree=worktree,
+            label="sdd-implementation",
         )
 
         implementing_label = f"{cfg.github_user}:implementing"

@@ -609,12 +609,12 @@ class TestCheckProposalMerged:
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", return_value=False) as mock_merged, \
+        with patch.object(h, "gh_find_merged_proposal", return_value=None), \
              patch.object(h, "gh_repo_default_branch") as mock_branch:
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
         mock_branch.assert_not_called()
-        assert state == {}  # nothing changed
+        assert state == {}
 
     def test_merged_starts_implementation(self, tmp_path):
         cfg = _make_cfg(tmp_path)
@@ -629,7 +629,7 @@ class TestCheckProposalMerged:
         worktree = tmp_path / "impl-wt"
         worktree.mkdir()
 
-        with patch.object(h, "gh_pr_is_merged", return_value=True), \
+        with patch.object(h, "gh_find_merged_proposal", return_value=42), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
              patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
              patch.object(h, "run_skill", return_value="done"), \
@@ -1274,6 +1274,58 @@ class TestGhCreateBranchAndPr:
         gh_create_call = [a for a in called_args if "gh" in a]
         assert all("--draft" not in a for a in gh_create_call)
 
+    def test_label_passed_to_gh(self, tmp_path):
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        called_args = []
+
+        def fake_run(args, **kwargs):
+            called_args.append(list(args))
+            r = MagicMock()
+            r.stdout = "https://github.com/owner/repo/pull/7\n"
+            r.returncode = 0
+            return r
+
+        with patch("subprocess.run", side_effect=fake_run):
+            h.gh_create_branch_and_pr(
+                "owner/repo", "main", "feat/1", "PR", "body",
+                label="sdd-proposal", worktree=worktree,
+            )
+        gh_calls = [a for a in called_args if len(a) > 0 and a[0] == "gh"]
+        assert any("--label" in a and "sdd-proposal" in a for a in gh_calls)
+
+
+class TestGhFindMergedProposal:
+    def _fake_gh(self, prs):
+        r = MagicMock()
+        r.returncode = 0
+        r.stdout = json.dumps(prs)
+        return r
+
+    def test_finds_by_issue_number_in_body(self):
+        prs = [{"number": 42, "title": "Proposal: fix", "body": "Fixes #10"}]
+        with patch("subprocess.run", return_value=self._fake_gh(prs)):
+            result = h.gh_find_merged_proposal("owner/repo", 10, "fix")
+        assert result == 42
+
+    def test_finds_by_issue_number_in_title(self):
+        prs = [{"number": 55, "title": "Proposal for #10", "body": ""}]
+        with patch("subprocess.run", return_value=self._fake_gh(prs)):
+            result = h.gh_find_merged_proposal("owner/repo", 10, "fix")
+        assert result == 55
+
+    def test_returns_none_when_no_match(self):
+        prs = [{"number": 1, "title": "Unrelated", "body": "nothing"}]
+        with patch("subprocess.run", return_value=self._fake_gh(prs)):
+            result = h.gh_find_merged_proposal("owner/repo", 10, "fix")
+        assert result is None
+
+    def test_returns_none_on_gh_failure(self):
+        r = MagicMock(); r.returncode = 1; r.stdout = ""
+        with patch("subprocess.run", return_value=r):
+            result = h.gh_find_merged_proposal("owner/repo", 10, "fix")
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # TestSetupNewBranchWorktree
@@ -1403,7 +1455,7 @@ class TestCheckProposalMergedExceptionInImpl:
             "status": "proposal_open",
         }
 
-        with patch.object(h, "gh_pr_is_merged", return_value=True), \
+        with patch.object(h, "gh_find_merged_proposal", return_value=42), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
              patch.object(h, "setup_new_branch_worktree", side_effect=RuntimeError("clone failed")), \
              patch.object(h, "save_hunter_state"):

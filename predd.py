@@ -398,10 +398,13 @@ def find_local_repo(repo: str) -> Path | None:
 
 def _worktree_cleanup(local_repo: Path, wt_path: Path, branch: str | None = None) -> None:
     """Remove stale worktree registration and optionally delete the local branch."""
+    # Prune first — catches directories already deleted manually
+    subprocess.run(["git", "worktree", "prune"], cwd=local_repo, capture_output=True)
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(wt_path)],
         cwd=local_repo, capture_output=True,
     )
+    # Prune again — catches anything remove left behind
     subprocess.run(["git", "worktree", "prune"], cwd=local_repo, capture_output=True)
     if branch:
         subprocess.run(["git", "branch", "-D", branch], cwd=local_repo, capture_output=True)
@@ -769,8 +772,11 @@ def start(once: bool):
                     entry_status = entry.get("status", "")
 
                     if entry_sha == head_sha and entry_status in (
-                        "submitted", "rejected", "awaiting_approval", "reviewing"
+                        "rejected", "awaiting_approval", "reviewing"
                     ):
+                        continue
+                    # submitted with same SHA → skip; new SHA → re-review
+                    if entry_sha == head_sha and entry_status == "submitted":
                         continue
 
                     if gh_pr_already_reviewed(repo, pr_number, cfg.github_user):
