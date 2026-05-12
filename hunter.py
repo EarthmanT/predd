@@ -1103,6 +1103,7 @@ def start(once: bool):
                     # Reload after each advancement
                     state = load_hunter_state()
 
+            logger.info("poll complete — next in %ds", cfg.poll_interval)
             if once or _stop.wait(cfg.poll_interval):
                 break
 
