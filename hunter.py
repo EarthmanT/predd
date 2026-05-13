@@ -45,6 +45,9 @@ repo_slug = _predd.repo_slug
 find_local_repo = _predd.find_local_repo
 setup_new_branch_worktree = _predd.setup_new_branch_worktree
 _now_iso = _predd._now_iso
+start_status_server = _predd.start_status_server
+stop_status_server = _predd.stop_status_server
+_run_bedrock_skill = _predd._run_bedrock_skill
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +596,8 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
         return _run_claude(cfg, prompt, worktree)
     if cfg.backend == "devin":
         return _run_devin_skill(cfg, prompt, skill_path, worktree)
+    if cfg.backend == "bedrock":
+        return _run_bedrock_skill(cfg, prompt, skill_path, worktree)
     raise ValueError(f"Unknown backend: {cfg.backend}")
 
 
@@ -902,7 +907,11 @@ def self_review_loop(
     logger.info("Self-review found issues for %s — running fix loop %d", key, loops_done + 1)
     try:
         fix_prompt = f"Fix the review findings on PR #{impl_pr}. Original issue: #{issue_number}"
-        _run_claude(cfg, fix_prompt, worktree) if cfg.backend == "claude" else \
+        if cfg.backend == "claude":
+            _run_claude(cfg, fix_prompt, worktree)
+        elif cfg.backend == "bedrock":
+            _run_bedrock_skill(cfg, fix_prompt, cfg.impl_skill_path, worktree)
+        else:
             _run_devin_skill(cfg, fix_prompt, cfg.impl_skill_path, worktree)
         # Push fixes
         subprocess.run(
@@ -1456,6 +1465,33 @@ def cli():
     pass
 
 
+@cli.command(name="status-server")
+@click.option("--port", type=int, default=None, help="Port to run status server on (default from config).")
+def status_server_cmd(port: int):
+    """Start the status server (without hunter daemon)."""
+    setup_logging()
+    cfg = load_config()
+
+    if port is None:
+        port = cfg.status_port
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    _stop.clear()
+
+    logger.info("Status server starting on port %d", port)
+
+    if start_status_server(port):
+        click.echo(f"Status server running at http://localhost:{port}")
+        try:
+            while not _stop.is_set():
+                _stop.wait(1)
+        finally:
+            stop_status_server()
+    else:
+        raise click.ClickException("Failed to start status server")
+
+
 @cli.command()
 @click.option("--once", is_flag=True, help="Run a single poll iteration then exit.")
 def start(once: bool):
@@ -1473,6 +1509,9 @@ def start(once: bool):
     _current_issue_key[:] = []
 
     logger.info("hunter started (once=%s)", once)
+
+    if not once and cfg.status_server_enabled:
+        start_status_server(cfg.status_port)
 
     hunter_repos = list(dict.fromkeys(cfg.repos + cfg.hunter_only_repos))
 
@@ -1577,6 +1616,7 @@ def start(once: bool):
 
         logger.info("hunter shutting down cleanly.")
     finally:
+        stop_status_server()
         if not once:
             release_pid_file()
 

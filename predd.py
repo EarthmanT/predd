@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
+#   "anthropic[bedrock]",
 # ]
 # ///
 
@@ -20,7 +21,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import click
@@ -32,9 +33,11 @@ import click
 CONFIG_DIR = Path("~/.config/predd").expanduser()
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 STATE_FILE = CONFIG_DIR / "state.json"
+HUNTER_STATE_FILE = CONFIG_DIR / "hunter-state.json"
 PID_FILE = CONFIG_DIR / "pid"
 LOG_FILE = CONFIG_DIR / "log.txt"
 DECISION_LOG = CONFIG_DIR / "decisions.jsonl"
+HUNTER_DECISION_LOG = CONFIG_DIR / "hunter-decisions.jsonl"
 
 DEFAULT_REVIEW_PROMPT = """\
 You are reviewing a pull request. Output a markdown document with this structure:
@@ -99,13 +102,19 @@ impl_skill_path = "~/.windsurf/skills/impl/SKILL.md"
 # "requested" — only PRs where you are an explicit reviewer
 trigger = "ready"
 
-# Backend to use for reviews: "devin" or "claude"
-backend = "devin"
+# Backend to use for reviews: "devin", "claude", or "bedrock"
+backend = "bedrock"
 
 # Model passed to the backend
 # devin default: swe-1.6
-# claude default: claude-opus-4-7
-model = "swe-1.6"
+# claude default: claude-opus-4-6
+# bedrock default: eu.anthropic.claude-sonnet-4-5-20250929-v1:0
+model = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+# AWS Bedrock settings (when backend = "bedrock")
+aws_profile = "default"
+aws_region = "us-east-1"
+bedrock_model = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 # Branch prefix for hunter-created branches
 branch_prefix = "usr/at"
@@ -132,6 +141,11 @@ auto_label_prs = true
 
 # Collect review feedback from proposal/impl PRs and store in hunter state
 collect_pr_feedback = true
+
+# Status page server
+status_server_enabled = true
+status_port = 8080
+status_refresh_interval = 30
 
 # Obsidian daemon settings
 observe_interval = 3600       # seconds between observe runs
@@ -213,10 +227,17 @@ class Config:
         self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
         self.auto_label_prs: bool = data.get("auto_label_prs", True)
         self.collect_pr_feedback: bool = data.get("collect_pr_feedback", True)
+        self.status_server_enabled: bool = data.get("status_server_enabled", True)
+        self.status_port: int = data.get("status_port", 8080)
+        self.status_refresh_interval: int = data.get("status_refresh_interval", 30)
         self.observe_interval: int = data.get("observe_interval", 3600)
         self.analyze_hour: int = data.get("analyze_hour", 8)
         self.analyze_days: int = data.get("analyze_days", 7)
         self.analyze_model: str = data.get("analyze_model", "claude-opus-4-7")
+        # Bedrock backend settings
+        self.aws_profile: str = data.get("aws_profile", "default")
+        self.aws_region: str = data.get("aws_region", "us-east-1")
+        self.bedrock_model: str = data.get("bedrock_model", "eu.anthropic.claude-3-7-sonnet-20250219-v1:0")
 
     def to_dict(self) -> dict:
         return {
@@ -245,10 +266,16 @@ class Config:
             "orphan_scan_interval": self.orphan_scan_interval,
             "auto_label_prs": self.auto_label_prs,
             "collect_pr_feedback": self.collect_pr_feedback,
+            "status_server_enabled": self.status_server_enabled,
+            "status_port": self.status_port,
+            "status_refresh_interval": self.status_refresh_interval,
             "observe_interval": self.observe_interval,
             "analyze_hour": self.analyze_hour,
             "analyze_days": self.analyze_days,
             "analyze_model": self.analyze_model,
+            "aws_profile": self.aws_profile,
+            "aws_region": self.aws_region,
+            "bedrock_model": self.bedrock_model,
         }
 
 
@@ -670,7 +697,9 @@ def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
         return _run_claude(cfg, prompt, worktree)
     if cfg.backend == "devin":
         return _run_devin(cfg, prompt, worktree)
-    raise ValueError(f"Unknown backend '{cfg.backend}'. Valid values: claude, devin")
+    if cfg.backend == "bedrock":
+        return _run_bedrock_skill(cfg, prompt, cfg.skill_path, worktree)
+    raise ValueError(f"Unknown backend '{cfg.backend}'. Valid values: claude, devin, bedrock")
 
 # ---------------------------------------------------------------------------
 # PR processing
@@ -811,6 +840,733 @@ def resolve_pr_key(state: dict, pr_arg: str, cfg: Config | None = None) -> tuple
     return matches[0]
 
 # ---------------------------------------------------------------------------
+# Status Server
+# ---------------------------------------------------------------------------
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+
+_status_server_thread = None
+_status_server_should_stop = False
+
+class StatusHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for status page and API."""
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        try:
+            if path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                html = generate_status_html()
+                self.wfile.write(html.encode("utf-8"))
+            elif path == "/api/status":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                data = get_status_json()
+                self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+            else:
+                self.send_error(404)
+        except Exception as e:
+            logger.error("Error handling status request: %s", e)
+            self.send_error(500, str(e))
+
+    def log_message(self, format, *args):
+        """Suppress logging of HTTP requests."""
+        pass
+
+
+def load_recent_decisions(filepath: Path, limit: int = 20) -> list[dict]:
+    """Load recent decision log entries."""
+    if not filepath.exists():
+        return []
+    try:
+        entries = []
+        with open(filepath, "r") as f:
+            for line in f:
+                if line.strip():
+                    entries.append(json.loads(line))
+        return entries[-limit:] if limit else entries
+    except Exception as e:
+        logger.warning("Failed to load decisions from %s: %s", filepath, e)
+        return []
+
+
+def get_status_json() -> dict:
+    """Generate JSON status data for API endpoint."""
+    predd_state = load_state()
+    hunter_state = {}
+    try:
+        if HUNTER_STATE_FILE.exists():
+            hunter_state = json.loads(HUNTER_STATE_FILE.read_text())
+    except Exception as e:
+        logger.warning("Failed to load hunter state: %s", e)
+
+    hunter_decisions = load_recent_decisions(HUNTER_DECISION_LOG, 20)
+    predd_decisions = load_recent_decisions(DECISION_LOG, 20)
+
+    # Compute summaries and group by status
+    predd_by_status = {}
+    for key, entry in predd_state.items():
+        status = entry.get("status", "unknown")
+        if status not in predd_by_status:
+            predd_by_status[status] = []
+        # Extract repo and PR number from key (format: owner/repo#N)
+        m = re.match(r"^(.+)#(\d+)$", key)
+        if m:
+            repo, pr_num = m.group(1), m.group(2)
+            predd_by_status[status].append({
+                "pr": int(pr_num),
+                "repo": repo,
+                "status": status,
+                "head_sha": entry.get("head_sha", "")[:8],
+            })
+
+    predd_summary = {
+        "total": len(predd_state),
+        "reviewing": len(predd_by_status.get("reviewing", [])),
+        "submitted": len(predd_by_status.get("submitted", [])),
+        "failed": len(predd_by_status.get("failed", [])),
+    }
+
+    # Group hunter issues by status
+    hunter_by_status = {}
+    for key, entry in hunter_state.items():
+        status = entry.get("status", "unknown")
+        if status not in hunter_by_status:
+            hunter_by_status[status] = []
+        # Extract repo and issue number from key (format: owner/repo!N)
+        m = re.match(r"^(.+)!(\d+)$", key)
+        if m:
+            repo, issue_num = m.group(1), m.group(2)
+            hunter_by_status[status].append({
+                "issue": int(issue_num),
+                "repo": repo,
+                "status": status,
+                "title": entry.get("title", ""),
+            })
+
+    hunter_summary = {
+        "total": len(hunter_state),
+        "in_progress": len(hunter_by_status.get("in_progress", [])),
+        "proposal_open": len(hunter_by_status.get("proposal_open", [])),
+        "implementing": len(hunter_by_status.get("implementing", [])),
+        "self_reviewing": len(hunter_by_status.get("self_reviewing", [])),
+        "ready_for_review": len(hunter_by_status.get("ready_for_review", [])),
+        "submitted": len(hunter_by_status.get("submitted", [])),
+        "failed": len(hunter_by_status.get("failed", [])),
+    }
+
+    return {
+        "timestamp": _now_iso(),
+        "predd": {
+            "summary": predd_summary,
+            "by_status": predd_by_status,
+            "recent_decisions": predd_decisions[-10:],
+        },
+        "hunter": {
+            "summary": hunter_summary,
+            "by_status": hunter_by_status,
+            "recent_decisions": hunter_decisions[-10:],
+        },
+    }
+
+
+def format_decision(decision: dict) -> str:
+    """Format a decision log entry as HTML activity item."""
+    ts_str = decision.get("ts", "")
+    event = decision.get("event", "unknown")
+
+    # Parse timestamp to human-readable format (HH:MM)
+    try:
+        from datetime import datetime as dt
+        dt_obj = dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+        time_str = dt_obj.strftime("%H:%M")
+    except:
+        time_str = ts_str[:16] if ts_str else "N/A"
+
+    # Determine color and build description
+    color = "gray"
+    repo = decision.get("repo", "")
+
+    # PR-related events
+    if pr := decision.get("pr"):
+        color = "blue" if "skip" in event else "green" if "posted" in event else "red" if "failed" in event else "yellow"
+        pr_link = f'<a href="https://github.com/{repo}/pull/{pr}" target="_blank">#{pr}</a>' if repo else f"#{pr}"
+        reason = decision.get("reason", "")
+        verdict = decision.get("verdict", "")
+
+        if event == "pr_skip":
+            desc = f"Skipped PR {pr_link} ({reason})"
+        elif event == "pr_review_started":
+            desc = f"Started reviewing PR {pr_link}"
+        elif event == "pr_review_posted":
+            desc = f"Posted review on PR {pr_link} ({verdict})"
+        elif event == "pr_review_failed":
+            error = decision.get("error", "unknown error")[:50]
+            desc = f"Review failed for PR {pr_link} ({error})"
+        else:
+            desc = f"PR {pr_link}: {event}"
+
+    # Issue-related events
+    elif issue := decision.get("issue"):
+        color = "blue" if "skip" in event else "green" if event in ["proposal_merged", "issue_closed"] else "red" if "failed" in event else "yellow"
+        issue_link = f'<a href="https://github.com/{repo}/issues/{issue}" target="_blank">#{issue}</a>' if repo else f"#{issue}"
+        reason = decision.get("reason", "")
+        status = decision.get("status", "")
+
+        if event == "issue_skip":
+            desc = f"Skipped issue {issue_link} ({reason})"
+        elif event == "issue_pickup":
+            desc = f"Picked up issue {issue_link}"
+        elif event == "proposal_created":
+            desc = f"Created proposal for issue {issue_link}"
+        elif event == "proposal_merged":
+            desc = f"Proposal merged for issue {issue_link}"
+        elif event == "impl_created":
+            desc = f"Created implementation for issue {issue_link}"
+        elif event == "issue_closed":
+            desc = f"Closed issue {issue_link}"
+        elif event == "rollback":
+            desc = f"Rolled back issue {issue_link}"
+        else:
+            desc = f"Issue {issue_link}: {event}"
+
+    else:
+        desc = event
+
+    color_class = f"activity-{color}"
+    return f'<div class="activity-item"><span class="activity-time">{time_str}</span> <span class="activity-event {color_class}">{desc}</span></div>'
+
+
+def generate_status_html() -> str:
+    """Generate the HTML status page."""
+    status_data = get_status_json()
+    status_json = json.dumps(status_data)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Hunter & Predd Status</title>
+    <style>
+        :root {{
+            --primary: #3b82f6;
+            --green: #10b981;
+            --yellow: #f59e0b;
+            --red: #ef4444;
+            --bg: #f9fafb;
+            --fg: #1f2937;
+            --fg-soft: #6b7280;
+            --border: #e5e7eb;
+            --card-bg: #ffffff;
+            --card-shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+            --card-shadow-hover: 0 10px 15px rgba(0,0,0,0.1), 0 4px 6px rgba(0,0,0,0.05);
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --bg: #111827;
+                --fg: #f3f4f6;
+                --fg-soft: #d1d5db;
+                --border: #374151;
+                --card-bg: #1f2937;
+            }}
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+            background: var(--bg);
+            color: var(--fg);
+            margin: 0;
+            padding: 16px;
+            line-height: 1.6;
+        }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        .header {{
+            margin-bottom: 32px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border);
+        }}
+        h1 {{ margin: 0 0 4px; font-size: 28px; font-weight: 700; }}
+        .header-meta {{ font-size: 13px; color: var(--fg-soft); }}
+        h2 {{ font-size: 18px; font-weight: 600; margin: 28px 0 16px; }}
+        .cards {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }}
+        .card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: var(--card-shadow);
+            transition: all 0.2s ease;
+        }}
+        .card.clickable {{
+            cursor: pointer;
+        }}
+        .card.clickable:hover {{
+            box-shadow: var(--card-shadow-hover);
+            transform: translateY(-2px);
+            border-color: var(--primary);
+        }}
+        .card-label {{
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--fg-soft);
+            margin-bottom: 8px;
+        }}
+        .card-count {{
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--fg);
+        }}
+        .modal {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }}
+        .modal.open {{ display: flex; }}
+        .modal-content {{
+            background: var(--card-bg);
+            border-radius: 12px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 25px rgba(0,0,0,0.15);
+        }}
+        .modal-header {{
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .modal-title {{ font-size: 18px; font-weight: 600; margin: 0; }}
+        .modal-close {{
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: var(--fg-soft);
+            padding: 0;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .modal-body {{
+            padding: 20px;
+        }}
+        .modal-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }}
+        .modal-table th {{
+            text-align: left;
+            padding: 12px;
+            font-weight: 600;
+            border-bottom: 2px solid var(--border);
+            background: var(--bg);
+        }}
+        .modal-table td {{
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+        }}
+        .modal-table tr:last-child td {{ border-bottom: none; }}
+        .modal-table a {{
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }}
+        .modal-table a:hover {{ text-decoration: underline; }}
+        .activity {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: var(--card-shadow);
+        }}
+        .activity-item {{
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+        }}
+        .activity-item:last-child {{ border-bottom: none; }}
+        .activity-time {{
+            font-weight: 600;
+            color: var(--fg-soft);
+            min-width: 60px;
+            display: inline-block;
+        }}
+        .activity-text {{ color: var(--fg); }}
+        .activity-text a {{
+            color: var(--primary);
+            text-decoration: none;
+        }}
+        .activity-text a:hover {{ text-decoration: underline; }}
+        @media (max-width: 640px) {{
+            .cards {{ grid-template-columns: repeat(2, 1fr); }}
+            .modal-content {{ width: 95%; }}
+        }}
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>Hunter & Predd Status</h1>
+        <div class="header-meta">Last updated <span id="timestamp-display"></span></div>
+    </div>
+
+    <section>
+        <h2>Predd (PR Reviews)</h2>
+        <div class="cards" id="predd-cards"></div>
+    </section>
+
+    <section>
+        <h2>Hunter (Issues)</h2>
+        <div class="cards" id="hunter-cards"></div>
+    </section>
+
+    <section>
+        <h2>Recent Activity</h2>
+        <div class="activity" id="activity"></div>
+    </section>
+</div>
+
+<div class="modal" id="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 class="modal-title" id="modal-title"></h3>
+            <button class="modal-close" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body" id="modal-body"></div>
+    </div>
+</div>
+
+<script>
+const statusData = {status_json};
+const modalData = {{}};
+
+function renderPage() {{
+    const timestamp = new Date(statusData.timestamp);
+    document.getElementById('timestamp-display').textContent = timestamp.toLocaleTimeString();
+
+    renderCards('predd');
+    renderCards('hunter');
+    renderActivity();
+}}
+
+function renderCards(type) {{
+    const data = statusData[type];
+    const container = document.getElementById(type + '-cards');
+    const statusOrder = type === 'predd'
+        ? ['reviewing', 'submitted', 'failed']
+        : ['in_progress', 'proposal_open', 'implementing', 'self_reviewing', 'ready_for_review', 'submitted', 'failed'];
+
+    let html = `<div class="card"><div class="card-label">Total</div><div class="card-count">${{data.summary.total}}</div></div>`;
+
+    for (const status of statusOrder) {{
+        const count = data.summary[status] || 0;
+        const items = data.by_status[status] || [];
+        const label = status.replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+
+        if (count > 0) {{
+            const key = type + '_' + status;
+            modalData[key] = {{ label, items, type }};
+            html += `<div class="card clickable" onclick="showModal('${{key}}')">
+                <div class="card-label">${{label}}</div>
+                <div class="card-count">${{count}}</div>
+            </div>`;
+        }} else {{
+            html += `<div class="card"><div class="card-label">${{label}}</div><div class="card-count">0</div></div>`;
+        }}
+    }}
+
+    container.innerHTML = html;
+}}
+
+function showModal(key) {{
+    const data = modalData[key];
+    if (!data) return;
+
+    const modal = document.getElementById('modal');
+    document.getElementById('modal-title').textContent = data.label;
+
+    let html = '<table class="modal-table"><thead><tr>';
+    if (data.type === 'predd') {{
+        html += '<th>PR</th><th>Repo</th>';
+    }} else {{
+        html += '<th>Issue</th><th>Title</th>';
+    }}
+    html += '</tr></thead><tbody>';
+
+    for (const item of data.items) {{
+        if (data.type === 'predd') {{
+            html += `<tr><td><a href="https://github.com/${{item.repo}}/pull/${{item.pr}}" target="_blank">#${{item.pr}}</a></td><td>${{item.repo}}</td></tr>`;
+        }} else {{
+            html += `<tr><td><a href="https://github.com/${{item.repo}}/issues/${{item.issue}}" target="_blank">#${{item.issue}}</a></td><td>${{item.title.substring(0, 50)}}</td></tr>`;
+        }}
+    }}
+
+    html += '</tbody></table>';
+    document.getElementById('modal-body').innerHTML = html;
+    modal.classList.add('open');
+}}
+
+function closeModal() {{
+    document.getElementById('modal').classList.remove('open');
+}}
+
+function renderActivity() {{
+    const decisions = [...statusData.predd.recent_decisions, ...statusData.hunter.recent_decisions]
+        .sort((a, b) => new Date(b.ts) - new Date(a.ts))
+        .slice(0, 20);
+
+    let html = '';
+    if (decisions.length === 0) {{
+        html = '<div style="color: var(--fg-soft); font-style: italic;">No recent activity</div>';
+    }} else {{
+        for (const d of decisions) {{
+            const time = new Date(d.ts).toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit'}});
+            let text = '';
+
+            if (d.pr) {{
+                const reason = d.reason ? ` - ${{d.reason}}` : '';
+                text = `Skipped PR <a href="https://github.com/${{d.repo}}/pull/${{d.pr}}" target="_blank">#${{d.pr}}</a>${{reason}}`;
+            }} else if (d.issue) {{
+                text = `Issue <a href="https://github.com/${{d.repo}}/issues/${{d.issue}}" target="_blank">#${{d.issue}}</a> ${{d.event}}`;
+            }} else {{
+                text = d.event;
+            }}
+
+            html += `<div class="activity-item"><span class="activity-time">${{time}}</span> <span class="activity-text">${{text}}</span></div>`;
+        }}
+    }}
+
+    document.getElementById('activity').innerHTML = html;
+}}
+
+document.getElementById('modal').addEventListener('click', (e) => {{
+    if (e.target.id === 'modal') closeModal();
+}});
+
+renderPage();
+setInterval(refreshData, 10000);
+
+async function refreshData() {{
+    try {{
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        Object.assign(statusData, data);
+        renderPage();
+    }} catch (e) {{
+        console.error('Failed to refresh:', e);
+    }}
+}}
+</script>
+</body>
+</html>"""
+
+
+def start_status_server(port: int) -> threading.Thread | None:
+    """Start the status server in a daemon thread."""
+    global _status_server_thread
+    try:
+        server = HTTPServer(("localhost", port), StatusHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True, name="status-server")
+        thread.start()
+        logger.info("Status server started on http://localhost:%d", port)
+        _status_server_thread = (server, thread)
+        return thread
+    except Exception as e:
+        logger.error("Failed to start status server: %s", e)
+        return None
+
+
+def stop_status_server():
+    """Stop the status server if running."""
+    global _status_server_thread
+    if _status_server_thread:
+        server, thread = _status_server_thread
+        try:
+            server.shutdown()
+            thread.join(timeout=2)
+        except Exception as e:
+            logger.warning("Error stopping status server: %s", e)
+        _status_server_thread = None
+
+
+# ---------------------------------------------------------------------------
+# Bedrock Agent Backend
+# ---------------------------------------------------------------------------
+
+BEDROCK_TOOLS = [
+    {
+        "name": "read_file",
+        "description": "Read a text file in the worktree",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path (relative to worktree)"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "list_files",
+        "description": "List files in worktree directory",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path (default: .)"}
+            }
+        }
+    },
+    {
+        "name": "bash",
+        "description": "Run bash command in worktree",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command to run"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"}
+            },
+            "required": ["command"]
+        }
+    }
+]
+
+
+def _handle_bedrock_tool(name: str, input_data: dict, worktree: Path) -> str:
+    """Execute a bedrock tool."""
+    try:
+        if name == "read_file":
+            path = worktree / input_data.get("path", "")
+            return path.read_text()
+
+        if name == "list_files":
+            target = worktree / input_data.get("path", ".")
+            files = sorted(
+                str(p.relative_to(target))
+                for p in target.rglob("*")
+                if p.is_file() and not any(part.startswith(".") for part in p.parts)
+            )
+            return "\n".join(files) or "(empty)"
+
+        if name == "bash":
+            result = subprocess.run(
+                input_data["command"],
+                shell=True,
+                cwd=str(worktree),
+                capture_output=True,
+                text=True,
+                timeout=input_data.get("timeout", 120)
+            )
+            out = result.stdout or ""
+            if result.stderr:
+                out += f"\n--- stderr ---\n{result.stderr}"
+            return f"exit={result.returncode}\n{out}"
+
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+
+def _run_bedrock_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Path) -> str:
+    """Run skill via AWS Bedrock Claude with agentic tool use."""
+    try:
+        from anthropic import AnthropicBedrock
+    except ImportError:
+        raise RuntimeError("anthropic[bedrock] not installed. Run: pip install -U 'anthropic[bedrock]'")
+
+    # Load SKILL.md
+    skill_text = skill_path.read_text()
+
+    # Create Bedrock client
+    client = AnthropicBedrock(
+        aws_profile=cfg.aws_profile,
+        region_name=cfg.aws_region
+    )
+
+    # Build system prompt
+    system = f"""You are an AI engineer assistant. Follow the SKILL.md to complete the task.
+
+--- SKILL.md ---
+{skill_text}
+--- end SKILL.md ---"""
+
+    # Agentic loop
+    messages = [{"role": "user", "content": prompt}]
+    max_turns = 50
+
+    for turn in range(max_turns):
+        resp = client.messages.create(
+            model=cfg.bedrock_model,
+            max_tokens=4096,
+            system=system,
+            tools=BEDROCK_TOOLS,
+            messages=messages
+        )
+
+        # Collect text output
+        output_text = ""
+        has_tool_use = False
+
+        for block in resp.content:
+            if hasattr(block, "text") and block.text:
+                output_text += block.text
+            if hasattr(block, "type") and block.type == "tool_use":
+                has_tool_use = True
+
+        if output_text:
+            logger.debug("Bedrock output: %s", output_text[:200])
+
+        # If stop reason isn't tool_use, we're done
+        if resp.stop_reason != "tool_use":
+            return output_text or "Task completed"
+
+        # Process tool calls
+        tool_results = []
+        for block in resp.content:
+            if hasattr(block, "type") and block.type == "tool_use":
+                tool_name = block.name
+                tool_input = block.input
+                logger.debug("Bedrock tool call: %s(%s)", tool_name, tool_input)
+
+                result = _handle_bedrock_tool(tool_name, tool_input, worktree)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result
+                })
+
+        # Continue conversation with tool results
+        messages.append({"role": "assistant", "content": [b.model_dump() if hasattr(b, "model_dump") else {"type": b.type, "id": b.id, "name": b.name, "input": b.input} for b in resp.content]})
+        messages.append({"role": "user", "content": tool_results})
+
+    logger.warning("Bedrock hit max turns (%d)", max_turns)
+    return output_text or "Max turns reached"
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -818,6 +1574,296 @@ def resolve_pr_key(state: dict, pr_arg: str, cfg: Config | None = None) -> tuple
 def cli():
     """predd: daemon that drafts PR reviews for human approval."""
     pass
+
+
+@cli.command(name="status-server")
+@click.option("--port", type=int, default=None, help="Port to run status server on (default from config).")
+def status_server_cmd(port: int):
+    """Start the status server (without polling daemon)."""
+    setup_logging()
+    cfg = load_config()
+
+    if port is None:
+        port = cfg.status_port
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+    _stop.clear()
+
+    logger.info("Status server starting on port %d", port)
+
+    if start_status_server(port):
+        click.echo(f"Status server running at http://localhost:{port}")
+        try:
+            while not _stop.is_set():
+                _stop.wait(1)
+        finally:
+            stop_status_server()
+    else:
+        raise click.ClickException("Failed to start status server")
+
+
+# ---------------------------------------------------------------------------
+# Obsidian Observation System
+# ---------------------------------------------------------------------------
+
+def obsidian_observe() -> None:
+    """Observe and record activity patterns for self-improvement analysis."""
+    obsidian_dir = CONFIG_DIR / "obsidian"
+    obsidian_dir.mkdir(exist_ok=True)
+
+    # Load all state
+    predd_state = load_state()
+    hunter_state = {}
+    try:
+        if HUNTER_STATE_FILE.exists():
+            hunter_state = json.loads(HUNTER_STATE_FILE.read_text())
+    except:
+        pass
+
+    # Load recent decisions
+    predd_decisions = load_recent_decisions(DECISION_LOG, 100)
+    hunter_decisions = load_recent_decisions(HUNTER_DECISION_LOG, 100)
+
+    # Analyze patterns
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    note_file = obsidian_dir / f"{today}-observation.md"
+
+    # Count events by type
+    predd_events = {}
+    for d in predd_decisions:
+        event = d.get("event", "unknown")
+        predd_events[event] = predd_events.get(event, 0) + 1
+
+    hunter_events = {}
+    for d in hunter_decisions:
+        event = d.get("event", "unknown")
+        hunter_events[event] = hunter_events.get(event, 0) + 1
+
+    # Identify issues with high rollback rate
+    rollback_count = hunter_events.get("rollback", 0)
+    issue_closed_count = hunter_events.get("issue_closed", 0)
+    claim_failed_count = hunter_events.get("claim_failed", 0)
+
+    # Find failures in current state
+    failed_issues = [k for k, v in hunter_state.items() if v.get("status") == "failed"]
+    failed_prs = [k for k, v in predd_state.items() if v.get("status") == "failed"]
+
+    # Build observation note
+    note = f"""# Observation: {today}
+
+## Summary
+- **Predd Reviews**: {predd_events.get('pr_review_posted', 0)} posted, {predd_events.get('pr_skip', 0)} skipped
+- **Hunter Issues**: {len(hunter_state)} tracked, {issue_closed_count} closed
+- **Rollbacks**: {rollback_count} (failure rate: {int(rollback_count/(len(hunter_state)+1)*100)}%)
+
+## Predd (PR Reviews)
+Total PRs tracked: {len(predd_state)}
+- Submitted: {sum(1 for v in predd_state.values() if v.get('status') == 'submitted')}
+- Reviewing: {sum(1 for v in predd_state.values() if v.get('status') == 'reviewing')}
+- Failed: {len(failed_prs)}
+
+Skip reasons (top):
+"""
+    skip_reasons = {}
+    for d in predd_decisions:
+        if d.get("event") == "pr_skip":
+            reason = d.get("reason", "unknown")
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+    for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1])[:5]:
+        note += f"- {reason}: {count}\n"
+
+    note += f"""
+## Hunter (Issues)
+Total issues tracked: {len(hunter_state)}
+- Closed: {issue_closed_count}
+- Proposal merged: {hunter_events.get('proposal_merged', 0)}
+- Failed: {len(failed_issues)}
+- Claim failures: {claim_failed_count}
+- Rollbacks: {rollback_count}
+
+Issue status distribution:
+"""
+    status_counts = {}
+    for v in hunter_state.values():
+        status = v.get("status", "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+        note += f"- {status}: {count}\n"
+
+    # Identify patterns
+    note += f"""
+## Patterns & Observations
+
+### Success Rate
+- Issues closed / total: {issue_closed_count} / {len(hunter_state)} = {int(issue_closed_count/(len(hunter_state)+1)*100)}%
+- High rollback rate ({rollback_count}) suggests implementation issues
+
+### Key Issues
+"""
+    if claim_failed_count > 5:
+        note += f"- **Claim failures elevated** ({claim_failed_count}): Issues can't be claimed\n"
+    if rollback_count > len(hunter_state) * 0.2:
+        note += f"- **High rollback rate**: {int(rollback_count/(len(hunter_state)+1)*100)}% of issues fail\n"
+    if skip_reasons.get("already_reviewed_same_sha", 0) > predd_events.get("pr_review_posted", 1):
+        note += "- **PR cache hit**: Most PRs already reviewed, low new work\n"
+
+    note += f"""
+## Questions for Analysis
+1. Why do {rollback_count} issues rollback? What's the common failure?
+2. What makes the {issue_closed_count} successful closures different?
+3. Can claim failures be prevented by better issue detection?
+4. Are PR reviews missing important patterns?
+
+---
+Generated at {_now_iso()}
+"""
+
+    note_file.write_text(note)
+    click.echo(f"✓ Observation written to {note_file}")
+    click.echo(f"\nKey metrics:")
+    click.echo(f"  Predd: {len(predd_state)} PRs, {predd_events.get('pr_review_posted', 0)} reviews")
+    click.echo(f"  Hunter: {len(hunter_state)} issues, {issue_closed_count} closed, {rollback_count} rollbacks")
+
+
+@cli.command(name="observe")
+def observe_cmd():
+    """Observe current activity and write to obsidian vault."""
+    obsidian_observe()
+
+
+@cli.command(name="analyze")
+@click.option("--model", default=None, help="Model to use for analysis (default from config)")
+@click.option("--days", default=7, help="Days of observations to analyze")
+def analyze_cmd(model: str, days: int):
+    """Analyze observations and generate improvement specs."""
+    cfg = load_config()
+    if model is None:
+        model = cfg.analyze_model
+
+    obsidian_analyze(cfg, model, days)
+
+
+def obsidian_analyze(cfg: Config, model: str, days: int = 7) -> None:
+    """Analyze observation patterns and generate improvement specs."""
+    obsidian_dir = CONFIG_DIR / "obsidian"
+    obsidian_dir.mkdir(exist_ok=True)
+    spec_dir = Path(__file__).parent / "spec" / "changes"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+
+    # Read observations from last N days
+    observations = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    for obs_file in sorted(obsidian_dir.glob("*-observation.md")):
+        try:
+            file_date = datetime.strptime(obs_file.stem.split("-observation")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if file_date >= cutoff:
+                observations.append(obs_file.read_text())
+        except:
+            pass
+
+    if not observations:
+        click.echo(f"✗ No observations found in last {days} days")
+        return
+
+    click.echo(f"✓ Found {len(observations)} observations")
+    click.echo(f"✓ Using model: {model}")
+    click.echo(f"\nAnalyzing patterns...")
+
+    # Build analysis prompt
+    obs_text = "\n\n---\n\n".join(observations)
+
+    analysis_prompt = f"""You are analyzing activity logs from an automated software engineering system (predd for PR reviews, hunter for issue implementation).
+
+Based on these observations from the last {days} days:
+
+{obs_text}
+
+## Your Task
+
+Analyze the patterns and identify:
+
+1. **Critical Issues** - What's broken? (e.g., high rollback rate, claim failures)
+2. **Root Causes** - Why are things failing?
+3. **Improvement Opportunities** - What specs should be implemented to fix this?
+4. **Quick Wins** - Low-effort, high-impact improvements
+
+Generate 2-4 improvement spec titles that hunter can implement.
+
+## Output Format
+
+```
+# Analysis Report
+
+## Critical Issues
+- Issue 1: ...
+- Issue 2: ...
+
+## Root Causes
+- Cause 1: ...
+
+## Proposed Improvements
+1. **Spec Title**: Brief description
+2. **Another Spec**: Description
+
+## Implementation Priority
+[Ranked by impact/effort]
+```
+
+Be specific and actionable. Focus on measurable improvements."""
+
+    # Call Claude/Sonnet to analyze
+    click.echo("Calling Claude for analysis...")
+
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        result = subprocess.run(
+            ["claude", "-p", "--dangerously-skip-permissions", "--model", model],
+            input=analysis_prompt,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120
+        )
+
+        if result.returncode != 0:
+            click.echo(f"✗ Claude error: {result.stderr}")
+            return
+
+        analysis_text = result.stdout
+    except subprocess.TimeoutExpired:
+        click.echo("✗ Analysis timed out")
+        return
+    except Exception as e:
+        click.echo(f"✗ Error: {e}")
+        return
+
+    # Write analysis report
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    analysis_file = obsidian_dir / f"{today}-analysis.md"
+    analysis_file.write_text(f"""# Analysis Report: {today}
+
+{analysis_text}
+
+---
+Generated with model: {model}
+Based on {len(observations)} observations over {days} days
+""")
+
+    click.echo(f"\n✓ Analysis written to {analysis_file}")
+
+    # Parse and suggest spec creation
+    click.echo("\n" + "="*60)
+    click.echo("Analysis complete. Review the report to generate specs:")
+    click.echo(f"  cat {analysis_file}")
+    click.echo("\nTo create improvement specs from the analysis:")
+    click.echo("  1. Review the analysis report")
+    click.echo("  2. Create spec files in spec/changes/")
+    click.echo("  3. Hunter will pick them up and implement")
+    click.echo("="*60)
 
 
 @cli.command()
@@ -837,6 +1883,9 @@ def start(once: bool):
     _current_pr_key[:] = []
 
     logger.info("predd started (once=%s)", once)
+
+    if not once and cfg.status_server_enabled:
+        start_status_server(cfg.status_port)
 
     try:
         while not _stop.is_set():
@@ -898,6 +1947,7 @@ def start(once: bool):
 
         logger.info("Shutting down cleanly.")
     finally:
+        stop_status_server()
         if not once:
             release_pid_file()
 
