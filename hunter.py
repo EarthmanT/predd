@@ -778,6 +778,15 @@ def check_impl_ready_for_review(
     cfg: Config, state: dict, repo: str, key: str, entry: dict
 ) -> None:
     """If impl PR is not draft (or auto_review_draft=True), run self-review."""
+    issue_number = entry["issue_number"]
+    try:
+        if gh_issue_is_closed(repo, issue_number):
+            logger.info("Issue %s was closed manually — stopping", key)
+            update_issue_state(state, key, status="submitted")
+            return
+    except Exception:
+        pass
+
     impl_pr = entry.get("impl_pr")
     if not impl_pr:
         return
