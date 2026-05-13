@@ -34,6 +34,7 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 STATE_FILE = CONFIG_DIR / "state.json"
 PID_FILE = CONFIG_DIR / "pid"
 LOG_FILE = CONFIG_DIR / "log.txt"
+DECISION_LOG = CONFIG_DIR / "decisions.jsonl"
 
 DEFAULT_REVIEW_PROMPT = """\
 You are reviewing a pull request. Output a markdown document with this structure:
@@ -664,6 +665,7 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
     key = f"{repo}#{pr_number}"
 
     logger.info("Processing %s: %s", key, title)
+    log_decision("pr_review_started", repo=repo, pr=pr_number, sha=head_sha, title=title)
     update_pr_state(state, key, head_sha=head_sha, status="reviewing",
                     first_seen=_now_iso())
 
@@ -680,23 +682,43 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
         summary_path = worktree / "review-summary.md"
         summary_path.write_text(review_text)
 
+        # Extract verdict from review output for decision log
+        verdict = "UNKNOWN"
+        for v in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+            if v in review_text.upper():
+                verdict = v
+                break
+
         update_pr_state(state, key,
                         status="submitted",
                         worktree=str(worktree),
                         draft_path=str(summary_path),
                         review_completed=_now_iso())
 
+        log_decision("pr_review_posted", repo=repo, pr=pr_number, sha=head_sha, verdict=verdict)
         notify_sound(cfg.sound_review_ready)
         notify_toast("Review posted", f"{key} — run `predd show {pr_number}`")
         logger.info("Review posted for %s", key)
 
     except Exception as e:
         logger.error("Failed processing %s: %s", key, e, exc_info=True)
+        log_decision("pr_review_failed", repo=repo, pr=pr_number, error=str(e))
         update_pr_state(state, key, status="failed")
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def log_decision(event: str, **fields) -> None:
+    """Append a structured decision record to decisions.jsonl."""
+    record = {"ts": _now_iso(), "event": event, **fields}
+    try:
+        with open(DECISION_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # Never let decision logging crash the daemon
+
 
 # ---------------------------------------------------------------------------
 # PID management
@@ -812,18 +834,21 @@ def start(once: bool):
                 for pr in prs:
                     if _stop.is_set():
                         break
+                    pr_number = pr["number"]
+                    head_sha = pr["headRefOid"]
+                    key = f"{repo}#{pr_number}"
+
                     if pr["author"]["login"] == cfg.github_user:
+                        log_decision("pr_skip", repo=repo, pr=pr_number, reason="own_pr")
                         continue
                     if pr["isDraft"]:
+                        log_decision("pr_skip", repo=repo, pr=pr_number, reason="draft")
                         continue
                     if cfg.trigger == "requested":
                         requested = [r.get("login") for r in pr.get("reviewRequests", [])]
                         if cfg.github_user not in requested:
+                            log_decision("pr_skip", repo=repo, pr=pr_number, reason="not_requested")
                             continue
-
-                    pr_number = pr["number"]
-                    head_sha = pr["headRefOid"]
-                    key = f"{repo}#{pr_number}"
 
                     entry = state.get(key, {})
                     entry_sha = entry.get("head_sha", "")
@@ -832,13 +857,16 @@ def start(once: bool):
                     if entry_sha == head_sha and entry_status in (
                         "rejected", "awaiting_approval", "reviewing"
                     ):
+                        log_decision("pr_skip", repo=repo, pr=pr_number, reason=f"status_{entry_status}")
                         continue
                     # submitted with same SHA → skip; new SHA → re-review
                     if entry_sha == head_sha and entry_status == "submitted":
+                        log_decision("pr_skip", repo=repo, pr=pr_number, reason="already_reviewed_same_sha")
                         continue
 
                     if gh_pr_already_reviewed(repo, pr_number, cfg.github_user):
                         logger.info("Skipping %s — already reviewed or closed", key)
+                        log_decision("pr_skip", repo=repo, pr=pr_number, reason="already_reviewed_by_user")
                         update_pr_state(state, key, head_sha=head_sha, status="rejected")
                         continue
 
