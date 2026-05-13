@@ -129,6 +129,9 @@ orphan_scan_interval = 10
 
 # Auto-label unlabelled proposal/implementation PRs
 auto_label_prs = true
+
+# Collect review feedback from proposal/impl PRs and store in hunter state
+collect_pr_feedback = true
 """
 
 # ---------------------------------------------------------------------------
@@ -203,6 +206,7 @@ class Config:
         self.max_new_issues_per_cycle: int = data.get("max_new_issues_per_cycle", 1)
         self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
         self.auto_label_prs: bool = data.get("auto_label_prs", True)
+        self.collect_pr_feedback: bool = data.get("collect_pr_feedback", True)
 
     def to_dict(self) -> dict:
         return {
@@ -230,6 +234,7 @@ class Config:
             "max_new_issues_per_cycle": self.max_new_issues_per_cycle,
             "orphan_scan_interval": self.orphan_scan_interval,
             "auto_label_prs": self.auto_label_prs,
+            "collect_pr_feedback": self.collect_pr_feedback,
         }
 
 

@@ -436,6 +436,42 @@ def gh_repo_default_branch(repo: str) -> str:
     return data["defaultBranchRef"]["name"]
 
 
+def gh_pr_reviews(repo: str, pr_number: int) -> list[dict]:
+    """Fetch formal reviews on a PR (APPROVED/REQUEST_CHANGES/COMMENT)."""
+    owner, name = repo.split("/")
+    result = gh_run(["api", f"repos/{owner}/{name}/pulls/{pr_number}/reviews"], check=False)
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def gh_pr_inline_comments(repo: str, pr_number: int) -> list[dict]:
+    """Fetch inline review comments on a PR."""
+    owner, name = repo.split("/")
+    result = gh_run(["api", f"repos/{owner}/{name}/pulls/{pr_number}/comments"], check=False)
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def gh_pr_issue_comments(repo: str, pr_number: int) -> list[dict]:
+    """Fetch general conversation comments on a PR."""
+    owner, name = repo.split("/")
+    result = gh_run(["api", f"repos/{owner}/{name}/issues/{pr_number}/comments"], check=False)
+    if result.returncode != 0:
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Race condition prevention
 # ---------------------------------------------------------------------------
@@ -654,6 +690,96 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         update_issue_state(state, key, status="failed")
 
 
+def collect_pr_feedback(cfg: Config, state: dict, repo: str, key: str,
+                        pr_number: int, feedback_field: str) -> None:
+    """Collect review feedback from a PR and store in hunter state and decision log."""
+    if not cfg.collect_pr_feedback:
+        return
+
+    entry = state.get(key, {})
+    existing = entry.get(feedback_field, [])
+    # Track which review IDs we've already collected to avoid duplicates
+    seen_ids = {f.get("review_id") for f in existing if f.get("review_id")}
+
+    try:
+        reviews = gh_pr_reviews(repo, pr_number)
+        inline_comments = gh_pr_inline_comments(repo, pr_number)
+        issue_comments = gh_pr_issue_comments(repo, pr_number)
+    except Exception as e:
+        logger.warning("collect_pr_feedback: failed to fetch feedback for PR %d: %s", pr_number, e)
+        return
+
+    # Group inline comments by review ID
+    inline_by_review: dict[int, list[dict]] = {}
+    for c in inline_comments:
+        rid = c.get("pull_request_review_id")
+        if rid:
+            inline_by_review.setdefault(rid, []).append({
+                "path": c.get("path", ""),
+                "line": c.get("line") or c.get("original_line"),
+                "body": c.get("body", ""),
+            })
+
+    new_feedback = []
+    for review in reviews:
+        review_id = review.get("id")
+        if review_id in seen_ids:
+            continue
+        state_val = review.get("state", "COMMENTED")
+        reviewer = (review.get("user") or {}).get("login", "")
+        body = review.get("body") or ""
+        submitted_at = review.get("submitted_at", _now_iso())
+
+        record = {
+            "review_id": review_id,
+            "ts": submitted_at,
+            "reviewer": reviewer,
+            "type": state_val,
+            "body": body,
+            "inline_comments": inline_by_review.get(review_id, []),
+        }
+        new_feedback.append(record)
+        log_decision("pr_feedback",
+                     repo=repo,
+                     issue=entry.get("issue_number"),
+                     pr=pr_number,
+                     type=state_val,
+                     reviewer=reviewer,
+                     body=body[:200])  # truncate for log
+
+    # Add general issue comments not tied to a review (new ones only)
+    seen_comment_ids = {f.get("comment_id") for f in existing if f.get("comment_id")}
+    for c in issue_comments:
+        cid = c.get("id")
+        if cid in seen_comment_ids:
+            continue
+        author = (c.get("user") or {}).get("login", "")
+        if author == cfg.github_user:
+            continue  # skip our own comments
+        record = {
+            "comment_id": cid,
+            "ts": c.get("created_at", _now_iso()),
+            "reviewer": author,
+            "type": "COMMENT",
+            "body": c.get("body", ""),
+            "inline_comments": [],
+        }
+        new_feedback.append(record)
+        log_decision("pr_feedback",
+                     repo=repo,
+                     issue=entry.get("issue_number"),
+                     pr=pr_number,
+                     type="COMMENT",
+                     reviewer=author,
+                     body=(c.get("body") or "")[:200])
+
+    if new_feedback:
+        all_feedback = existing + new_feedback
+        update_issue_state(state, key, **{feedback_field: all_feedback})
+        logger.info("Collected %d new feedback item(s) for %s PR #%d",
+                    len(new_feedback), feedback_field.replace("_feedback", ""), pr_number)
+
+
 def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: dict) -> None:
     """If a merged sdd-proposal PR exists for this issue, kick off implementation."""
     issue_number = entry["issue_number"]
@@ -667,6 +793,13 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             return
     except Exception:
         pass  # if we can't check, proceed normally
+
+    # Collect feedback on the proposal PR while waiting for merge
+    proposal_pr = entry.get("proposal_pr")
+    if proposal_pr:
+        collect_pr_feedback(cfg, state, repo, key, proposal_pr, "proposal_feedback")
+        state = load_hunter_state()  # reload after potential state update
+        entry = state.get(key, entry)
 
     merged_pr = gh_find_merged_proposal(repo, issue_number, title)
     if not merged_pr:
@@ -811,6 +944,12 @@ def check_impl_ready_for_review(
     impl_pr = entry.get("impl_pr")
     if not impl_pr:
         return
+
+    # Collect feedback on the impl PR
+    if impl_pr:
+        collect_pr_feedback(cfg, state, repo, key, impl_pr, "impl_feedback")
+        state = load_hunter_state()
+        entry = state.get(key, entry)
 
     try:
         is_draft = gh_pr_is_draft(repo, impl_pr)

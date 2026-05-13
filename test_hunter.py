@@ -857,6 +857,10 @@ class TestCheckProposalMerged:
              patch.object(h, "gh_create_branch_and_pr", return_value=99), \
              patch.object(h, "gh_ensure_label_exists"), \
              patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_pr_reviews", return_value=[]), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "load_hunter_state", return_value=state), \
              patch.object(h, "save_hunter_state"):
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
@@ -1695,6 +1699,10 @@ class TestCheckProposalMergedExceptionInImpl:
         with patch.object(h, "gh_find_merged_proposal", return_value=42), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
              patch.object(h, "setup_new_branch_worktree", side_effect=RuntimeError("clone failed")), \
+             patch.object(h, "gh_pr_reviews", return_value=[]), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "load_hunter_state", return_value=state), \
              patch.object(h, "save_hunter_state"):
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
@@ -2511,3 +2519,108 @@ class TestIngestJiraCsv:
             h.ingest_jira_csv(cfg, ["owner/repo"])
         label_calls = [str(c) for c in mock_label.call_args_list]
         assert any("needs-jira-info" in c for c in label_calls)
+
+
+# ---------------------------------------------------------------------------
+# TestCollectPrFeedback
+# ---------------------------------------------------------------------------
+
+class TestCollectPrFeedback:
+    def _cfg(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.collect_pr_feedback = True
+        cfg.github_user = "testuser"
+        return cfg
+
+    def test_collect_pr_feedback_disabled(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        cfg.collect_pr_feedback = False
+        state = {}
+        with patch.object(h, "gh_pr_reviews") as mock_reviews:
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+        mock_reviews.assert_not_called()
+
+    def test_collects_review_and_stores_in_state(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!1": {"issue_number": 1, "status": "proposal_open"}}
+
+        reviews = [{"id": 100, "state": "REQUEST_CHANGES", "body": "Missing tests",
+                    "submitted_at": "2026-05-13T10:00:00Z",
+                    "user": {"login": "reviewer1"}}]
+        with patch.object(h, "gh_pr_reviews", return_value=reviews), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "log_decision") as mock_log, \
+             patch.object(h, "save_hunter_state"):
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+
+        feedback = state["owner/repo!1"].get("proposal_feedback", [])
+        assert len(feedback) == 1
+        assert feedback[0]["type"] == "REQUEST_CHANGES"
+        assert feedback[0]["reviewer"] == "reviewer1"
+        mock_log.assert_called_once()
+
+    def test_skips_already_seen_reviews(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        existing = [{"review_id": 100, "type": "APPROVED", "reviewer": "r1",
+                     "ts": "2026-05-13T09:00:00Z", "body": "", "inline_comments": []}]
+        state = {"owner/repo!1": {"issue_number": 1, "proposal_feedback": existing}}
+
+        reviews = [{"id": 100, "state": "APPROVED", "body": "",
+                    "submitted_at": "2026-05-13T09:00:00Z",
+                    "user": {"login": "r1"}}]
+        with patch.object(h, "gh_pr_reviews", return_value=reviews), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "save_hunter_state"):
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+
+        # Still only 1 item — duplicate skipped
+        assert len(state["owner/repo!1"]["proposal_feedback"]) == 1
+
+    def test_collects_inline_comments(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!1": {"issue_number": 1}}
+
+        reviews = [{"id": 200, "state": "REQUEST_CHANGES", "body": "See inline",
+                    "submitted_at": "2026-05-13T10:00:00Z",
+                    "user": {"login": "r2"}}]
+        inline = [{"pull_request_review_id": 200, "path": "design.md",
+                   "line": 5, "body": "Missing detail"}]
+        with patch.object(h, "gh_pr_reviews", return_value=reviews), \
+             patch.object(h, "gh_pr_inline_comments", return_value=inline), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+
+        feedback = state["owner/repo!1"]["proposal_feedback"]
+        assert feedback[0]["inline_comments"][0]["path"] == "design.md"
+
+    def test_skips_own_comments(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!1": {"issue_number": 1}}
+
+        issue_comments = [{"id": 99, "body": "hunter comment",
+                           "created_at": "2026-05-13T10:00:00Z",
+                           "user": {"login": "testuser"}}]  # own comment
+        with patch.object(h, "gh_pr_reviews", return_value=[]), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=issue_comments), \
+             patch.object(h, "save_hunter_state"):
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+
+        assert state["owner/repo!1"].get("proposal_feedback", []) == []
+
+    def test_gh_api_failure_does_not_crash(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!1": {"issue_number": 1}}
+
+        with patch.object(h, "gh_pr_reviews", side_effect=Exception("network")):
+            h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
+        # Should not raise
