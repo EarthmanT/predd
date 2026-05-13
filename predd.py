@@ -132,6 +132,12 @@ auto_label_prs = true
 
 # Collect review feedback from proposal/impl PRs and store in hunter state
 collect_pr_feedback = true
+
+# Obsidian daemon settings
+observe_interval = 3600       # seconds between observe runs
+analyze_hour = 8              # hour of day to run analyze (local time)
+analyze_days = 7              # days of observations to analyze
+analyze_model = "claude-opus-4-7"
 """
 
 # ---------------------------------------------------------------------------
@@ -207,6 +213,10 @@ class Config:
         self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
         self.auto_label_prs: bool = data.get("auto_label_prs", True)
         self.collect_pr_feedback: bool = data.get("collect_pr_feedback", True)
+        self.observe_interval: int = data.get("observe_interval", 3600)
+        self.analyze_hour: int = data.get("analyze_hour", 8)
+        self.analyze_days: int = data.get("analyze_days", 7)
+        self.analyze_model: str = data.get("analyze_model", "claude-opus-4-7")
 
     def to_dict(self) -> dict:
         return {
@@ -235,6 +245,10 @@ class Config:
             "orphan_scan_interval": self.orphan_scan_interval,
             "auto_label_prs": self.auto_label_prs,
             "collect_pr_feedback": self.collect_pr_feedback,
+            "observe_interval": self.observe_interval,
+            "analyze_hour": self.analyze_hour,
+            "analyze_days": self.analyze_days,
+            "analyze_model": self.analyze_model,
         }
 
 
