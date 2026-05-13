@@ -107,6 +107,7 @@ CONFIG_DIR = Path("~/.config/predd").expanduser()
 HUNTER_STATE_FILE = CONFIG_DIR / "hunter-state.json"
 HUNTER_PID_FILE = CONFIG_DIR / "hunter-pid"
 HUNTER_LOG_FILE = CONFIG_DIR / "hunter-log.txt"
+HUNTER_DECISION_LOG = CONFIG_DIR / "hunter-decisions.jsonl"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -158,6 +159,16 @@ def update_issue_state(state: dict, key: str, **fields) -> None:
         state[key] = {}
     state[key].update(fields)
     save_hunter_state(state)
+
+
+def log_decision(event: str, **fields) -> None:
+    """Append a structured decision record to hunter-decisions.jsonl."""
+    record = {"ts": _now_iso(), "event": event, **fields}
+    try:
+        with open(HUNTER_DECISION_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +462,7 @@ def try_claim_issue(cfg: Config, repo: str, issue_number: int) -> bool:
         return True
     except Exception as e:
         logger.warning("try_claim_issue failed for %s#%d: %s", repo, issue_number, e)
+        log_decision("claim_failed", repo=repo, issue=issue_number, reason="label_error")
         return False
 
 
@@ -563,6 +575,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
 
     if not try_claim_issue(cfg, repo, issue_number):
         logger.info("Could not claim issue %s — skipping", key)
+        log_decision("claim_failed", repo=repo, issue=issue_number, reason="try_claim_returned_false")
         return
 
     try:
@@ -605,6 +618,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         commit_skill_output(worktree, f"proposal: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
+            log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="proposal")
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
 
         pr_body = f"Proposal for issue #{issue_number}"
@@ -631,6 +645,8 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                            proposal_pr=pr_number,
                            proposal_branch=branch,
                            proposal_worktree=str(worktree))
+        log_decision("issue_pickup", repo=repo, issue=issue_number, title=title)
+        log_decision("proposal_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Proposal PR #%d created for issue %s", pr_number, key)
 
     except Exception as e:
@@ -646,6 +662,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
     try:
         if gh_issue_is_closed(repo, issue_number):
             logger.info("Issue %s was closed manually — stopping", key)
+            log_decision("issue_skip", repo=repo, issue=issue_number, reason="closed_manually")
             update_issue_state(state, key, status="submitted")
             return
     except Exception:
@@ -655,6 +672,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
     if not merged_pr:
         return
 
+    log_decision("proposal_merged", repo=repo, issue=issue_number, pr=merged_pr)
     logger.info("Proposal PR #%d merged for %s — starting implementation", merged_pr, key)
 
     update_issue_state(state, key, status="implementing")
@@ -674,6 +692,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         commit_skill_output(worktree, f"impl: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
+            log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="impl")
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
 
         pr_body = f"Implementation for issue #{issue_number}"
@@ -698,6 +717,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
                            impl_pr=pr_number,
                            impl_branch=branch,
                            impl_worktree=str(worktree))
+        log_decision("impl_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Impl PR #%d created for issue %s", pr_number, key)
 
     except Exception as e:
@@ -782,6 +802,7 @@ def check_impl_ready_for_review(
     try:
         if gh_issue_is_closed(repo, issue_number):
             logger.info("Issue %s was closed manually — stopping", key)
+            log_decision("issue_skip", repo=repo, issue=issue_number, reason="closed_manually")
             update_issue_state(state, key, status="submitted")
             return
     except Exception:
@@ -822,6 +843,7 @@ def check_impl_merged(
     try:
         if gh_issue_is_closed(repo, issue_number):
             logger.info("Issue %s was closed manually — stopping", key)
+            log_decision("issue_skip", repo=repo, issue=issue_number, reason="closed_manually")
             update_issue_state(state, key, status="submitted")
             return
     except Exception:
@@ -843,6 +865,7 @@ def check_impl_merged(
         gh_issue_comment(repo, issue_number,
                          f"Implemented in #{impl_pr}. Closing.")
         gh_run(["issue", "close", str(issue_number), "--repo", repo])
+        log_decision("issue_closed", repo=repo, issue=issue_number, pr=impl_pr)
         update_issue_state(state, key, status="submitted")
         logger.info("Issue %s closed", key)
 
@@ -984,6 +1007,7 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
             for repo in repos:
                 try:
                     if gh_issue_exists(repo, jira_key):
+                        log_decision("csv_issue_skip", repo=repo, jira_key=jira_key, reason="already_exists")
                         continue
 
                     assignee = cfg.github_user if (conformant or not cfg.require_jira_conformance) else None
@@ -993,6 +1017,7 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
                         logger.warning("CSV ingest: failed to create issue for %s in %s", jira_key, repo)
                         continue
 
+                    log_decision("csv_issue_created", repo=repo, jira_key=jira_key, issue=issue_number, conformant=conformant)
                     logger.info("CSV ingest: created issue #%d for %s in %s%s",
                                 issue_number, jira_key, repo,
                                 " (non-conformant, not assigned)" if not conformant else "")
@@ -1031,6 +1056,7 @@ def rollback_issue(cfg: Config, state: dict, key: str, reason: str) -> None:
     issue_number = entry.get("issue_number")
 
     logger.warning("Rolling back %s: %s", key, reason)
+    log_decision("rollback", repo=entry.get("repo", ""), issue=entry.get("issue_number"), reason=reason)
 
     # Remove all hunter labels from GitHub
     if repo and issue_number:
@@ -1070,6 +1096,7 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
 
         resume_attempts = entry.get("resume_attempts", 0)
         if resume_attempts >= cfg.max_resume_retries:
+            log_decision("rollback", repo=entry.get("repo", ""), issue=entry.get("issue_number"), reason="max_resume_retries_exceeded")
             rollback_issue(cfg, state, key, f"exceeded max_resume_retries ({cfg.max_resume_retries})")
             continue
 
@@ -1364,8 +1391,10 @@ def start(once: bool):
                     if status == "":
                         # New issue: only process if no competing labels
                         if _issue_has_hunter_labels(issue):
+                            log_decision("issue_skip", repo=repo, issue=issue_number, reason="already_claimed")
                             continue
                         if new_issues_this_cycle >= cfg.max_new_issues_per_cycle:
+                            log_decision("issue_skip", repo=repo, issue=issue_number, reason="max_new_issues_reached")
                             continue
                         _current_issue_key[:] = [key]
                         process_issue(cfg, state, repo, issue)
