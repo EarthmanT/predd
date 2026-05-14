@@ -21,6 +21,8 @@ import tempfile
 import threading
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -152,11 +154,14 @@ max_review_fix_loops = 1
 # Whether to self-review draft implementation PRs (false = wait for ready)
 auto_review_draft = false
 
-# Jira CSV ingestion (optional)
+# Jira integration (optional)
+# CSV ingest: uncomment jira_csv_dir to enable
 # jira_csv_dir = "./jira"
 # jira_base_url = "https://jira.cec.lab.emc.com"
 # require_jira_conformance = true
-# Jira issue types to skip during CSV ingest (case-insensitive)
+# API integration: uncomment jira_api_enabled (token via JIRA_API_TOKEN env var)
+# jira_api_enabled = false
+# Jira issue types to skip during ingest (case-insensitive)
 skip_jira_issue_types = ["sub-task", "subtask", "sub task"]
 
 # Max new issues to pick up per repo per poll cycle
@@ -216,6 +221,86 @@ def setup_logging() -> logging.Logger:
 logger = logging.getLogger("predd")
 
 # ---------------------------------------------------------------------------
+# Jira API Client
+# ---------------------------------------------------------------------------
+
+class JiraClient:
+    """REST API client for Jira Server v2."""
+
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+
+    def _make_request(self, method: str, endpoint: str, params: dict | None = None, max_retries: int = 3) -> dict:
+        """Make HTTP request to Jira API with exponential backoff for rate limiting."""
+        url = f"{self.base_url}/rest/api/2{endpoint}"
+        if params:
+            from urllib.parse import urlencode
+            url += f"?{urlencode(params)}"
+
+        req = urllib.request.Request(
+            url,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            }
+        )
+
+        for attempt in range(max_retries):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                # Check for rate limiting
+                if e.code == 429:
+                    retry_after = int(e.headers.get("Retry-After", 60))
+                    if attempt < max_retries - 1:
+                        wait_time = retry_after * (2 ** attempt)  # exponential backoff
+                        logger.warning("Jira API rate limit, retrying in %ds (attempt %d/%d)", wait_time, attempt + 1, max_retries)
+                        time.sleep(wait_time)
+                        continue
+                # Re-raise for non-rate-limit errors
+                raise
+            except urllib.error.URLError as e:
+                # Network/connection errors — retry with backoff
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning("Jira API connection error: %s, retrying in %ds (attempt %d/%d)", e, wait_time, attempt + 1, max_retries)
+                    time.sleep(wait_time)
+                    continue
+                raise
+
+        raise RuntimeError(f"Jira API request failed after {max_retries} attempts")
+
+    def search(self, jql: str, fields: list[str] | None = None, max_results: int = 50) -> list[dict]:
+        """Run a JQL query and return issues."""
+        if fields is None:
+            fields = ["key", "summary", "status", "assignee"]
+
+        params = {
+            "jql": jql,
+            "fields": ",".join(fields),
+            "maxResults": str(max_results),
+        }
+
+        result = self._make_request("GET", "/search", params=params)
+        return result.get("issues", [])
+
+    def get_issue(self, key: str) -> dict:
+        """Fetch a single issue by key."""
+        return self._make_request("GET", f"/issue/{key}")
+
+    def validate(self) -> bool:
+        """Test auth via /rest/api/2/myself."""
+        try:
+            self._make_request("GET", "/myself")
+            return True
+        except Exception as e:
+            logger.warning("Jira API validation failed: %s", e)
+            return False
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -261,6 +346,7 @@ class Config:
             Path(data["jira_csv_dir"]).expanduser() if "jira_csv_dir" in data else None
         )
         self.jira_base_url: str = data.get("jira_base_url", "https://jira.cec.lab.emc.com")
+        self.jira_api_enabled: bool = data.get("jira_api_enabled", False)
         self.require_jira_conformance: bool = data.get("require_jira_conformance", True)
         self.max_new_issues_per_cycle: int = data.get("max_new_issues_per_cycle", 1)
         self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
@@ -310,6 +396,7 @@ class Config:
             "max_resume_retries": self.max_resume_retries,
             "jira_csv_dir": str(self.jira_csv_dir) if self.jira_csv_dir else None,
             "jira_base_url": self.jira_base_url,
+            "jira_api_enabled": self.jira_api_enabled,
             "require_jira_conformance": self.require_jira_conformance,
             "max_new_issues_per_cycle": self.max_new_issues_per_cycle,
             "orphan_scan_interval": self.orphan_scan_interval,

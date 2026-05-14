@@ -33,6 +33,7 @@ _predd = importlib.util.module_from_spec(_predd_spec)
 _predd_spec.loader.exec_module(_predd)
 
 Config = _predd.Config
+JiraClient = _predd.JiraClient
 load_config = _predd.load_config
 load_state = _predd.load_state
 save_state = _predd.save_state
@@ -1240,8 +1241,9 @@ def _build_issue_body(row: dict, jira_base_url: str) -> tuple[str, list[str]]:
     missing = []
     if not epic:
         missing.append("Epic not set")
-    if not capability:
-        missing.append("No `capability: <id> <name>` line in description")
+    # DO NOT REQUIRE capability for now. (Many issues are Tech Debt and not linked to capability.)
+    # if not capability:
+    #     missing.append("No `capability: <id> <name>` line in description")
 
     lines = ["| Field | Value |", "|-------|-------|"]
     if jira_key:
@@ -1396,6 +1398,152 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
 
                 except Exception as e:
                     logger.error("CSV ingest: error processing %s in %s: %s", jira_key, repo, e)
+
+
+def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
+    """Query Jira API for sprint issues and create missing GH issues."""
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not token or not cfg.jira_api_enabled:
+        return  # Fall back to CSV ingest
+
+    try:
+        client = JiraClient(cfg.jira_base_url, token)
+        if not client.validate():
+            logger.warning("Jira API authentication failed — falling back to CSV ingest")
+            return
+    except Exception as e:
+        logger.warning("Jira API validation error: %s — falling back to CSV ingest", e)
+        return
+
+    logger.info("Jira API ingest: starting")
+
+    try:
+        # Query: project = configured projects AND sprint in openSprints()
+        # This gets all issues in open sprints (matches CSV ingest behavior)
+        jql = "sprint in openSprints()"
+
+        issues = client.search(
+            jql,
+            fields=[
+                "key", "summary", "status", "issuetype", "customfield_10005",  # Epic link
+                "customfield_10006", "customfield_10007", "customfield_10008",  # Sprint variants
+            ],
+            max_results=1000,
+        )
+    except Exception as e:
+        logger.warning("Jira API search failed: %s — falling back to CSV ingest", e)
+        return
+
+    if not issues:
+        logger.info("Jira API ingest: no issues in open sprints")
+        return
+
+    logger.info("Jira API ingest: processing %d issue(s)", len(issues))
+
+    for issue in issues:
+        try:
+            jira_key = issue.get("key", "").strip()
+            summary = issue.get("fields", {}).get("summary", "").strip()
+            if not jira_key or not summary:
+                continue
+
+            # Skip by issue type
+            issue_type = issue.get("fields", {}).get("issuetype", {}).get("name", "").lower()
+            if issue_type in {t.lower() for t in cfg.skip_jira_issue_types}:
+                log_decision(
+                    "api_issue_skip",
+                    jira_key=jira_key,
+                    reason="excluded_type",
+                    issue_type=issue_type,
+                )
+                logger.info(
+                    "Jira API ingest: skipping %s (type=%s) per skip_jira_issue_types",
+                    jira_key, issue_type,
+                )
+                continue
+
+            # Extract sprint (hard gate — must have sprint)
+            fields = issue.get("fields", {})
+            sprint = None
+
+            # Try customfield_10006 first (common Sprint field)
+            sprint = fields.get("customfield_10006")
+            if sprint and isinstance(sprint, list) and sprint:
+                # Sprint field returns array of sprint objects
+                sprint_obj = sprint[0]
+                if isinstance(sprint_obj, dict):
+                    sprint = sprint_obj.get("name", "").strip()
+                else:
+                    sprint = str(sprint_obj).strip()
+            elif not sprint:
+                # Try other sprint field variants
+                for field_key in ("customfield_10007", "customfield_10008"):
+                    sprint = fields.get(field_key)
+                    if sprint:
+                        if isinstance(sprint, list) and sprint:
+                            sprint = sprint[0]
+                        sprint = str(sprint).strip() if sprint else ""
+                        if sprint:
+                            break
+
+            if not sprint:
+                log_decision(
+                    "api_issue_skip",
+                    jira_key=jira_key,
+                    reason="no_sprint",
+                )
+                logger.info("Jira API ingest: skipping %s — no sprint assigned", jira_key)
+                continue
+
+            # Build issue body (reuse CSV logic)
+            # Convert API issue dict to CSV-like row format for _build_issue_body
+            row = {
+                "issue key": jira_key,
+                "summary": summary,
+                "epic link": fields.get("customfield_10005", ""),
+                "sprint": sprint,
+            }
+            body, missing = _build_issue_body(row, cfg.jira_base_url)
+            conformant = len(missing) == 0
+
+            title = f"[{jira_key}] {summary}"
+
+            for repo in repos:
+                try:
+                    if gh_issue_exists(repo, jira_key):
+                        log_decision("api_issue_skip", repo=repo, jira_key=jira_key, reason="already_exists")
+                        continue
+
+                    assignee = cfg.github_user if (conformant or not cfg.require_jira_conformance) else None
+                    issue_number = gh_issue_create(repo, title, body, assignee=assignee)
+
+                    if issue_number is None:
+                        logger.warning("Jira API ingest: failed to create issue for %s in %s", jira_key, repo)
+                        continue
+
+                    log_decision("api_issue_created", repo=repo, jira_key=jira_key, issue=issue_number, conformant=conformant)
+                    label_jira_issue(repo, issue_number, title)
+                    logger.info(
+                        "Jira API ingest: created issue #%d for %s in %s%s",
+                        issue_number, jira_key, repo,
+                        " (non-conformant, not assigned)" if not conformant else "",
+                    )
+
+                    if not conformant:
+                        needs_label = f"{cfg.github_user}:needs-jira-info"
+                        try:
+                            gh_ensure_label_exists(repo, needs_label, color="e11d48")
+                            gh_issue_add_label(repo, issue_number, needs_label)
+                        except Exception as e:
+                            logger.warning("Jira API ingest: could not add needs-jira-info label: %s", e)
+
+                except Exception as e:
+                    logger.error("Jira API ingest: error processing %s in %s: %s", jira_key, repo, e)
+
+        except Exception as e:
+            logger.error("Jira API ingest: error processing issue %s: %s", jira_key, e)
+
+    logger.info("Jira API ingest: complete")
 
 
 def worktree_has_commits_since(worktree: Path, base_branch: str) -> bool:
@@ -1748,7 +1896,8 @@ def start(once: bool):
                 scan_orphaned_labels(cfg, state, hunter_repos)
                 state = load_hunter_state()
 
-            # Ingest new issues from Jira CSV exports
+            # Ingest new issues from Jira API (if configured) or CSV exports (fallback)
+            ingest_jira_api(cfg, hunter_repos)
             ingest_jira_csv(cfg, hunter_repos)
 
             # Auto-label unlabelled proposal/implementation PRs
