@@ -605,6 +605,82 @@ class TestRunReviewDispatch:
 
 
 # ---------------------------------------------------------------------------
+# Bedrock backend: construction + prompt caching
+# ---------------------------------------------------------------------------
+
+def _make_bedrock_mocks():
+    """Create a fake anthropic module with a mock AnthropicBedrock class."""
+    mock_resp = MagicMock()
+    mock_resp.stop_reason = "end_turn"
+    mock_resp.content = [MagicMock(type="text", text="done")]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = mock_resp
+    mock_bedrock_cls = MagicMock(return_value=mock_client)
+    fake_anthropic = MagicMock()
+    fake_anthropic.AnthropicBedrock = mock_bedrock_cls
+    return fake_anthropic, mock_bedrock_cls, mock_client
+
+
+class TestBedrockDriver:
+    def test_client_constructed_with_aws_region_only(self, tmp_path):
+        """AnthropicBedrock must be called with aws_region=, not region_name= or aws_profile=."""
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review PR $ARGUMENTS")
+        cfg = _make_cfg(tmp_path, "bedrock")
+        cfg.skill_path = skill
+        cfg.aws_region = "us-west-2"
+        cfg.aws_profile = "default"
+        cfg.bedrock_model = "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fake_anthropic, mock_bedrock_cls, _ = _make_bedrock_mocks()
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            pw._run_bedrock_skill(cfg, "test prompt", skill, worktree)
+
+        mock_bedrock_cls.assert_called_once_with(aws_region="us-west-2")
+
+    def test_system_has_cache_control(self, tmp_path):
+        """System arg must be a list with cache_control on the SKILL.md block."""
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("skill content here")
+        cfg = _make_cfg(tmp_path, "bedrock")
+        cfg.skill_path = skill
+        cfg.aws_region = "us-east-1"
+        cfg.aws_profile = "default"
+        cfg.bedrock_model = "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fake_anthropic, _, mock_client = _make_bedrock_mocks()
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            pw._run_bedrock_skill(cfg, "test prompt", skill, worktree)
+
+        create_kwargs = mock_client.messages.create.call_args
+        system_arg = create_kwargs.kwargs.get("system") or create_kwargs[1].get("system")
+        assert isinstance(system_arg, list), "system must be a list of content blocks"
+        assert len(system_arg) == 2
+        assert system_arg[1]["cache_control"] == {"type": "ephemeral"}
+        assert "skill content here" in system_arg[1]["text"]
+
+    def test_aws_profile_set_in_env_when_not_default(self, tmp_path, monkeypatch):
+        """Non-default aws_profile should be set as AWS_PROFILE env var."""
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("skill content")
+        cfg = _make_cfg(tmp_path, "bedrock")
+        cfg.skill_path = skill
+        cfg.aws_region = "us-east-1"
+        cfg.aws_profile = "my-profile"
+        cfg.bedrock_model = "eu.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        worktree = tmp_path / "wt"; worktree.mkdir()
+
+        fake_anthropic, _, _ = _make_bedrock_mocks()
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        with patch.dict("sys.modules", {"anthropic": fake_anthropic}):
+            pw._run_bedrock_skill(cfg, "test prompt", skill, worktree)
+
+        assert os.environ.get("AWS_PROFILE") == "my-profile"
+
+
+# ---------------------------------------------------------------------------
 # gh_run permanent error detection (SPEC 6)
 # ---------------------------------------------------------------------------
 

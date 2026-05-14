@@ -181,6 +181,9 @@ fix_interval = 1200           # seconds between fix retry runs (20 min for testi
 analyze_days = 7              # days of observations to analyze
 analyze_model = "claude-opus-4-7"
 
+# Hour of the day (0-23, local time) to run obsidian analyze
+analyze_hour = 9
+
 # Failure commenting and cleanup
 comment_on_failures = true
 predd_failure_label = "{github_user}:predd-failed"
@@ -277,6 +280,7 @@ class Config:
         self.aws_profile: str = data.get("aws_profile", "default")
         self.aws_region: str = data.get("aws_region", "us-east-1")
         self.bedrock_model: str = data.get("bedrock_model", "eu.anthropic.claude-3-7-sonnet-20250219-v1:0")
+        self.analyze_hour: int = data.get("analyze_hour", 9)
 
     def to_dict(self) -> dict:
         return {
@@ -320,6 +324,7 @@ class Config:
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "bedrock_model": self.bedrock_model,
+            "analyze_hour": self.analyze_hour,
         }
 
 
@@ -1655,18 +1660,27 @@ def _run_bedrock_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Pat
     # Load SKILL.md
     skill_text = skill_path.read_text()
 
-    # Create Bedrock client
-    client = AnthropicBedrock(
-        aws_profile=cfg.aws_profile,
-        region_name=cfg.aws_region
-    )
+    # Create Bedrock client — set AWS_PROFILE in env for boto3 credential chain
+    if cfg.aws_profile and cfg.aws_profile != "default":
+        os.environ["AWS_PROFILE"] = cfg.aws_profile
 
-    # Build system prompt
-    system = f"""You are an AI engineer assistant. Follow the SKILL.md to complete the task.
+    client = AnthropicBedrock(aws_region=cfg.aws_region)
 
---- SKILL.md ---
-{skill_text}
---- end SKILL.md ---"""
+    # Build system prompt with prompt caching on the SKILL.md block
+    system = [
+        {
+            "type": "text",
+            "text": (
+                "You are an AI engineer assistant. "
+                "Follow the SKILL.md to complete the task."
+            ),
+        },
+        {
+            "type": "text",
+            "text": f"--- SKILL.md ---\n{skill_text}\n--- end SKILL.md ---",
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
 
     # Agentic loop
     messages = [{"role": "user", "content": prompt}]
