@@ -1431,6 +1431,7 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
             fields=[
                 "key", "summary", "status", "issuetype", "customfield_10005",  # Epic link
                 "customfield_10006", "customfield_10007", "customfield_10008",  # Sprint variants
+                "labels",  # For repo label routing
             ],
             max_results=1000,
         )
@@ -1499,6 +1500,23 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
                 logger.info("Jira API ingest: skipping %s — no sprint assigned", jira_key)
                 continue
 
+            # Extract labels and filter repos (repo label routing)
+            issue_labels = fields.get("labels", [])
+            matching_repos = [r for r in repos if r in issue_labels]
+
+            if not matching_repos:
+                log_decision(
+                    "api_issue_skip",
+                    jira_key=jira_key,
+                    reason="no_matching_repo_labels",
+                    labels=issue_labels,
+                )
+                logger.info(
+                    "Jira API ingest: skipping %s — no matching repo labels (has: %s)",
+                    jira_key, ", ".join(issue_labels) if issue_labels else "(none)",
+                )
+                continue
+
             # Build issue body (reuse CSV logic)
             # Convert API issue dict to CSV-like row format for _build_issue_body
             row = {
@@ -1512,7 +1530,7 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
 
             title = f"[{jira_key}] {summary}"
 
-            for repo in repos:
+            for repo in matching_repos:
                 try:
                     if gh_issue_exists(repo, jira_key):
                         log_decision("api_issue_skip", repo=repo, jira_key=jira_key, reason="already_exists")

@@ -3079,6 +3079,7 @@ class TestIngestJiraApi:
                 "issuetype": {"name": "Story"},
                 "customfield_10006": [{"name": "Sprint-1"}],
                 "customfield_10005": "DAP-100",
+                "labels": ["owner/repo"],  # Matching repo label
             },
         }
 
@@ -3164,7 +3165,7 @@ class TestIngestJiraApi:
         mock_create.assert_not_called()
 
     def test_multiple_repos(self, tmp_path):
-        """Test creates issues in all configured repos."""
+        """Test creates issues in all configured repos with matching labels."""
         cfg = self._cfg_with_api(tmp_path)
 
         api_issue = {
@@ -3173,6 +3174,7 @@ class TestIngestJiraApi:
                 "summary": "Multi-repo",
                 "issuetype": {"name": "Story"},
                 "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["repo1/name1", "repo2/name2"],  # Both repos have matching labels
             },
         }
 
@@ -3188,3 +3190,127 @@ class TestIngestJiraApi:
 
         # Should create in both repos
         assert mock_create.call_count == 2
+
+    def test_skips_issue_with_no_labels(self, tmp_path):
+        """Test skips issue when it has no repo labels."""
+        cfg = self._cfg_with_api(tmp_path)
+
+        api_issue = {
+            "key": "DAP-10",
+            "fields": {
+                "summary": "No labels",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": [],  # No labels
+            },
+        }
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[api_issue]), \
+             patch.object(h, "gh_issue_create") as mock_create:
+            h.ingest_jira_api(cfg, ["fusion-e/ai-bp-toolkit"])
+
+        mock_create.assert_not_called()
+
+    def test_skips_issue_with_non_matching_labels(self, tmp_path):
+        """Test skips issue when labels don't match any configured repo."""
+        cfg = self._cfg_with_api(tmp_path)
+
+        api_issue = {
+            "key": "DAP-11",
+            "fields": {
+                "summary": "Wrong labels",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["other-org/repo", "tech-debt"],  # No matching labels
+            },
+        }
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[api_issue]), \
+             patch.object(h, "gh_issue_create") as mock_create:
+            h.ingest_jira_api(cfg, ["fusion-e/ai-bp-toolkit"])
+
+        mock_create.assert_not_called()
+
+    def test_creates_only_in_matching_repo(self, tmp_path):
+        """Test creates issue only in repo with matching label."""
+        cfg = self._cfg_with_api(tmp_path)
+
+        api_issue = {
+            "key": "DAP-12",
+            "fields": {
+                "summary": "Single repo match",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["fusion-e/ai-bp-toolkit", "feature"],
+            },
+        }
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[api_issue]), \
+             patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=10) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "label_jira_issue"):
+            h.ingest_jira_api(cfg, ["fusion-e/ai-bp-toolkit", "fusion-e/other-repo"])
+
+        # Should create only in the matching repo
+        mock_create.assert_called_once()
+        assert mock_create.call_args.args[0] == "fusion-e/ai-bp-toolkit"
+
+    def test_creates_in_all_matching_repos(self, tmp_path):
+        """Test creates issue in all repos with matching labels."""
+        cfg = self._cfg_with_api(tmp_path)
+
+        api_issue = {
+            "key": "DAP-13",
+            "fields": {
+                "summary": "Multi-repo match",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["fusion-e/ai-bp-toolkit", "fusion-e/other-repo", "shared"],
+            },
+        }
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[api_issue]), \
+             patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=10) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "label_jira_issue"):
+            h.ingest_jira_api(cfg, ["fusion-e/ai-bp-toolkit", "fusion-e/other-repo"])
+
+        # Should create in both matching repos
+        assert mock_create.call_count == 2
+        repos_created = [call.args[0] for call in mock_create.call_args_list]
+        assert set(repos_created) == {"fusion-e/ai-bp-toolkit", "fusion-e/other-repo"}
+
+    def test_label_matching_is_case_sensitive(self, tmp_path):
+        """Test label matching is case-sensitive."""
+        cfg = self._cfg_with_api(tmp_path)
+
+        api_issue = {
+            "key": "DAP-14",
+            "fields": {
+                "summary": "Case mismatch",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["Fusion-E/AI-BP-Toolkit"],  # Wrong case
+            },
+        }
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[api_issue]), \
+             patch.object(h, "gh_issue_create") as mock_create:
+            h.ingest_jira_api(cfg, ["fusion-e/ai-bp-toolkit"])
+
+        # Should not match due to case difference
+        mock_create.assert_not_called()
