@@ -179,6 +179,11 @@ def extract_jira_key(title: str) -> str | None:
     return m.group(1) if m else None
 
 
+def issue_identifier(issue_number: int, title: str) -> str:
+    """Return Jira key from title if present, else GitHub issue number as string."""
+    return extract_jira_key(title) or str(issue_number)
+
+
 def label_jira_issue(repo: str, issue_number: int, title: str) -> None:
     """Apply 'jira' label to an issue if its title contains a Jira key."""
     jira_key = extract_jira_key(title)
@@ -624,11 +629,11 @@ def issue_slug(title: str, max_len: int = 30) -> str:
 
 
 def proposal_branch(cfg: Config, issue_number: int, title: str) -> str:
-    return f"{cfg.branch_prefix}/{issue_number}-proposal-{issue_slug(title)}"
+    return f"{cfg.branch_prefix}/{issue_identifier(issue_number, title)}-proposal-{issue_slug(title)}"
 
 
 def impl_branch(cfg: Config, issue_number: int, title: str) -> str:
-    return f"{cfg.branch_prefix}/{issue_number}-impl-{issue_slug(title)}"
+    return f"{cfg.branch_prefix}/{issue_identifier(issue_number, title)}-impl-{issue_slug(title)}"
 
 
 # ---------------------------------------------------------------------------

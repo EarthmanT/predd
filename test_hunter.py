@@ -2728,3 +2728,39 @@ class TestJiraLabeling:
 
         # Only issue #2 should be labeled (has key, not already labeled)
         mock_label.assert_called_once_with("owner/repo", 2, "[BPA-2] Needs label")
+
+
+# ---------------------------------------------------------------------------
+# TestBranchNamingJiraKey
+# ---------------------------------------------------------------------------
+
+class TestBranchNamingJiraKey:
+    """Tests for issue_identifier and Jira-key-aware branch naming."""
+
+    def test_issue_identifier_returns_jira_key_when_present(self):
+        assert h.issue_identifier(377, "[DAP09A-1841] Add foo") == "DAP09A-1841"
+
+    def test_issue_identifier_falls_back_to_issue_number(self):
+        assert h.issue_identifier(377, "Add foo") == "377"
+
+    def test_proposal_branch_uses_jira_key(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        branch = h.proposal_branch(cfg, 377, "[DAP09A-1900] Add foo")
+        assert "DAP09A-1900-proposal-" in branch
+        assert "377" not in branch
+
+    def test_proposal_branch_falls_back_to_issue_number(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        branch = h.proposal_branch(cfg, 377, "Add foo")
+        assert "377-proposal-" in branch
+
+    def test_impl_branch_uses_jira_key(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        branch = h.impl_branch(cfg, 377, "[BPA-42] Fix thing")
+        assert "BPA-42-impl-" in branch
+        assert "377" not in branch
+
+    def test_impl_branch_falls_back_to_issue_number(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        branch = h.impl_branch(cfg, 377, "Fix thing")
+        assert "377-impl-" in branch
