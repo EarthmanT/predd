@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
+#   "anthropic[bedrock]",
 # ]
 # ///
 
@@ -165,6 +166,36 @@ def _run_claude(cfg: Config, prompt: str, worktree: Path) -> str:
         ["claude", "-p", "--dangerously-skip-permissions", "--model", cfg.model],
         worktree, env=env, stdin_text=prompt,
     )
+
+
+def _run_bedrock_text(cfg: Config, prompt: str) -> str:
+    """Call Bedrock for a plain text response — no tools, no skill file."""
+    try:
+        from anthropic import AnthropicBedrock
+    except ImportError:
+        raise RuntimeError("anthropic[bedrock] not installed. Run: pip install -U 'anthropic[bedrock]'")
+
+    if cfg.aws_profile and cfg.aws_profile != "default":
+        os.environ["AWS_PROFILE"] = cfg.aws_profile
+
+    client = AnthropicBedrock(aws_region=cfg.aws_region)
+    resp = client.messages.create(
+        model=cfg.bedrock_model,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(
+        block.text for block in resp.content if hasattr(block, "text") and block.text
+    )
+
+
+def _run_llm(cfg: Config, prompt: str, worktree: Path) -> str:
+    """Dispatch to the configured backend for a plain text LLM call."""
+    if cfg.backend == "claude":
+        return _run_claude(cfg, prompt, worktree)
+    if cfg.backend == "bedrock":
+        return _run_bedrock_text(cfg, prompt)
+    raise ValueError(f"Unknown backend '{cfg.backend}'. Valid values: claude, bedrock")
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +763,7 @@ def run_analyze(cfg: Config, days: int | None = None, dry_run: bool = False) -> 
     cfg_copy_model = cfg.model
     cfg.model = cfg.analyze_model
     try:
-        response = _run_claude(cfg, prompt, Path.cwd())
+        response = _run_llm(cfg, prompt, Path.cwd())
     finally:
         cfg.model = cfg_copy_model
 

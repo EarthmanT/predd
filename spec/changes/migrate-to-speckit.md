@@ -1,221 +1,292 @@
-# Migrate Hunter to Spec Kit Workflow
+# Migrate Hunter/Predd to Spec Kit Workflow
 
 ## Problem
 
-Hunter today runs a two-stage skill workflow: proposal_skill produces a draft proposal PR, impl_skill produces an implementation PR. The skills are bespoke prompts that have to encode all the structure themselves — spec format, planning, task breakdown, traceability. There's no shared vocabulary with the rest of the SDD ecosystem.
+Hunter runs bespoke `proposal_skill` / `impl_skill` prompts with no awareness of upstream spec artifacts. The skills encode all structure themselves. There is no shared vocabulary with the SDD ecosystem, no traceability from business requirements to implementation, and no standard artifact layout reviewers can rely on.
 
-GitHub's Spec Kit (`github/spec-kit`, MIT, 95k stars) defines that structure as a first-class set of artifacts: `constitution.md`, `spec.md`, `clarify`, `plan.md`, `tasks.md`, and `implement`. Adopting it gets us:
-- A standard artifact layout that any spec-kit-aware tool can read
-- Versioned templates maintained by GitHub, not by us
-- Compatibility with the community-extension ecosystem (worktree isolation, plan review gates, retro analysis, etc.) we can adopt later without forking hunter
+## Architecture
 
-## Proposed Behaviour
+### Upstream Repos (read-only from hunter/predd's perspective)
 
-### Stage Mapping (preserves the 2-PR gate model)
+Two repos feed the workflow:
 
-| Hunter stage today | Spec Kit equivalent | PR gate |
+- **Product Management repo** — capability definitions; source of `constitution.md` content
+- **BPA-Specs repo** — owns `specify` + `clarify` output: business reqs, acceptance criteria, eng reqs, cross-team decisions
+
+Spec-kit phases 1–3 (constitution, specify, clarify) happen upstream and are committed to BPA-Specs by humans. Hunter **consumes** them; it does not generate them.
+
+### BPA-Specs Folder Contract
+
+```
+<capability_specs_path>/        # e.g. ~/windsurf/projects/bpa-specs/specs
+  <capability-slug>/
+    constitution.md             # regenerated from PM content at intake
+    spec.md                     # capability-level spec
+    clarifications.md           # architect/QA/cross-team decisions (optional)
+    stories/
+      <jira-key>/               # e.g. DAP09A-1234
+        spec.md                 # story-level spec (references capability spec)
+```
+
+### Phase Mapping
+
+| Spec-kit phase | Owner | Implementation phase |
 |---|---|---|
-| `proposal_skill` produces a proposal | `/speckit.specify` + `/speckit.clarify` + `/speckit.plan` + `/speckit.tasks` produce four artifacts | **Specification PR** — `spec.md`, `plan.md`, `tasks.md` (+ optional `research.md`, `data-model.md`, `contracts/`) |
-| `impl_skill` produces the implementation | `/speckit.implement` executes `tasks.md` | **Implementation PR** — code changes |
+| 1 constitution | PM repo (humans) | — |
+| 2 specify | BPA-Specs (humans) | — |
+| 3 clarify | BPA-Specs (humans) | — |
+| 4 plan | hunter proposal stage | Phase I |
+| 5 analyze | predd review of proposal PR | Phase II |
+| 6 tasks | predd review of proposal PR | Phase II |
+| 7 implement | hunter impl stage | Phase I |
 
-Five spec-kit checkpoints collapse into hunter's two existing PR gates. Human reviewer sees a richer artifact set in PR 1 (spec + plan + tasks together rather than a single proposal) but the merge/approval flow is unchanged.
+Preserves the 2-PR gate model. Phase I is shippable independently — predd does its existing generic review of the proposal PR unchanged until Phase II lands.
 
-### State Machine
+---
 
-Old:
+## Phase I — Hunter reads BPA-Specs, runs plan + implement
 
-```
-new → in_progress → proposal_open → implementing → self_reviewing → ready_for_review → submitted
-```
+### Identity Resolution
 
-New:
+No frontmatter parsing — all identity comes from Jira:
 
-```
-new → specifying → spec_open → implementing → self_reviewing → ready_for_review → submitted
-```
+- **Story ID** = Jira ticket key (e.g. `DAP09A-1234`), already on `entry["jira_key"]`
+- **Capability** = Jira epic link field → slugified → matched to folder under `capability_specs_path`
+- **Epic field**: existing Jira integration fetches multiple epic fields; reuse whichever has a value (same pattern already in `fetch_jira_frontmatter`)
+- **Stories without a capability** (Security, Tech Debt, etc.) → epic absent or no matching folder → log `speckit_no_capability` → fall back to legacy `proposal_skill_path`, no error
 
-`specifying` covers all four spec-kit pre-implementation stages run sequentially in one worktree. Progress within `specifying` is tracked via decision-log events, not state transitions:
+**Epic → folder mapping**: slugify epic name (lowercase, hyphens). If no folder match, check `speckit_epic_map` config dict. If still no match → legacy fallback.
 
-```
-specify_started → specify_completed → clarify_completed → plan_completed → tasks_completed
-```
+### Config Additions (`predd.py`)
 
-The `proposal_*` state field names (`proposal_pr`, `proposal_branch`, `proposal_worktree`, `proposal_feedback`) rename to `spec_*` for clarity, but the old field names are read as aliases for backward compatibility on existing state files.
-
-### Per-Repo Prerequisite Check
-
-Before hunter processes any issue, it verifies the target repo has been initialized for Spec Kit:
-
-```
-<repo>/.specify/memory/constitution.md          # must exist
-<repo>/.specify/templates/spec-template.md      # must exist
-<repo>/.specify/templates/plan-template.md      # must exist
-<repo>/.specify/templates/tasks-template.md     # must exist
-<repo>/.specify/scripts/create-new-feature.sh   # must exist (or .ps1 on Windows hosts)
+```python
+self.speckit_enabled: bool = data.get("speckit_enabled", False)
+self.speckit_prompt_dir: Path = Path(data.get("speckit_prompt_dir",
+    str(Path(__file__).parent / "prompts" / "speckit"))).expanduser()
+self.capability_specs_path: Path | None = (
+    Path(data["capability_specs_path"]).expanduser() if "capability_specs_path" in data else None
+)
+self.speckit_epic_map: dict[str, str] = data.get("speckit_epic_map", {})
 ```
 
-If any are missing, hunter:
-1. Logs `log_decision("speckit_not_initialized", repo=repo)`
-2. Posts a comment on the issue: `⚠️ This repo is not initialized for Spec Kit. Run 'specify init .' in the repo and add a constitution (run /speckit.constitution in your agent). Hunter will skip this issue until done.`
-3. Adds label `{github_user}:speckit-uninitialized`
-4. Skips the issue (does not claim, does not pick up again on next poll until the label is removed by a human after init)
+Keep `proposal_skill_path` / `impl_skill_path` — legacy fallback path unchanged.
 
-Auto-running `specify init` is out of scope — the constitution needs human authorship.
+### Artifact Copy (spec-refs/)
 
-### Specification Stage (replaces `process_issue`)
-
-When hunter claims an issue:
-
-1. **Branch and worktree** (unchanged pattern). New branch name: `{cfg.branch_prefix}/spec/{issue_number}-{slug}` (e.g. `usr/at/spec/377-port-linter-prs`). Worktree under `cfg.worktree_base` as today.
-
-2. **Bootstrap the feature folder** by invoking spec-kit's `create-new-feature.sh` from inside the worktree:
-
-```bash
-./.specify/scripts/create-new-feature.sh "<issue-title>"
-```
-
-This creates `.specify/specs/NNN-<slug>/spec.md` (initial template) and switches the worktree's branch if spec-kit's script does its own branch creation. Hunter checks the resulting branch name and renames it to match `{cfg.branch_prefix}/spec/{issue_number}-{slug}` if the script's default doesn't match. (Spec-kit's branch naming and hunter's user-prefix convention need to coexist — we keep hunter's prefix for label/state correlation.)
-
-3. **Run `/speckit.specify` equivalent.** Send the agent a prompt with the issue body as input and instructions to populate `spec.md`. The prompt structure mirrors what spec-kit's slash command sends — see "Prompt Templates" below.
-
-4. **Run `/speckit.clarify` equivalent.** Drives the agent through structured clarification questions. Recorded in a Clarifications section of `spec.md`. Skippable via `cfg.speckit_skip_clarify = true` for prototype-mode work; default `false`.
-
-5. **Run `/speckit.plan` equivalent.** Agent produces `plan.md` + supporting files (`research.md`, `data-model.md`, `contracts/`). The tech stack is inferred from the existing repo — no human input on plan tech choices, which differs from interactive spec-kit usage. If hunter wants the human to make the tech-stack call, that's a separate spec.
-
-6. **Run `/speckit.tasks` equivalent.** Agent produces `tasks.md` with the task breakdown, dependency markers, parallel-execution markers.
-
-7. **(Optional) Run `/speckit.analyze` equivalent.** Cross-artifact consistency check. Gated on `cfg.speckit_run_analyze = true`; default `false` (extra LLM cost, useful but not blocking).
-
-8. **Commit and open Specification PR.** All artifacts in one commit: `spec: issue #N — <title>`. PR title `Spec: <title>`. Label `sdd-proposal` (kept for hunter's existing discovery via `gh_find_merged_proposal`). The merged-proposal discovery and downstream wiring don't need to change.
-
-9. **State** → `spec_open`. Label `{github_user}:spec-open` on the issue (was `:proposal-open`; rename in the same change). Wait for human merge.
-
-### Implementation Stage (replaces the existing implementation path)
-
-When hunter detects a merged `sdd-proposal` PR for an issue (via existing `gh_find_merged_proposal`):
-
-1. Create implementation branch `{cfg.branch_prefix}/impl/{issue_number}-{slug}` and worktree.
-
-2. **Run `/speckit.implement` equivalent.** Agent reads `.specify/specs/NNN-<slug>/spec.md`, `plan.md`, `tasks.md` and executes the tasks. Hunter's `run_skill` is replaced with a `run_speckit_implement` function. The prompt structure includes paths to the three artifact files and the constitution.
-
-3. Commit (`commit_skill_output`), validate non-empty diff (`skill_has_commits`), open implementation PR with label `sdd-implementation`. Self-review loop runs unchanged.
-
-### Prompt Templates
-
-Hunter ships prompt templates that approximate each spec-kit slash command for headless use. Stored in the predd repo at:
+At proposal time, hunter copies the relevant BPA-Specs artifacts into the proposal branch:
 
 ```
-prompts/speckit/specify.md
-prompts/speckit/clarify.md
-prompts/speckit/plan.md
-prompts/speckit/tasks.md
-prompts/speckit/analyze.md
-prompts/speckit/implement.md
+spec-refs/
+  constitution.md
+  capability-spec.md
+  story-spec.md
+  clarifications.md      # if present
 ```
 
-Each is a Jinja-lite template (Python `str.format` with named placeholders — no new dep) that substitutes:
-- `{issue_number}`, `{issue_title}`, `{issue_body}`, `{constitution_path}`, `{spec_dir}`, `{template_paths}` as relevant.
+`plan.md` frontmatter records `capability_specs_sha` (HEAD SHA of `capability_specs_path` at proposal time), `capability`, `story_id`. Rationale: self-contained PR review, audit trail, no cross-repo lookup required for reviewers.
 
-The substance of each prompt: instruct the agent to follow the spec-kit template at `<repo>/.specify/templates/<template>.md` and write the output to the correct path. The agent gets repo-local file access via the existing tool set (bedrock backend) or filesystem access (claude/devin CLIs).
+Implementation stage reads `spec-refs/` from the merged proposal branch — never re-resolves BPA-Specs at implement time.
 
-### Replaces `cfg.proposal_skill_path` and `cfg.impl_skill_path`
+### Missing Artifacts
 
-These config knobs are deprecated. New knobs:
+- `story spec.md`, `capability spec.md`, or `constitution.md` missing → **hard fail**: comment on issue, add `{github_user}:speckit-missing-spec` label, skip
+- `clarifications.md` missing → **soft warn**: log decision, proceed without it
 
-```toml
-# Spec-Kit workflow
-speckit_enabled = true                # set false to keep legacy skill workflow
-speckit_prompt_dir = "/path/to/predd/prompts/speckit"  # default points at repo
-speckit_skip_clarify = false          # skip the clarify stage (faster, less rigorous)
-speckit_run_analyze = false           # run /speckit.analyze after tasks
+### New Functions in `hunter.py`
+
+```python
+def resolve_capability_folder(cfg, epic_name, epic_key) -> Path | None
+```
+- `capability_specs_path` not set → None
+- Slugify epic_name → check folder exists → return path
+- Check `speckit_epic_map[epic_key]` → return path
+- Else → log `speckit_no_capability` → None (triggers legacy path)
+
+```python
+def read_bpa_specs_bundle(capability_dir, story_id) -> dict
+```
+- Returns `{"constitution": Path, "capability_spec": Path, "story_spec": Path, "clarifications": Path|None}`
+- Hard fail (RuntimeError) if required files missing; soft warn for clarifications
+
+```python
+def pin_capability_sha(cfg) -> str
+```
+- `git -C cfg.capability_specs_path rev-parse HEAD`
+
+```python
+def copy_spec_refs(bundle, worktree) -> Path
+```
+- Writes `spec-refs/` into worktree; returns `worktree / "spec-refs"`
+
+```python
+def load_speckit_prompt(cfg, name, **kwargs) -> str
+```
+- Reads `cfg.speckit_prompt_dir / f"{name}.md"`, calls `.format(**kwargs)`
+- Raises `FileNotFoundError` if template missing
+
+```python
+def run_speckit_plan(cfg, entry, worktree, issue_number, title, issue_body) -> bool
+```
+1. Get `jira_key` + epic fields from `entry`; call `resolve_capability_folder` → if None, return False
+2. `read_bpa_specs_bundle` → bundle
+3. `pin_capability_sha` → sha; store in state as `capability_specs_sha`
+4. `copy_spec_refs(bundle, worktree)` and commit
+5. Load + render `plan.md` prompt; write to temp file; call `run_skill(cfg, tmp, context, worktree)`
+6. Verify `plan.md` written; log `plan_completed`; return True
+
+```python
+def run_speckit_implement(cfg, entry, worktree, issue_number, title, issue_body) -> None
+```
+1. Load `implement.md` prompt with paths from `spec-refs/` + `plan.md` + `tasks.md` in worktree
+2. Write to temp file; call `run_skill(cfg, tmp, context, worktree)`
+
+### Fork `process_issue()` (~line 878)
+
+```python
+used_speckit = cfg.speckit_enabled and run_speckit_plan(cfg, entry, worktree, ...)
+if not used_speckit:
+    run_skill(cfg, cfg.proposal_skill_path, context, worktree)
 ```
 
-When `speckit_enabled = false`, hunter uses the old `proposal_skill_path` / `impl_skill_path` flow unchanged. This gives us a feature flag to roll back if the new flow breaks. Once stable, the legacy path can be deleted.
+Store `used_speckit: bool` in state entry. Branch name: `spec_branch()` helper (`{branch_prefix}/{issue_id}-spec-{slug}`) when speckit; existing `proposal_branch()` when legacy.
 
-`cfg.skill_path` (the PR-review skill used by predd and by hunter's self-review) stays — spec-kit doesn't replace post-implementation code review.
+### Fork `check_proposal_merged()` (~line 1138)
 
-### Backend Compatibility
+```python
+if entry.get("used_speckit"):
+    run_speckit_implement(cfg, entry, worktree, ...)
+else:
+    run_skill(cfg, cfg.impl_skill_path, context, worktree)
+```
 
-All three backends (`claude`, `devin`, `bedrock`) work without changes because hunter invokes spec-kit by:
-- Running shell scripts (`create-new-feature.sh`) via subprocess — backend-agnostic
-- Sending prompt templates to the agent via the existing `run_skill` machinery — backend-agnostic
+### Prompt Templates (`prompts/speckit/`)
 
-The bedrock backend already has the tool set (`read_file`, `list_files`, `bash`) needed to navigate `.specify/` and write artifacts. No new tools required.
+Two new files, Python `str.format` placeholders only (no new deps):
 
-### Obsidian Output Adjustment
+- `plan.md` — given spec bundle paths + issue context, produce `plan.md`
+- `implement.md` — given `spec-refs/` + `plan.md` + `tasks.md`, execute all tasks
 
-Obsidian's `_extract_and_write_specs` currently writes full spec markdown files into `spec/changes/` and hunter picks those up. With spec-kit:
+Placeholders: `{issue_number}`, `{issue_title}`, `{issue_body}`, `{constitution_path}`, `{capability_spec_path}`, `{story_spec_path}`, `{clarifications_path}`, `{spec_refs_dir}`, `{plan_path}`, `{tasks_path}`.
 
-- Obsidian writes one-line **issue descriptions** into `spec/changes/`, formatted as GitHub issue bodies. A separate small loop (or a new field on the obsidian output) files them as GitHub issues in the target repo.
-- Hunter then picks up the issues normally and runs the spec-kit workflow on them.
+---
 
-This is a separate follow-on spec — not required for this one. Until obsidian is updated, its output keeps going to `spec/changes/` and the legacy flow handles it (when `speckit_enabled = false`) or is ignored (when `speckit_enabled = true`).
+## Phase II — Predd analyze + tasks + re-plan loop
 
-### Branch Prefix Reconciliation
+Depends on Phase I being merged and stable.
 
-Spec-kit's `create-new-feature.sh` creates branches named `NNN-<slug>` (e.g. `001-create-taskify`). Hunter's convention is `{cfg.branch_prefix}/<stage>/{issue_number}-<slug>`. We reconcile by:
+### Additional Config (`predd.py`)
 
-1. Letting spec-kit's script create its branch.
-2. Renaming it inside the script's worktree before opening the PR:
-   ```bash
-   git branch -m <speckit-name> <hunter-name>
-   ```
-3. Updating any internal spec-kit references to the branch name if needed (spec-kit doesn't appear to hard-code branch names in artifacts based on the docs).
+```python
+self.speckit_run_analyze: bool = data.get("speckit_run_analyze", True)
+self.max_analyze_fix_loops: int = data.get("max_analyze_fix_loops", 2)
+```
 
-### CLAUDE.md Updates
+### Additional Prompt Templates
 
-Document the new workflow in the conventions section. Add the constitution-required precondition. Update the spec inventory table to note spec-kit migration.
+- `analyze.md` — given `spec-refs/` + `plan.md`, output structured `APPROVE` or `INCONSISTENT: <findings>`
+- `tasks.md` — given approved `plan.md`, produce `tasks.md`
+
+### `run_speckit_review()` in `predd.py`
+
+Called from `process_pr()` when `cfg.speckit_enabled` and PR has label `sdd-proposal`:
+
+1. Read `spec-refs/` + `plan.md` from worktree
+2. Load + run `analyze.md` prompt via existing backend dispatch
+3. Parse verdict: first line `APPROVE` or `INCONSISTENT`
+4. If `INCONSISTENT`:
+   - Post `REQUEST_CHANGES` review with findings body
+   - Add `{github_user}:needs-replan` label to source issue (parse issue number from PR body)
+5. If `APPROVE`:
+   - Load + run `tasks.md` prompt
+   - Verify `tasks.md` written; `git commit` + push to proposal branch
+   - Post `APPROVE` review with summary
+
+### Re-plan Loop in `hunter.py`
+
+In `proposal_open` poll branch:
+- If issue has `needs-replan` label AND `analyze_fix_loops < max_analyze_fix_loops`:
+  - Remove label; close proposal PR; delete worktree
+  - Increment `analyze_fix_loops`; reset status to `new` for reprocessing
+- If loops exhausted: mark `failed`, post escalation comment
+
+Add `analyze_fix_loops: int` (default 0) to state entry.
+
+### Label Updates
+
+Add to `_clean_hunter_labels()`: `{github_user}:needs-replan`, `{github_user}:speckit-missing-spec`.
+
+---
+
+## State Machine
+
+State machine is **unchanged** for Phase I. `used_speckit` flag in the state entry distinguishes which path is active; status names (`in_progress`, `proposal_open`, `implementing`, etc.) remain as-is. No new statuses.
+
+---
+
+## Backend Compatibility
+
+All three backends work without changes — hunter invokes spec-kit by sending prompt templates via the existing `run_skill` machinery. The bedrock and claude backends have active tool use (`read_file`, `list_files`, `bash`) and can discover additional context from the worktree filesystem if prompted. Devin requires files to be staged explicitly (already handled by `copy_spec_refs`).
+
+Bedrock end-to-end verification is a separate spec. Keep `speckit_enabled = false` on bedrock-backed instances until verified.
+
+---
 
 ## Out of Scope
 
-- Adopting any community spec-kit extension. Hunter drives spec-kit directly. Extension adoption is a separate decision per extension.
-- Auto-generating the constitution. Human-authored only — it's the project's foundational document.
-- Multi-feature parallel specification (spec-kit handles this via numbered feature folders; hunter is single-threaded per issue, which matches today).
-- Updating obsidian to produce spec-kit-compatible issues. Follow-on spec.
-- `predd analyze` / `obsidian analyze` themselves adopting spec-kit. They produce specs *about* the predd/hunter codebase; that's a different concern from hunter's per-issue workflow.
-- Removing `proposal_skill_path` / `impl_skill_path` from Config. Stays for one release as a fallback path.
+- Phases 1–3 (constitution, specify, clarify) — upstream / human-authored
+- Auto-generating the constitution or spec — human-authored only
+- Per-repo `speckit_enabled` flag — separate spec
+- Removing `proposal_skill_path` / `impl_skill_path` from Config — stays as fallback
+- Updating obsidian to produce spec-kit-compatible issues — follow-on spec
+- Constitution staleness check against PM repo — `pm_source_sha` recorded in frontmatter for future use; not checked yet
+
+---
 
 ## Risks
 
-1. **Heavier per-issue token spend.** Spec-kit runs four sequential LLM calls (specify, clarify, plan, tasks) where the old flow ran one. With prompt caching landed (the bedrock spec), the marginal cost is much lower — constitution + templates cache across calls. Still ~2-3x the cost of the old flow on the spec stage.
+1. **Heavier token spend.** Two LLM calls (plan + implement) replace one each. Minor with prompt caching.
+2. **BPA-Specs drift.** If BPA-Specs changes mid-flight, the pinned SHA in `plan.md` frontmatter anchors both plan and implement to the same snapshot.
+3. **Epic → folder slug mismatch.** Epic naming conventions may not slugify cleanly. `speckit_epic_map` provides an escape hatch.
 
-2. **Spec-kit's scripts may evolve.** The shell scripts in `.specify/scripts/` are versioned with the user's `specify init` run. If they change shape (rename, new arguments), hunter's invocations break. Pin spec-kit version via the repo's own `specify` install; do not invoke remote scripts.
-
-3. **More artifacts in the spec PR means longer reviews.** Spec + plan + tasks is three documents to review instead of one. Could slow down the human gate. Counterargument: it makes the eventual implementation more predictable.
-
-4. **Bedrock backend has not yet been verified end-to-end** (separate spec). If bedrock is the chosen backend for spec-kit work and the bedrock spec hasn't landed first, this spec is blocked on it.
+---
 
 ## Acceptance Criteria
 
-1. With a fresh repo where `specify init .` has been run and a constitution committed, hunter picks up an assigned issue and produces a Specification PR containing `spec.md`, `plan.md`, `tasks.md` (and `research.md`, `contracts/` if the plan generated them).
-2. With a repo missing `.specify/memory/constitution.md`, hunter posts the prerequisite comment, applies the `speckit-uninitialized` label, and does not claim the issue.
-3. After the Specification PR merges, hunter creates an Implementation PR by running `/speckit.implement` against the merged artifacts.
-4. `speckit_enabled = false` runs the legacy `proposal_skill` / `impl_skill` flow with no changes from today's behavior.
-5. State machine entries for new issues have status `specifying` then `spec_open` (not `in_progress` / `proposal_open`).
-6. Existing state entries with `proposal_*` keys continue to advance correctly (alias read).
-7. Decision-log events include `specify_started`, `specify_completed`, `clarify_completed`, `plan_completed`, `tasks_completed` for new-flow issues.
-8. All three backends (`claude`, `devin`, `bedrock`) produce identical artifact structure for the same issue (content will differ; structure must not).
-9. Tests in `test_hunter.py` cover: prerequisite check, prompt template substitution, the spec → impl transition reading the new fields, the legacy alias-read path, the feature flag toggle.
-10. Existing tests pass.
+**Phase I:**
+1. Hunter picks up a story with a Jira epic that maps to a capability folder and opens a proposal PR containing `spec-refs/` + `plan.md` with `capability_specs_sha` in frontmatter.
+2. For a story with no capability (Security, Tech Debt, etc.) — hunter falls back to `proposal_skill_path` with no error.
+3. After the proposal PR merges, hunter runs spec-kit implement and opens an implementation PR reading from `spec-refs/` + `plan.md`.
+4. `speckit_enabled = false` runs legacy flow unchanged.
+5. `used_speckit` is recorded in state; `check_proposal_merged` respects it.
+6. Tests cover: `resolve_capability_folder` (slug match, map fallback, no epic, no config), `read_bpa_specs_bundle` (happy path, hard fail, soft warn), `run_speckit_plan` (returns True/False), `process_issue` fork, `check_proposal_merged` fork.
+7. Existing tests pass.
+
+**Phase II:**
+8. Predd running against a speckit proposal PR commits `tasks.md` to the branch and posts APPROVE review.
+9. Predd detects plan inconsistency → posts REQUEST_CHANGES + `needs-replan` label.
+10. Hunter re-plan loop increments counter, resets issue on next cycle; exhausted → `failed`.
+11. Tests cover: analyze approve path, analyze inconsistent path, re-plan loop counter, exhaustion.
+
+---
 
 ## Files Touched
 
-- `hunter.py` — new state machine, new `process_issue` body, new `check_proposal_merged` body (rename to `check_spec_merged`?), prerequisite check, prompt-template loading, Config additions.
-- `predd.py` — Config knobs for `speckit_*`.
-- `obsidian.py` — no required change in this spec (follow-on).
-- `prompts/speckit/*.md` — new directory with six prompt templates.
-- `test_hunter.py` — new tests.
-- `CLAUDE.md` — workflow documentation.
-- `README.md` — workflow section update.
+| File | Phase |
+|---|---|
+| `predd.py` — Config fields, `process_pr` fork | I + II |
+| `hunter.py` — new functions, `process_issue` fork, `check_proposal_merged` fork, re-plan loop | I + II |
+| `prompts/speckit/plan.md`, `implement.md` | I |
+| `prompts/speckit/analyze.md`, `tasks.md` | II |
+| `test_hunter.py` | I + II |
+| `CLAUDE.md` | I |
 
-## Migration
+## Key Reused Functions (do not duplicate)
 
-This is a big enough change to warrant a feature flag (`speckit_enabled`) plus a documented migration:
-
-1. Land the spec with `speckit_enabled = false` as the default.
-2. Initialize spec-kit on one target repo (`specify init .` + constitution).
-3. Flip `speckit_enabled = true` for that repo (per-repo flag once the per-repo config spec lands; until then, global).
-4. Run hunter on one real issue end-to-end. Compare artifact quality and token cost to the old flow.
-5. If it works, flip the default to `true` and remove the legacy code path in a follow-on.
-
-If it doesn't work, the flag flips back and we iterate without committing.
+- `run_skill(cfg, skill_path, arguments, worktree)` — `hunter.py` ~line 835
+- `setup_new_branch_worktree(...)` — `predd.py` ~line 1170
+- `commit_skill_output / skill_has_commits` — `hunter.py`
+- `gh_create_branch_and_pr / gh_issue_add_label / gh_issue_remove_label` — `hunter.py`
+- `gh_pr_review(...)` — `predd.py`
+- `_run_claude / _run_devin_skill / _run_bedrock_skill` — `predd.py`
+- `fetch_jira_frontmatter` — `hunter.py` (already fetches epic fields; reuse whichever epic field has a value)
+- `log_decision(...)` — both files

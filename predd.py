@@ -157,6 +157,8 @@ auto_review_draft = false
 # API integration: uncomment jira_api_enabled (token via JIRA_API_TOKEN env var)
 # jira_api_enabled = false
 # jira_projects = ["DAP09A"]  # Jira projects to ingest (defaults to DAP09A)
+# Ingest Jira subtasks as GitHub sub-issues (requires jira_api_enabled = true)
+# ingest_subtasks = false
 # Jira issue types to skip during ingest (case-insensitive)
 skip_jira_issue_types = ["sub-task", "subtask", "sub task"]
 
@@ -460,11 +462,15 @@ class Config:
         self.aws_region: str = data.get("aws_region", "us-east-1")
         self.bedrock_model: str = data.get("bedrock_model", "eu.anthropic.claude-3-7-sonnet-20250219-v1:0")
         self.analyze_hour: int = data.get("analyze_hour", 9)
+        self.ingest_subtasks: bool = data.get("ingest_subtasks", False)
         self.skip_jira_issue_types: list[str] = data.get(
             "skip_jira_issue_types",
             ["sub-task", "subtask", "sub task"],
         )
         self.jira_sprint_filter: str = data.get("jira_sprint_filter", "active")
+        self.jira_failure_threshold: int = data.get("jira_failure_threshold", 3)
+        self.jira_backoff_base: int = data.get("jira_backoff_base", 60)
+        self.jira_backoff_max: int = data.get("jira_backoff_max", 3600)
         self.jira_active_sprint_name: str = data.get("jira_active_sprint_name", "")
         # Validate jira_sprint_filter
         _jsf = self.jira_sprint_filter
@@ -558,6 +564,10 @@ class Config:
             "jira_projects": self.jira_projects,
             "require_jira_conformance": self.require_jira_conformance,
             "jira_sprint_filter": self.jira_sprint_filter,
+            "jira_failure_threshold": self.jira_failure_threshold,
+            "jira_backoff_base": self.jira_backoff_base,
+            "jira_backoff_max": self.jira_backoff_max,
+            "ingest_subtasks": self.ingest_subtasks,
             "skip_jira_issue_types": self.skip_jira_issue_types,
             "status_server_enabled": self.status_server_enabled,
             "status_port": self.status_port,
@@ -1352,57 +1362,62 @@ def _run_skill_prompt(cfg: "Config", prompt: str, worktree: Path) -> str:
     raise ValueError(f"Unknown backend '{cfg.backend}'")
 
 
+def _gh_api_paginated(path: str) -> list[dict]:
+    """Fetch all pages from a GitHub API endpoint via gh --paginate, return combined list."""
+    import re as _re
+    result = subprocess.run(
+        ["gh", "api", path, "--paginate"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+    # gh --paginate concatenates JSON arrays: "[...][...]" — split on "][" boundary
+    items = []
+    for chunk in _re.split(r'\]\s*\[', raw.strip('[]')):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            items.extend(json.loads('[' + chunk + ']'))
+        except json.JSONDecodeError:
+            pass
+    return items
+
+
 def _fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
     """Return all reviews + inline comments for a PR via gh api."""
     comments = []
 
     # Top-level reviews (REQUEST_CHANGES, APPROVE, COMMENT with body)
     try:
-        result = gh_run(
-            ["api", f"repos/{repo}/pulls/{pr_number}/reviews",
-             "--paginate", "--jq", ".[]"],
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                try:
-                    obj = json.loads(line)
-                    if obj.get("body", "").strip() or obj.get("state") == "CHANGES_REQUESTED":
-                        comments.append({
-                            "id": obj.get("id"),
-                            "type": "review",
-                            "state": obj.get("state"),
-                            "author": (obj.get("user") or {}).get("login", ""),
-                            "body": obj.get("body", "").strip(),
-                            "submitted_at": obj.get("submitted_at", ""),
-                        })
-                except json.JSONDecodeError:
-                    pass
+        for obj in _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews"):
+            if obj.get("body", "").strip() or obj.get("state") == "CHANGES_REQUESTED":
+                comments.append({
+                    "id": obj.get("id"),
+                    "type": "review",
+                    "state": obj.get("state"),
+                    "author": (obj.get("user") or {}).get("login", ""),
+                    "body": obj.get("body", "").strip(),
+                    "submitted_at": obj.get("submitted_at", ""),
+                })
     except Exception as e:
         logger.debug("Could not fetch reviews for PR #%d: %s", pr_number, e)
 
     # Inline review comments
     try:
-        result = gh_run(
-            ["api", f"repos/{repo}/pulls/{pr_number}/comments",
-             "--paginate", "--jq", ".[]"],
-            check=False,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().splitlines():
-                try:
-                    obj = json.loads(line)
-                    comments.append({
-                        "id": obj.get("id"),
-                        "type": "inline",
-                        "author": (obj.get("user") or {}).get("login", ""),
-                        "path": obj.get("path", ""),
-                        "line": obj.get("line") or obj.get("original_line"),
-                        "body": obj.get("body", "").strip(),
-                        "submitted_at": obj.get("created_at", ""),
-                    })
-                except json.JSONDecodeError:
-                    pass
+        for obj in _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments"):
+            comments.append({
+                "id": obj.get("id"),
+                "type": "inline",
+                "author": (obj.get("user") or {}).get("login", ""),
+                "path": obj.get("path", ""),
+                "line": obj.get("line") or obj.get("original_line"),
+                "body": obj.get("body", "").strip(),
+                "submitted_at": obj.get("created_at", ""),
+            })
     except Exception as e:
         logger.debug("Could not fetch inline comments for PR #%d: %s", pr_number, e)
 

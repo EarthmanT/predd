@@ -54,6 +54,16 @@ gh_issue_comment = _predd.gh_issue_comment
 gh_issue_add_label = _predd.gh_issue_add_label
 gh_run = _predd.gh_run
 
+# ---------------------------------------------------------------------------
+# Jira API circuit-breaker state
+# ---------------------------------------------------------------------------
+
+_jira_consecutive_failures: int = 0
+_jira_backoff_until: float = 0.0
+_JIRA_BACKOFF_BASE: int = 60
+_JIRA_BACKOFF_MAX: int = 3600
+_JIRA_FAILURE_THRESHOLD: int = 3
+
 # Failure comment templates for hunter
 _HUNTER_NO_COMMITS_COMMENT = """\
 ⚠️ Hunter ran the `{skill}` skill for this issue but the AI produced no commits.
@@ -177,6 +187,20 @@ def extract_jira_key(title: str) -> str | None:
     """Extract Jira key from issue title, e.g. '[DAP09A-1184] foo' -> 'DAP09A-1184'."""
     m = JIRA_KEY_RE.search(title or "")
     return m.group(1) if m else None
+
+
+def parse_jira_frontmatter(body: str) -> dict:
+    """Extract key/value pairs from <!-- jira-metadata ... --> block in a GitHub issue body."""
+    import re as _re
+    m = _re.search(r"<!-- jira-metadata\n(.*?)\n-->", body or "", _re.DOTALL)
+    if not m:
+        return {}
+    result = {}
+    for line in m.group(1).splitlines():
+        if ": " in line:
+            k, _, v = line.partition(": ")
+            result[k.strip()] = v.strip()
+    return result
 
 
 def issue_identifier(issue_number: int, title: str) -> str:
@@ -487,6 +511,33 @@ def _find_impl_pr(repo: str, issue_number: int) -> int | None:
     return None
 
 
+def _find_open_impl_pr_by_jira_key(repo: str, jira_key: str, exclude_issue: int) -> int | None:
+    """Return PR number if any open sdd-implementation PR for jira_key exists on a different issue."""
+    result = gh_run([
+        "pr", "list",
+        "--repo", repo,
+        "--state", "open",
+        "--label", "sdd-implementation",
+        "--json", "number,title,headRefName,body",
+        "--limit", "100",
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    key_pattern = re.compile(rf"\b{re.escape(jira_key)}\b", re.IGNORECASE)
+    issue_ref_pattern = re.compile(r"hunter:issue-(\d+)")
+    for pr in json.loads(result.stdout):
+        branch = pr.get("headRefName", "")
+        pr_title = pr.get("title") or ""
+        body = pr.get("body") or ""
+        if not (key_pattern.search(branch) or key_pattern.search(pr_title)):
+            continue
+        m = issue_ref_pattern.search(body)
+        referenced_issue = int(m.group(1)) if m else 0
+        if referenced_issue != exclude_issue:
+            return pr["number"]
+    return None
+
+
 def reconcile_assigned_issues(cfg: "Config", state: dict, repos: list[str]) -> None:
     """For any assigned GH issue with no state entry, infer state from GitHub and inject it."""
     for repo in repos:
@@ -503,6 +554,11 @@ def reconcile_assigned_issues(cfg: "Config", state: dict, repos: list[str]) -> N
 
             if key in state:
                 continue  # already tracked
+
+            # Only reconcile issues with the "jira" label
+            label_names = [lbl["name"] for lbl in issue.get("labels", [])]
+            if "jira" not in label_names:
+                continue
 
             # Search for impl PR first (highest specificity)
             impl_pr = _find_impl_pr(repo, issue_number)
@@ -828,6 +884,21 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
 # ---------------------------------------------------------------------------
 
 
+def _clean_hunter_labels(repo: str, issue_number: int, cfg) -> None:
+    labels_to_remove = [
+        f"{cfg.github_user}:in-progress",
+        f"{cfg.github_user}:proposal-open",
+        f"{cfg.github_user}:implementing",
+        f"{cfg.github_user}:hunter-failed",
+        "needs-jira-info",
+    ]
+    for label in labels_to_remove:
+        try:
+            gh_issue_remove_label(repo, issue_number, label)
+        except Exception:
+            pass
+
+
 def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     """Pick up a new issue: claim it, create proposal PR."""
     issue_number = issue["number"]
@@ -864,6 +935,14 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                          jira_key=jira_key, missing=missing_fields)
             logger.info("Skipping %s#%d — non-conformant Jira issue (%s)",
                         repo, issue_number, ", ".join(missing_fields))
+            update_issue_state(state, key,
+                               status="skipped_conformance",
+                               issue_number=issue_number,
+                               repo=repo,
+                               title=title,
+                               missing_fields=missing_fields,
+                               last_conformance_check=_now_iso(),
+                               first_seen=_now_iso())
             return
 
     if not try_claim_issue(cfg, repo, issue_number):
@@ -878,7 +957,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         return
 
     branch = proposal_branch(cfg, issue_number, title)
-    worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
+    _computed_worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
 
     issue_body = issue.get("body") or ""
 
@@ -891,16 +970,18 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                        issue_author=issue.get("author", {}).get("login", ""),
                        base_branch=base_branch,
                        proposal_branch=branch,
-                       proposal_worktree=str(worktree),
+                       proposal_worktree=str(_computed_worktree),
                        jira_frontmatter=jira_frontmatter,
                        resume_attempts=0,
                        first_seen=_now_iso())
 
+    worktree = None
     try:
         notify_sound(cfg.sound_new_pr)
         notify_toast("New issue picked up", f"{key} — {title}")
 
         worktree = setup_new_branch_worktree(cfg, repo, branch, base_branch)
+        update_issue_state(state, key, proposal_worktree=str(worktree))
         logger.info("Proposal worktree at %s", worktree)
 
         context = build_issue_context(
@@ -956,7 +1037,8 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                 else:
                     comment = _HUNTER_CRASH_COMMENT.format(
                         repo=repo, issue_number=issue_number, skill="proposal",
-                        error=str(e), worktree_path=worktree
+                        error=str(e),
+                        worktree_path=str(worktree) if worktree is not None else "<not created>",
                     )
                 gh_issue_comment(repo, issue_number, comment)
                 failure_label = f"{cfg.github_user}:hunter-failed"
@@ -966,13 +1048,15 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             except Exception as comment_err:
                 logger.error("Failed to post failure comment for %s: %s", key, comment_err)
         update_issue_state(state, key, status="failed")
+        _clean_hunter_labels(repo, issue_number, cfg)
     except Exception as e:
         logger.error("Failed processing issue %s: %s", key, e, exc_info=True)
         if cfg.comment_on_failures:
             try:
                 comment = _HUNTER_CRASH_COMMENT.format(
                     repo=repo, issue_number=issue_number, skill="proposal",
-                    error=str(e), worktree_path=worktree
+                    error=str(e),
+                    worktree_path=str(worktree) if worktree is not None else "<not created>",
                 )
                 gh_issue_comment(repo, issue_number, comment)
                 failure_label = f"{cfg.github_user}:hunter-failed"
@@ -982,6 +1066,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             except Exception as comment_err:
                 logger.error("Failed to post failure comment for %s: %s", key, comment_err)
         update_issue_state(state, key, status="failed")
+        _clean_hunter_labels(repo, issue_number, cfg)
 
 
 def collect_pr_feedback(cfg: Config, state: dict, repo: str, key: str,
@@ -1106,6 +1191,28 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         logger.info("Impl PR #%d already exists for %s — resuming", existing_impl, key)
         update_issue_state(state, key, status="implementing", impl_pr=existing_impl)
         return
+
+    # Block duplicate impl PRs when another GitHub issue with the same Jira key
+    # already has an open impl PR (e.g. Jira issue imported twice into GitHub).
+    jira_key = extract_jira_key(title)
+    if jira_key:
+        duplicate_pr = _find_open_impl_pr_by_jira_key(repo, jira_key, exclude_issue=issue_number)
+        if duplicate_pr:
+            logger.warning(
+                "Jira key %s already has open impl PR #%d — skipping impl for %s",
+                jira_key, duplicate_pr, key,
+            )
+            log_decision("impl_skipped_jira_duplicate", repo=repo, issue=issue_number,
+                         jira_key=jira_key, existing_pr=duplicate_pr)
+            try:
+                gh_issue_comment(repo, issue_number,
+                    f"Skipping implementation: Jira key `{jira_key}` already has an open "
+                    f"impl PR #{duplicate_pr}. If this is a separate issue, update the "
+                    f"Jira key in the issue title to make them unique.")
+            except Exception:
+                pass
+            update_issue_state(state, key, status="skipped_jira_duplicate")
+            return
 
     log_decision("proposal_merged", repo=repo, issue=issue_number, pr=merged_pr)
     logger.info("Proposal PR #%d merged for %s — starting implementation", merged_pr, key)
@@ -1247,7 +1354,7 @@ def self_review_loop(
             _run_bedrock_skill(cfg, fix_prompt, cfg.impl_skill_path, worktree)
         else:
             _run_devin_skill(cfg, fix_prompt, cfg.impl_skill_path, worktree)
-        # Push fixes
+        # Stage and commit fixes
         subprocess.run(
             ["git", "add", "-A"],
             cwd=str(worktree), check=True, capture_output=True,
@@ -1256,17 +1363,30 @@ def self_review_loop(
             ["git", "commit", "--allow-empty", "-m", f"fix: address review findings (loop {loops_done + 1})"],
             cwd=str(worktree), check=True, capture_output=True,
         )
-        subprocess.run(
-            ["git", "push"],
-            cwd=str(worktree), check=True, capture_output=True,
-        )
     except Exception as e:
         logger.error("Fix loop failed for %s: %s", key, e, exc_info=True)
         update_issue_state(state, key, status="failed")
         return
 
+    # Push fixes — separated so push failure can be recovered without losing commits
+    try:
+        subprocess.run(
+            ["git", "push"],
+            cwd=str(worktree), check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError as push_err:
+        logger.warning("Self-review push failed for %s: %s — resetting to implementing", key, push_err)
+        log_decision("self_review_push_failed", repo=repo, issue=issue_number,
+                     pr=impl_pr, error=str(push_err)[:200])
+        update_issue_state(state, key,
+                           status="implementing",
+                           impl_push_failed=True,
+                           review_loops_done=loops_done)
+        return
+
     update_issue_state(state, key,
                        status="implementing",
+                       impl_push_failed=False,
                        review_loops_done=loops_done + 1)
 
 
@@ -1341,9 +1461,7 @@ def check_impl_merged(
 
     try:
         # Remove hunter labels before closing
-        for label_suffix in (":implementing", ":proposal-open", ":in-progress"):
-            gh_issue_remove_label(repo, issue_number,
-                                  f"{cfg.github_user}{label_suffix}")
+        _clean_hunter_labels(repo, issue_number, cfg)
         gh_issue_comment(repo, issue_number,
                          f"Implemented in #{impl_pr}. Closing.")
         gh_run(["issue", "close", str(issue_number), "--repo", repo])
@@ -1360,7 +1478,7 @@ def check_impl_merged(
 # Resume and rollback
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATES = {"merged", "awaiting_verification", "submitted"}
+TERMINAL_STATES = {"merged", "awaiting_verification", "submitted", "skipped_conformance"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
 
 
@@ -1510,31 +1628,50 @@ def _build_issue_body(row: dict, jira_base_url: str) -> tuple[str, list[str]]:
     sprint = row.get("sprint", "")
     description = row.get("description", "")
     capability = _parse_capability(description)
+    parent_key = row.get("parent key", "")  # set for subtasks
 
     missing = []
     if not epic:
         missing.append("Epic not set")
-    # DO NOT REQUIRE capability for now. (Many issues are Tech Debt and not linked to capability.)
-    # if not capability:
-    #     missing.append("No `capability: <id> <name>` line in description")
 
-    lines = ["| Field | Value |", "|-------|-------|"]
+    # Machine-parseable frontmatter block (HTML comment, invisible in rendered view)
+    fm_lines = ["<!-- jira-metadata"]
     if jira_key:
-        lines.append(f"| Jira | [{jira_key}]({jira_base_url}/browse/{jira_key}) |")
+        fm_lines.append(f"jira_key: {jira_key}")
     if issue_type:
-        lines.append(f"| Type | {issue_type} |")
+        fm_lines.append(f"jira_type: {issue_type}")
     if epic:
-        # Epic link is a key — hyperlink it; epic name is plain text
-        if re.match(r"^[A-Z]+-\d+$", epic):
-            lines.append(f"| Epic | [{epic}]({jira_base_url}/browse/{epic}) |")
-        else:
-            lines.append(f"| Epic | {epic} |")
+        fm_lines.append(f"jira_epic: {epic}")
     if sprint:
-        lines.append(f"| Sprint | {sprint} |")
+        fm_lines.append(f"jira_sprint: {sprint}")
     if capability:
-        lines.append(f"| Capability | {capability} |")
+        fm_lines.append(f"jira_capability: {capability}")
+    if parent_key:
+        fm_lines.append(f"jira_parent: {parent_key}")
+    if jira_key:
+        fm_lines.append(f"jira_url: {jira_base_url}/browse/{jira_key}")
+    fm_lines.append("-->")
+    frontmatter = "\n".join(fm_lines)
 
-    body = "\n".join(lines)
+    # Visible metadata table
+    table_lines = ["| Field | Value |", "|-------|-------|"]
+    if jira_key:
+        table_lines.append(f"| Jira | [{jira_key}]({jira_base_url}/browse/{jira_key}) |")
+    if issue_type:
+        table_lines.append(f"| Type | {issue_type} |")
+    if parent_key:
+        table_lines.append(f"| Parent | [{parent_key}]({jira_base_url}/browse/{parent_key}) |")
+    if epic:
+        if re.match(r"^[A-Z]+-\d+$", epic):
+            table_lines.append(f"| Epic | [{epic}]({jira_base_url}/browse/{epic}) |")
+        else:
+            table_lines.append(f"| Epic | {epic} |")
+    if sprint:
+        table_lines.append(f"| Sprint | {sprint} |")
+    if capability:
+        table_lines.append(f"| Capability | {capability} |")
+
+    body = frontmatter + "\n\n" + "\n".join(table_lines)
 
     if missing:
         warning = "\n\n> ⚠️ **Missing required fields:**\n" + \
@@ -1573,6 +1710,31 @@ def gh_issue_create(repo: str, title: str, body: str, assignee: str | None = Non
         return None
     m = re.search(r"/issues/(\d+)", result.stdout)
     return int(m.group(1)) if m else None
+
+
+def _find_gh_issue_for_jira_key(repo: str, jira_key: str) -> int | None:
+    """Find open GitHub issue whose title contains [jira_key]. Returns issue number or None."""
+    result = gh_run([
+        "issue", "list", "--repo", repo, "--state", "open",
+        "--json", "number,title", "--limit", "200",
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    for issue in json.loads(result.stdout):
+        if f"[{jira_key}]" in (issue.get("title") or ""):
+            return issue["number"]
+    return None
+
+
+def gh_add_sub_issue(repo: str, parent_issue: int, sub_issue: int) -> None:
+    """Link sub_issue as a sub-issue of parent_issue via GitHub API."""
+    owner, name = repo.split("/", 1)
+    gh_run([
+        "api",
+        f"repos/{owner}/{name}/issues/{parent_issue}/sub_issues",
+        "--method", "POST",
+        "--field", f"sub_issue_id={sub_issue}",
+    ], check=False)
 
 
 def _sprint_jql_clause(sprint_filter: str) -> str | None:
@@ -1774,7 +1936,104 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
         except Exception as e:
             logger.error("Jira API ingest: error processing issue %s: %s", jira_key, e)
 
+    # Subtask pass — gated on cfg.ingest_subtasks
+    if cfg.ingest_subtasks:
+        for issue in issues:
+            try:
+                parent_jira_key = issue.get("key", "").strip()
+                fields = issue.get("fields", {})
+                subtasks = fields.get("subtasks", []) or []
+                if not subtasks:
+                    continue
+                # Same label-based routing as the main pass
+                issue_labels = fields.get("labels", [])
+                matching_repos = [r for r in repos if r in issue_labels]
+                if not matching_repos:
+                    continue
+                for subtask_stub in subtasks:
+                    subtask_key = subtask_stub.get("key", "").strip()
+                    if not subtask_key:
+                        continue
+                    subtask_summary = (subtask_stub.get("fields") or {}).get("summary", "").strip()
+                    subtask_type = ((subtask_stub.get("fields") or {}).get("issuetype") or {}).get("name", "")
+                    if not subtask_summary:
+                        continue
+                    subtask_title = f"[{subtask_key}] {subtask_summary}"
+                    row = {
+                        "issue key": subtask_key,
+                        "summary": subtask_summary,
+                        "issue type": subtask_type,
+                        "epic link": fields.get("customfield_10005", "") or fields.get("customfield_10014", ""),
+                        "sprint": "",  # subtasks inherit parent sprint context
+                        "parent key": parent_jira_key,
+                    }
+                    body, _ = _build_issue_body(row, cfg.jira_base_url)
+                    for repo in matching_repos:
+                        try:
+                            if gh_issue_exists(repo, subtask_key):
+                                log_decision("api_issue_skip", repo=repo, jira_key=subtask_key, reason="already_exists")
+                                continue
+                            subtask_issue_number = gh_issue_create(repo, subtask_title, body)
+                            if subtask_issue_number is None:
+                                continue
+                            label_jira_issue(repo, subtask_issue_number, subtask_title)
+                            log_decision("api_subtask_created", repo=repo, jira_key=subtask_key,
+                                         parent_jira_key=parent_jira_key, issue=subtask_issue_number)
+                            logger.info("Jira API ingest: created subtask issue #%d for %s (parent: %s)",
+                                        subtask_issue_number, subtask_key, parent_jira_key)
+                            # Link as GitHub sub-issue
+                            parent_gh_issue = _find_gh_issue_for_jira_key(repo, parent_jira_key)
+                            if parent_gh_issue:
+                                try:
+                                    gh_add_sub_issue(repo, parent_gh_issue, subtask_issue_number)
+                                    log_decision("api_sub_issue_linked", repo=repo,
+                                                 parent_issue=parent_gh_issue, sub_issue=subtask_issue_number)
+                                except Exception as link_err:
+                                    logger.warning("Could not link sub-issue %d to parent %d: %s",
+                                                   subtask_issue_number, parent_gh_issue, link_err)
+                            else:
+                                log_decision("api_subtask_skip_no_parent", repo=repo,
+                                             jira_key=subtask_key, parent_jira_key=parent_jira_key)
+                        except Exception as e:
+                            logger.error("Jira API ingest: error processing subtask %s: %s", subtask_key, e)
+            except Exception as e:
+                logger.error("Jira API ingest: subtask pass error for %s: %s", issue.get("key"), e)
+
     logger.info("Jira API ingest: complete")
+
+
+def _run_jira_ingest(cfg: Config, repos: list[str]) -> None:
+    """Run ingest_jira_api with circuit-breaker protection."""
+    global _jira_consecutive_failures, _jira_backoff_until
+
+    if time.monotonic() < _jira_backoff_until:
+        logger.debug("Jira API in backoff — skipping ingest")
+        return
+
+    try:
+        ingest_jira_api(cfg, repos)
+        if _jira_consecutive_failures > 0:
+            logger.info("Jira API circuit closed after %d failure(s)", _jira_consecutive_failures)
+            log_decision("jira_circuit_closed", consecutive_failures=_jira_consecutive_failures)
+        _jira_consecutive_failures = 0
+    except Exception as e:
+        _jira_consecutive_failures += 1
+        if _jira_consecutive_failures >= cfg.jira_failure_threshold:
+            delay = min(
+                cfg.jira_backoff_base * (2 ** (_jira_consecutive_failures - cfg.jira_failure_threshold)),
+                cfg.jira_backoff_max,
+            )
+            _jira_backoff_until = time.monotonic() + delay
+            logger.warning(
+                "Jira API circuit open (%d consecutive failures) — backing off %ds",
+                _jira_consecutive_failures, delay,
+            )
+            log_decision(
+                "jira_circuit_open",
+                consecutive_failures=_jira_consecutive_failures,
+                backoff_seconds=delay,
+            )
+        raise
 
 
 def worktree_has_commits_since(worktree: Path, base_branch: str) -> bool:
@@ -1803,12 +2062,7 @@ def rollback_issue(cfg: Config, state: dict, key: str, reason: str) -> None:
 
     # Remove all hunter labels from GitHub
     if repo and issue_number:
-        for suffix in (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification"):
-            label = f"{cfg.github_user}{suffix}"
-            try:
-                gh_issue_remove_label(repo, issue_number, label)
-            except Exception:
-                pass
+        _clean_hunter_labels(repo, issue_number, cfg)
 
     # Delete worktrees
     for wt_field in ("proposal_worktree", "impl_worktree"):
@@ -1883,6 +2137,25 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
 
         elif status in ("implementing", "self_reviewing"):
             wt = entry.get("impl_worktree")
+            # Retry a failed push from a previous self-review fix loop
+            if entry.get("impl_push_failed") and entry.get("impl_pr"):
+                if wt and Path(wt).exists():
+                    logger.info("Retrying push for %s after previous push failure", key)
+                    try:
+                        subprocess.run(
+                            ["git", "push"],
+                            cwd=wt, check=True, capture_output=True,
+                        )
+                        update_issue_state(state, key,
+                                           impl_push_failed=False,
+                                           resume_attempts=resume_attempts + 1)
+                        logger.info("Push retry succeeded for %s", key)
+                    except subprocess.CalledProcessError as push_err:
+                        logger.warning("Push retry failed for %s: %s — falling through to rollback", key, push_err)
+                        rollback_issue(cfg, state, key, "impl_push_failed and retry also failed")
+                else:
+                    rollback_issue(cfg, state, key, "impl_push_failed but worktree missing")
+                continue
             if not entry.get("impl_pr"):
                 # Implementation was started but PR not created yet
                 if wt and Path(wt).exists():
@@ -2133,7 +2406,10 @@ def start(once: bool):
                 state = load_hunter_state()
 
             # Ingest new issues from Jira API (if configured)
-            ingest_jira_api(cfg, hunter_repos)
+            try:
+                _run_jira_ingest(cfg, hunter_repos)
+            except Exception as e:
+                logger.warning("Jira API ingest failed: %s", e)
 
             # Auto-label unlabelled proposal/implementation PRs
             auto_label_prs(cfg, hunter_repos)
@@ -2167,6 +2443,12 @@ def start(once: bool):
 
                     # Skip terminal states
                     if status in TERMINAL_STATES:
+                        continue
+
+                    # Only work on issues with the "jira" label
+                    label_names = [lbl["name"] for lbl in issue.get("labels", [])]
+                    if "jira" not in label_names:
+                        log_decision("issue_skip", repo=repo, issue=issue_number, reason="no_jira_label")
                         continue
 
                     # Skip already-claimed issues (they have labels or are in-flight)
@@ -2282,9 +2564,20 @@ def status():
         counts[s] = counts.get(s, 0) + 1
     if not counts:
         click.echo("No tracked issues.")
-        return
-    for s, c in sorted(counts.items()):
-        click.echo(f"{s}: {c}")
+    else:
+        for s, c in sorted(counts.items()):
+            click.echo(f"{s}: {c}")
+
+    cfg = load_config()
+    if cfg.jira_api_enabled:
+        remaining = _jira_backoff_until - time.monotonic()
+        if remaining > 0:
+            click.echo(
+                f"Jira: circuit open ({_jira_consecutive_failures} consecutive failures,"
+                f" backoff {int(remaining)}s remaining)"
+            )
+        else:
+            click.echo("Jira: OK")
 
 
 @cli.command(name="init")

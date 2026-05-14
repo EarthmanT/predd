@@ -3356,8 +3356,10 @@ class TestJiraFrontmatter:
 
         # Should not attempt to claim the issue
         mock_claim.assert_not_called()
-        # State should remain empty (issue was skipped, not failed)
-        assert "owner/repo!42" not in state
+        # State should have a skipped_conformance entry (not failed, not empty)
+        entry = state.get("owner/repo!42", {})
+        assert entry.get("status") == "skipped_conformance"
+        assert entry.get("missing_fields") == missing_fields
 
     def test_process_issue_continues_when_conformant(self, tmp_path):
         cfg = _make_cfg(tmp_path, require_jira_conformance=True, jira_api_enabled=True)
@@ -3525,7 +3527,7 @@ class TestReconcileAssignedIssues:
         return _make_cfg(tmp_path)
 
     def _issue(self, number=42, title="Fix the bug"):
-        return {"number": number, "title": title, "labels": [], "body": "desc"}
+        return {"number": number, "title": title, "labels": [{"name": "jira"}], "body": "desc"}
 
     def test_reconcile_injects_submitted_when_impl_merged(self, tmp_path):
         cfg = self._cfg(tmp_path)
@@ -3686,3 +3688,231 @@ class TestCleanupEphemeralStates:
 
         assert count == 0
         mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestParseJiraFrontmatter
+# ---------------------------------------------------------------------------
+
+class TestParseJiraFrontmatter:
+    def test_extracts_all_fields(self):
+        body = "<!-- jira-metadata\njira_key: DAP-123\njira_type: Story\njira_epic: DAP-1\n-->\n\nrest"
+        result = h.parse_jira_frontmatter(body)
+        assert result["jira_key"] == "DAP-123"
+        assert result["jira_type"] == "Story"
+        assert result["jira_epic"] == "DAP-1"
+
+    def test_returns_empty_for_no_block(self):
+        assert h.parse_jira_frontmatter("| Jira | DAP-123 |") == {}
+
+    def test_returns_empty_for_none(self):
+        assert h.parse_jira_frontmatter(None) == {}
+
+    def test_ignores_lines_without_colon_space(self):
+        body = "<!-- jira-metadata\njira_key: DAP-123\nbadline\n-->"
+        result = h.parse_jira_frontmatter(body)
+        assert "badline" not in result
+        assert result["jira_key"] == "DAP-123"
+
+    def test_returns_empty_for_empty_string(self):
+        assert h.parse_jira_frontmatter("") == {}
+
+    def test_extracts_url_field(self):
+        body = "<!-- jira-metadata\njira_key: DAP-5\njira_url: https://jira.example.com/browse/DAP-5\n-->"
+        result = h.parse_jira_frontmatter(body)
+        assert result["jira_url"] == "https://jira.example.com/browse/DAP-5"
+
+
+# ---------------------------------------------------------------------------
+# TestBuildIssueBodyFrontmatter
+# ---------------------------------------------------------------------------
+
+class TestBuildIssueBodyFrontmatter:
+    """Tests that _build_issue_body produces the expected jira-metadata block."""
+
+    def _row(self, **kwargs):
+        base = {
+            "issue key": "DAP-42",
+            "summary": "Do something",
+            "issue type": "Story",
+            "epic link": "DAP-10",
+            "sprint": "Sprint 1",
+        }
+        base.update(kwargs)
+        return base
+
+    def test_body_contains_jira_metadata_comment(self):
+        body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
+        assert "<!-- jira-metadata" in body
+
+    def test_frontmatter_roundtrips_via_parse(self):
+        body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
+        parsed = h.parse_jira_frontmatter(body)
+        assert parsed["jira_key"] == "DAP-42"
+        assert parsed["jira_type"] == "Story"
+        assert parsed["jira_epic"] == "DAP-10"
+        assert parsed["jira_sprint"] == "Sprint 1"
+
+    def test_parent_key_in_frontmatter_and_table(self):
+        row = self._row(**{"parent key": "DAP-5"})
+        body, _ = h._build_issue_body(row, "https://jira.example.com")
+        assert "jira_parent: DAP-5" in body
+        assert "| Parent |" in body
+
+    def test_no_parent_key_omits_parent_row(self):
+        body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
+        assert "jira_parent:" not in body
+        assert "| Parent |" not in body
+
+
+# ---------------------------------------------------------------------------
+# TestFindGhIssueForJiraKey
+# ---------------------------------------------------------------------------
+
+class TestFindGhIssueForJiraKey:
+    def test_returns_issue_number_when_found(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([
+            {"number": 7, "title": "[DAP-99] Some issue"},
+            {"number": 8, "title": "[DAP-100] Other issue"},
+        ])
+        with patch("subprocess.run", return_value=fake):
+            result = h._find_gh_issue_for_jira_key("owner/repo", "DAP-99")
+        assert result == 7
+
+    def test_returns_none_when_not_found(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = json.dumps([{"number": 1, "title": "[DAP-1] unrelated"}])
+        with patch("subprocess.run", return_value=fake):
+            result = h._find_gh_issue_for_jira_key("owner/repo", "DAP-99")
+        assert result is None
+
+    def test_returns_none_on_gh_failure(self):
+        fake = MagicMock()
+        fake.returncode = 1
+        fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            result = h._find_gh_issue_for_jira_key("owner/repo", "DAP-1")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestIngestJiraApiSubtasks
+# ---------------------------------------------------------------------------
+
+class TestIngestJiraApiSubtasks:
+    """Tests for subtask ingestion in ingest_jira_api."""
+
+    def _cfg(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.jira_api_enabled = True
+        cfg.jira_projects = ["DAP"]
+        cfg.jira_base_url = "https://jira.example.com"
+        cfg.ingest_subtasks = True
+        return cfg
+
+    def _parent_issue(self, subtasks=None):
+        return {
+            "key": "DAP-1",
+            "fields": {
+                "summary": "Parent issue",
+                "issuetype": {"name": "Story"},
+                "customfield_10006": [{"name": "Sprint-1"}],
+                "labels": ["owner/repo"],
+                "subtasks": subtasks or [],
+                "customfield_10005": "",
+            },
+        }
+
+    def test_subtask_created_and_linked(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        subtask_stub = {
+            "key": "DAP-2",
+            "fields": {"summary": "Sub task", "issuetype": {"name": "Sub-task"}},
+        }
+        parent = self._parent_issue(subtasks=[subtask_stub])
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[parent]), \
+             patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", side_effect=[10, 11]) as mock_create, \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "_find_gh_issue_for_jira_key", return_value=10) as mock_find, \
+             patch.object(h, "gh_add_sub_issue") as mock_link, \
+             patch.object(h, "gh_ensure_label_exists"):
+            h.ingest_jira_api(cfg, ["owner/repo"])
+
+        # Parent issue created
+        assert mock_create.call_count == 2
+        # Sub-issue link called
+        mock_link.assert_called_once_with("owner/repo", 10, 11)
+
+    def test_subtask_skipped_when_already_exists(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        subtask_stub = {
+            "key": "DAP-2",
+            "fields": {"summary": "Sub task", "issuetype": {"name": "Sub-task"}},
+        }
+        parent = self._parent_issue(subtasks=[subtask_stub])
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[parent]), \
+             patch.object(h, "gh_issue_exists", side_effect=lambda repo, key: key == "DAP-2"), \
+             patch.object(h, "gh_issue_create", return_value=10) as mock_create, \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_add_sub_issue") as mock_link:
+            h.ingest_jira_api(cfg, ["owner/repo"])
+
+        # Parent created, subtask skipped
+        assert mock_create.call_count == 1
+        mock_link.assert_not_called()
+
+    def test_no_subtask_pass_when_flag_off(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        cfg.ingest_subtasks = False
+        subtask_stub = {
+            "key": "DAP-2",
+            "fields": {"summary": "Sub task", "issuetype": {"name": "Sub-task"}},
+        }
+        parent = self._parent_issue(subtasks=[subtask_stub])
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[parent]), \
+             patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=10), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_add_sub_issue") as mock_link:
+            h.ingest_jira_api(cfg, ["owner/repo"])
+
+        mock_link.assert_not_called()
+
+    def test_subtask_no_parent_gh_issue_logs_skip(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        subtask_stub = {
+            "key": "DAP-2",
+            "fields": {"summary": "Sub task", "issuetype": {"name": "Sub-task"}},
+        }
+        parent = self._parent_issue(subtasks=[subtask_stub])
+
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}), \
+             patch.object(_predd.JiraClient, "validate", return_value=True), \
+             patch.object(_predd.JiraClient, "search", return_value=[parent]), \
+             patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", side_effect=[10, 11]), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "_find_gh_issue_for_jira_key", return_value=None), \
+             patch.object(h, "gh_add_sub_issue") as mock_link, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "log_decision") as mock_log:
+            h.ingest_jira_api(cfg, ["owner/repo"])
+
+        mock_link.assert_not_called()
+        skip_calls = [c for c in mock_log.call_args_list if c.args[0] == "api_subtask_skip_no_parent"]
+        assert len(skip_calls) == 1
