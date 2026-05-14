@@ -25,12 +25,43 @@ predd.py                  # predd daemon + shared base code
 hunter.py                 # hunter daemon (imports from predd.py via importlib)
 test_pr_watcher.py        # predd tests
 test_hunter.py            # hunter tests
+scripts/worktree.sh       # worktree management helper
+.skills/worktree-management/  # worktree workflow skill
 spec/archive/v0.0.1/      # implemented specs (design decisions)
 spec/changes/             # pending specs (future work)
 README.md
 ```
 
 Config and state live outside the repo at `~/.config/predd/`.
+
+---
+
+## Worktree Workflow
+
+**NEVER work directly in the main checkout. ALWAYS use worktrees for code changes.**
+
+This repo includes `scripts/worktree.sh` to manage git worktrees:
+
+```bash
+# Create a new worktree for a branch
+scripts/worktree.sh create <branch-name> [base-branch]
+
+# Checkout a PR into a worktree
+scripts/worktree.sh pr <pr-number>
+
+# List all worktrees
+scripts/worktree.sh list
+
+# Remove a worktree
+scripts/worktree.sh remove <branch-name>
+```
+
+Worktrees are created at: `~/windsurf/worktrees/predd/<branch-name>/`
+
+**Why:** Keeps main checkout clean (always on `main`), enables parallel work on multiple branches, prevents accidental commits to wrong branch.
+
+See `.skills/worktree-management/SKILL.md` for detailed workflow.
+
 
 ---
 
