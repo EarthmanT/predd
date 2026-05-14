@@ -16,11 +16,11 @@ This is predd "moonlighting" — it normally only reviews PRs written by others,
 
 ### Trigger
 
-A PR is eligible for fix if:
-1. The branch matches `branch_prefix` (i.e. it's a hunter-created branch)
-2. There are review comments newer than the last fix attempt (or the PR was never fixed)
-3. The PR is open and not merged
-4. `review_fix_turns` for this PR < `max_moonlight_turns` (default: 2)
+A PR gets a fix run when all of these are true:
+1. Hunter created it — branch starts with `branch_prefix` (e.g. `usr/at/`)
+2. Someone left review comments or requested changes since the last fix attempt
+3. The PR is still open
+4. We haven't already attempted fixes `max_moonlight_turns` times (default: 2)
 
 ### What it does
 
