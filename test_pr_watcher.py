@@ -1194,3 +1194,147 @@ class TestInitCommand:
         assert data["backend"] == "devin"
         assert len(data["repo"]) == 1
         assert data["repo"][0]["name"] == "owner/repo"
+
+
+# ---------------------------------------------------------------------------
+# TestPreflightDiffCheck
+# ---------------------------------------------------------------------------
+
+class TestPreflightDiffCheck:
+    """Tests for the pre-flight diff-size check in process_pr."""
+
+    def _make_pr(self, number=1, sha="abc123"):
+        return {
+            "number": number,
+            "title": "Test PR",
+            "author": {"login": "other"},
+            "headRefOid": sha,
+            "headRefName": "feature-branch",
+            "baseRefName": "main",
+            "isDraft": False,
+            "reviewRequests": [],
+        }
+
+    def _cfg(self, tmp_path, max_pr_diff_lines=2000):
+        cfg = pw.Config({
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path / "worktrees"),
+            "github_user": "testuser",
+            "backend": "claude",
+            "model": "claude-haiku-4-5",
+            "skill_path": str(tmp_path / "SKILL.md"),
+            "max_pr_diff_lines": max_pr_diff_lines,
+        })
+        return cfg
+
+    def _fake_size_result(self, additions, deletions, returncode=0):
+        r = MagicMock()
+        r.returncode = returncode
+        r.stdout = json.dumps({"additions": additions, "deletions": deletions})
+        return r
+
+    def test_preflight_skips_oversized_pr(self, tmp_path, monkeypatch):
+        """Oversized PR: comment posted, status=rejected, setup_worktree NOT called."""
+        monkeypatch.setattr(pw, "STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(pw, "CONFIG_DIR", tmp_path)
+
+        cfg = self._cfg(tmp_path, max_pr_diff_lines=500)
+        state = {}
+        pr = self._make_pr()
+
+        with patch.object(pw, "gh_run", return_value=self._fake_size_result(300, 300)) as mock_gh_run, \
+             patch.object(pw, "gh_pr_comment") as mock_comment, \
+             patch.object(pw, "setup_worktree") as mock_worktree, \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"):
+            pw.process_pr(cfg, state, "owner/repo", pr)
+
+        mock_comment.assert_called_once()
+        comment_body = mock_comment.call_args[0][2]
+        assert "too large" in comment_body.lower() or "600" in comment_body
+        mock_worktree.assert_not_called()
+        assert state.get("owner/repo#1", {}).get("status") == "rejected"
+
+    def test_preflight_proceeds_when_within_limit(self, tmp_path, monkeypatch):
+        """PR within limit: setup_worktree IS called."""
+        monkeypatch.setattr(pw, "STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(pw, "CONFIG_DIR", tmp_path)
+
+        cfg = self._cfg(tmp_path, max_pr_diff_lines=2000)
+        state = {}
+        pr = self._make_pr()
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review $ARGUMENTS")
+        cfg.skill_path = skill
+
+        with patch.object(pw, "gh_run", return_value=self._fake_size_result(100, 50)), \
+             patch.object(pw, "setup_worktree", return_value=worktree) as mock_worktree, \
+             patch.object(pw, "run_review", return_value="## Verdict\nAPPROVE"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"):
+            pw.process_pr(cfg, state, "owner/repo", pr)
+
+        mock_worktree.assert_called_once()
+
+    def test_preflight_proceeds_when_api_fails(self, tmp_path, monkeypatch):
+        """API failure during size check: fail-open, setup_worktree IS called."""
+        monkeypatch.setattr(pw, "STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(pw, "CONFIG_DIR", tmp_path)
+
+        cfg = self._cfg(tmp_path, max_pr_diff_lines=100)
+        state = {}
+        pr = self._make_pr()
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review $ARGUMENTS")
+        cfg.skill_path = skill
+
+        with patch.object(pw, "gh_run", side_effect=RuntimeError("network error")), \
+             patch.object(pw, "setup_worktree", return_value=worktree) as mock_worktree, \
+             patch.object(pw, "run_review", return_value="APPROVE"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"):
+            pw.process_pr(cfg, state, "owner/repo", pr)
+
+        mock_worktree.assert_called_once()
+
+    def test_preflight_skips_when_limit_is_zero(self, tmp_path, monkeypatch):
+        """max_pr_diff_lines=0 disables the check; gh_run not called for size check."""
+        monkeypatch.setattr(pw, "STATE_FILE", tmp_path / "state.json")
+        monkeypatch.setattr(pw, "CONFIG_DIR", tmp_path)
+
+        cfg = self._cfg(tmp_path, max_pr_diff_lines=0)
+        state = {}
+        pr = self._make_pr()
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+
+        skill = tmp_path / "SKILL.md"
+        skill.write_text("Review $ARGUMENTS")
+        cfg.skill_path = skill
+
+        with patch.object(pw, "gh_run") as mock_gh_run, \
+             patch.object(pw, "setup_worktree", return_value=worktree) as mock_worktree, \
+             patch.object(pw, "run_review", return_value="APPROVE"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"):
+            pw.process_pr(cfg, state, "owner/repo", pr)
+
+        # gh_run should not have been called for the size check
+        size_check_calls = [
+            c for c in mock_gh_run.call_args_list
+            if "additions" in str(c)
+        ]
+        assert len(size_check_calls) == 0
+        mock_worktree.assert_called_once()

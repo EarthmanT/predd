@@ -3484,3 +3484,174 @@ class TestJiraFrontmatter:
         body = pr_body_captured[0]
         assert body.startswith(frontmatter)
         assert "Proposal for issue #45" in body
+
+# ---------------------------------------------------------------------------
+# TestReconcileAssignedIssues
+# ---------------------------------------------------------------------------
+
+class TestReconcileAssignedIssues:
+    def _cfg(self, tmp_path):
+        return _make_cfg(tmp_path)
+
+    def _issue(self, number=42, title="Fix the bug"):
+        return {"number": number, "title": title, "labels": [], "body": "desc"}
+
+    def test_reconcile_injects_submitted_when_impl_merged(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=[self._issue()]), \
+             patch.object(h, "_find_impl_pr", return_value=10), \
+             patch.object(h, "gh_pr_is_merged", return_value=True), \
+             patch.object(h, "save_hunter_state"):
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        entry = state.get("owner/repo!42", {})
+        assert entry["status"] == "submitted"
+        assert entry["issue_number"] == 42
+        assert entry["repo"] == "owner/repo"
+        # impl_pr should be None for merged (no further work needed)
+        assert entry.get("impl_pr") is None
+
+    def test_reconcile_injects_implementing_when_impl_open(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=[self._issue()]), \
+             patch.object(h, "_find_impl_pr", return_value=10), \
+             patch.object(h, "gh_pr_is_merged", return_value=False), \
+             patch.object(h, "save_hunter_state"):
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        entry = state.get("owner/repo!42", {})
+        assert entry["status"] == "implementing"
+        assert entry["impl_pr"] == 10
+
+    def test_reconcile_injects_proposal_open_when_proposal_merged(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=[self._issue()]), \
+             patch.object(h, "_find_impl_pr", return_value=None), \
+             patch.object(h, "gh_find_merged_proposal", return_value=7), \
+             patch.object(h, "save_hunter_state"):
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        entry = state.get("owner/repo!42", {})
+        assert entry["status"] == "proposal_open"
+        assert entry["proposal_pr"] == 7
+        assert entry["resume_attempts"] == 0
+
+    def test_reconcile_skips_when_no_prs_found(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=[self._issue()]), \
+             patch.object(h, "_find_impl_pr", return_value=None), \
+             patch.object(h, "gh_find_merged_proposal", return_value=None), \
+             patch.object(h, "save_hunter_state") as mock_save:
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        assert "owner/repo!42" not in state
+        mock_save.assert_not_called()
+
+    def test_reconcile_skips_existing_state_entries(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!42": {"status": "proposal_open", "proposal_pr": 5}}
+
+        with patch.object(h, "gh_list_assigned_issues", return_value=[self._issue()]), \
+             patch.object(h, "_find_impl_pr") as mock_find_impl, \
+             patch.object(h, "save_hunter_state") as mock_save:
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        # Should not touch existing entry
+        mock_find_impl.assert_not_called()
+        mock_save.assert_not_called()
+        assert state["owner/repo!42"]["status"] == "proposal_open"
+
+    def test_reconcile_continues_on_list_error(self, tmp_path):
+        cfg = self._cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+
+        with patch.object(h, "gh_list_assigned_issues", side_effect=RuntimeError("network")), \
+             patch.object(h, "save_hunter_state") as mock_save:
+            # Should not raise
+            h.reconcile_assigned_issues(cfg, state, ["owner/repo"])
+
+        assert state == {}
+        mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestCleanupEphemeralStates
+# ---------------------------------------------------------------------------
+
+class TestCleanupEphemeralStates:
+    def test_cleanup_resets_in_progress_to_failed(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!1": {"status": "in_progress", "issue_number": 1}}
+
+        with patch.object(h, "save_hunter_state"):
+            h._cleanup_ephemeral_states(state)
+
+        assert state["owner/repo!1"]["status"] == "failed"
+
+    def test_cleanup_resets_implementing_to_failed(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        state = {"owner/repo!2": {"status": "implementing", "issue_number": 2, "impl_pr": 10}}
+
+        with patch.object(h, "save_hunter_state"):
+            h._cleanup_ephemeral_states(state)
+
+        assert state["owner/repo!2"]["status"] == "failed"
+
+    def test_cleanup_leaves_other_states_untouched(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        state = {
+            "owner/repo!3": {"status": "proposal_open"},
+            "owner/repo!4": {"status": "self_reviewing"},
+            "owner/repo!5": {"status": "ready_for_review"},
+            "owner/repo!6": {"status": "submitted"},
+            "owner/repo!7": {"status": "failed"},
+        }
+
+        with patch.object(h, "save_hunter_state"):
+            h._cleanup_ephemeral_states(state)
+
+        assert state["owner/repo!3"]["status"] == "proposal_open"
+        assert state["owner/repo!4"]["status"] == "self_reviewing"
+        assert state["owner/repo!5"]["status"] == "ready_for_review"
+        assert state["owner/repo!6"]["status"] == "submitted"
+        assert state["owner/repo!7"]["status"] == "failed"
+
+    def test_cleanup_returns_count(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        state = {
+            "owner/repo!1": {"status": "in_progress"},
+            "owner/repo!2": {"status": "implementing"},
+            "owner/repo!3": {"status": "submitted"},
+        }
+
+        with patch.object(h, "save_hunter_state"):
+            count = h._cleanup_ephemeral_states(state)
+
+        assert count == 2
+
+    def test_cleanup_returns_zero_when_nothing_to_reset(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        state = {
+            "owner/repo!1": {"status": "proposal_open"},
+            "owner/repo!2": {"status": "submitted"},
+        }
+
+        with patch.object(h, "save_hunter_state") as mock_save:
+            count = h._cleanup_ephemeral_states(state)
+
+        assert count == 0
+        mock_save.assert_not_called()

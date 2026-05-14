@@ -1336,39 +1336,38 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
     update_pr_state(state, key, head_sha=head_sha, status="reviewing",
                     first_seen=_now_iso())
 
+    # Pre-flight diff-size check — before any worktree setup
+    if cfg.max_pr_diff_lines > 0:
+        try:
+            size_result = gh_run(
+                ["pr", "view", str(pr_number), "--repo", repo, "--json", "additions,deletions"],
+                check=False,
+            )
+            if size_result.returncode == 0:
+                counts = json.loads(size_result.stdout)
+                total = counts.get("additions", 0) + counts.get("deletions", 0)
+                if total > cfg.max_pr_diff_lines:
+                    msg = (
+                        f"Skipping review — diff is too large ({total:,} lines changed, "
+                        f"limit is {cfg.max_pr_diff_lines:,}).\n\n"
+                        f"Review this PR manually. To raise the limit: "
+                        f"`predd config set max_pr_diff_lines {total + 500}`"
+                    )
+                    logger.info("Skipping %s — diff too large (%d lines)", key, total)
+                    gh_pr_comment(repo, pr_number, msg)
+                    update_pr_state(state, key, status="rejected", head_sha=head_sha)
+                    log_decision("pr_skip", repo=repo, pr=pr_number,
+                                 reason="diff_too_large", lines=total)
+                    return
+        except Exception as e:
+            logger.warning("Pre-flight diff check failed for %s: %s — proceeding", key, e)
+
     try:
         notify_sound(cfg.sound_new_pr)
         notify_toast("New PR", f"{key} — {title}")
 
         worktree = setup_worktree(cfg, repo, pr_number, head_sha, head_ref)
         logger.info("Worktree at %s", worktree)
-
-        # Diff-size gate: skip PRs too large to review meaningfully
-        base_ref = pr.get("baseRefName", "main")
-        try:
-            stat_result = subprocess.run(
-                ["git", "diff", f"origin/{base_ref}", "--shortstat"],
-                cwd=str(worktree), capture_output=True, text=True, timeout=30
-            )
-            # shortstat format: " 12 files changed, 450 insertions(+), 123 deletions(-)"
-            m_ins = re.search(r"(\d+) insertion", stat_result.stdout)
-            m_del = re.search(r"(\d+) deletion",  stat_result.stdout)
-            insertions = int(m_ins.group(1)) if m_ins else 0
-            deletions  = int(m_del.group(1)) if m_del else 0
-            total_lines = insertions + deletions
-            if total_lines > cfg.max_pr_diff_lines:
-                msg = (
-                    f"⏭️ Skipping review — diff is too large ({total_lines:,} lines changed, "
-                    f"limit is {cfg.max_pr_diff_lines:,}).\n\n"
-                    f"Review this PR manually. To raise the limit: `predd config set max_pr_diff_lines {total_lines + 500}`"
-                )
-                logger.info("Skipping %s — diff too large (%d lines)", key, total_lines)
-                gh_pr_comment(repo, pr_number, msg)
-                update_pr_state(state, key, status="rejected", head_sha=head_sha)
-                log_decision("pr_skip", repo=repo, pr=pr_number, reason="diff_too_large", lines=total_lines)
-                return
-        except Exception as e:
-            logger.warning("Could not check diff size for %s: %s — proceeding anyway", key, e)
 
         review_text = run_review(cfg, repo, pr_number, worktree)
 

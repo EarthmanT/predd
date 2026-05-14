@@ -327,6 +327,21 @@ _stop = threading.Event()
 _current_issue_key: list[str] = []
 
 
+def _cleanup_ephemeral_states(state: dict) -> int:
+    """Reset in_progress and implementing entries to failed. Returns count of entries reset."""
+    EPHEMERAL = {"in_progress", "implementing"}
+    changed = []
+    for key, entry in state.items():
+        if entry.get("status") in EPHEMERAL:
+            entry["status"] = "failed"
+            changed.append(key)
+    if changed:
+        save_hunter_state(state)
+        for key in changed:
+            logger.info("Shutdown cleanup: reset %s to 'failed' (was ephemeral)", key)
+    return len(changed)
+
+
 def _shutdown(signum, frame):
     if _stop.is_set():
         # Second signal — force quit
@@ -435,6 +450,88 @@ def gh_find_merged_proposal(repo: str, issue_number: int, title: str) -> int | N
         if pattern.search(body) or pattern.search(pr_title):
             return pr["number"]
     return None
+
+
+def _find_impl_pr(repo: str, issue_number: int) -> int | None:
+    """Find any sdd-implementation PR (open or merged) for this issue. Returns PR number or None."""
+    result = gh_run([
+        "pr", "list",
+        "--repo", repo,
+        "--state", "all",
+        "--label", "sdd-implementation",
+        "--json", "number,title,body",
+        "--limit", "100",
+    ], check=False)
+    if result.returncode != 0:
+        return None
+    prs = json.loads(result.stdout)
+    pattern = re.compile(rf"#{issue_number}\b")
+    for pr in prs:
+        body = pr.get("body") or ""
+        pr_title = pr.get("title") or ""
+        if pattern.search(body) or pattern.search(pr_title):
+            return pr["number"]
+    return None
+
+
+def reconcile_assigned_issues(cfg: "Config", state: dict, repos: list[str]) -> None:
+    """For any assigned GH issue with no state entry, infer state from GitHub and inject it."""
+    for repo in repos:
+        try:
+            issues = gh_list_assigned_issues(repo)
+        except Exception as e:
+            logger.warning("reconcile: failed to list issues for %s: %s", repo, e)
+            continue
+
+        for issue in issues:
+            issue_number = issue["number"]
+            title = issue["title"]
+            key = f"{repo}!{issue_number}"
+
+            if key in state:
+                continue  # already tracked
+
+            # Search for impl PR first (highest specificity)
+            impl_pr = _find_impl_pr(repo, issue_number)
+            if impl_pr is not None:
+                try:
+                    merged = gh_pr_is_merged(repo, impl_pr)
+                except Exception:
+                    merged = False
+                injected = "submitted" if merged else "implementing"
+                entry = dict(
+                    status=injected,
+                    repo=repo,
+                    issue_number=issue_number,
+                    title=title,
+                    impl_pr=impl_pr if not merged else None,
+                    resume_attempts=0,
+                )
+                state[key] = entry
+                save_hunter_state(state)
+                logger.info("Reconciled %s: injected status %r (found %s impl PR #%d)",
+                            key, injected, "merged" if merged else "open", impl_pr)
+                log_decision("reconciled", repo=repo, issue=issue_number,
+                             injected_status=injected, pr=impl_pr)
+                continue
+
+            # Search for merged proposal PR
+            proposal_pr = gh_find_merged_proposal(repo, issue_number, title)
+            if proposal_pr is not None:
+                entry = dict(
+                    status="proposal_open",
+                    repo=repo,
+                    issue_number=issue_number,
+                    title=title,
+                    proposal_pr=proposal_pr,
+                    resume_attempts=0,
+                )
+                state[key] = entry
+                save_hunter_state(state)
+                logger.info("Reconciled %s: injected status 'proposal_open' "
+                            "(found merged proposal PR #%d)", key, proposal_pr)
+                log_decision("reconciled", repo=repo, issue=issue_number,
+                             injected_status="proposal_open", pr=proposal_pr)
 
 
 def gh_create_branch_and_pr(
@@ -1987,6 +2084,8 @@ def start(once: bool):
             # Resume or rollback any in-flight issues from previous runs
             resume_in_flight_issues(cfg, state)
             state = load_hunter_state()
+            reconcile_assigned_issues(cfg, state, hunter_repos)
+            state = load_hunter_state()
 
             for repo in hunter_repos:
                 if _stop.is_set():
@@ -2066,6 +2165,8 @@ def start(once: bool):
     finally:
         stop_status_server()
         if not once:
+            state = load_hunter_state()
+            _cleanup_ephemeral_states(state)
             release_pid_file()
 
 
