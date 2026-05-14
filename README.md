@@ -319,9 +319,8 @@ predd analyze [--model M] [--days N]  # Analyze observations, generate specs
 hunter start [--once]         # Start daemon
 hunter status                 # Summary counts by status
 hunter list                   # Full state (JSON)
-hunter claim <issue>          # Manually claim issue
-hunter skip <issue>           # Skip issue
-hunter rollback <issue>       # Reset issue to failed state for retry
+hunter show <issue>           # Show state for a specific issue
+hunter status-server          # Start status server standalone
 ```
 
 ---
@@ -489,11 +488,7 @@ Future: Bedrock prompt caching will reduce token spend by ~90%.
 
 **Check:** `hunter list | jq 'map(select(.status | contains("proposal_open")))'`
 
-**Fix:** Manually merge the PR, or rollback and retry:
-
-```bash
-hunter rollback <issue>
-```
+**Fix:** Manually merge the PR, or edit `~/.config/predd/hunter-state.json` to reset the issue's status to `failed` so hunter will retry on next cycle.
 
 ---
 
