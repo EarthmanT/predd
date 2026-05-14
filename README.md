@@ -55,7 +55,6 @@ name = "owner/repo"
 predd = true
 hunter = true
 obsidian = true
-# jira_csv_dir = "~/jira/owner-repo"   # optional: Jira CSV ingest directory
 
 # GitHub
 github_user = "your-github-username"
@@ -135,14 +134,11 @@ aws sts get-caller-identity   # confirm AWS creds (bedrock only)
 - **Resume & rollback**: survives crashes; rolls back stuck issues after `max_resume_retries`
 - **Feedback collection**: captures PR review feedback for analysis
 - **Auto-labeling**: applies `sdd-proposal` and `sdd-implementation` labels
+- **PR title format**: `[JIRA-ID] Proposal/Impl - Issue name` (or `Proposal/Impl - Issue name` when no Jira key)
 
 ### Jira Integration
 
-Two modes (can be used together):
-
-**CSV ingest**: set `jira_csv_dir` in a `[[repo]]` block. Hunter reads Jira-exported CSV files and creates GitHub issues.
-
-**API ingest**: set `jira_api_enabled = true` and provide `JIRA_API_TOKEN` env var. Hunter fetches issues directly from the Jira REST API.
+Set `jira_api_enabled = true` and provide `JIRA_API_TOKEN` env var. Hunter fetches issues directly from the Jira REST API and creates GitHub issues.
 
 Additional Jira settings:
 
@@ -226,7 +222,6 @@ Requires `devin` CLI.
 | `predd` | `true` | Watch this repo for PR reviews |
 | `hunter` | `true` | Watch this repo for issues |
 | `obsidian` | `true` | Include in obsidian observations |
-| `jira_csv_dir` | (none) | Path to Jira CSV export directory |
 
 ### Skill paths
 
