@@ -1099,6 +1099,14 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
     if not merged_pr:
         return
 
+    # If an impl PR already exists (open or merged), resume from it rather than
+    # pushing a new branch and hitting a conflict.
+    existing_impl = _find_impl_pr(repo, issue_number)
+    if existing_impl:
+        logger.info("Impl PR #%d already exists for %s — resuming", existing_impl, key)
+        update_issue_state(state, key, status="implementing", impl_pr=existing_impl)
+        return
+
     log_decision("proposal_merged", repo=repo, issue=issue_number, pr=merged_pr)
     logger.info("Proposal PR #%d merged for %s — starting implementation", merged_pr, key)
 
