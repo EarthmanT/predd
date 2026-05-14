@@ -109,6 +109,14 @@ Please check the logs for details:
 tail -f ~/.config/predd/hunter-log.txt
 """
 
+class SpeckitSkipError(Exception):
+    """Raised by run_speckit_plan when required BPA-Specs artifacts are missing.
+
+    Distinct from RuntimeError so process_issue can suppress the generic crash
+    comment (run_speckit_plan already posted the user-facing comment and label).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Hunter-local subprocess runner — tracks _active_proc_hunter for shutdown
 # ---------------------------------------------------------------------------
@@ -342,8 +350,8 @@ _current_issue_key: list[str] = []
 
 
 def _cleanup_ephemeral_states(state: dict) -> int:
-    """Reset in_progress and implementing entries to failed. Returns count of entries reset."""
-    EPHEMERAL = {"in_progress", "implementing"}
+    """Reset in_progress/specifying and implementing entries to failed. Returns count reset."""
+    EPHEMERAL = {"in_progress", "specifying", "implementing"}
     changed = []
     for key, entry in state.items():
         if entry.get("status") in EPHEMERAL:
@@ -734,8 +742,14 @@ def try_claim_issue(cfg: Config, repo: str, issue_number: int) -> bool:
 
 
 def issue_slug(title: str, max_len: int = 30) -> str:
-    """Lowercase title, replace non-alphanumeric with hyphens, truncate."""
-    slug = title.lower()
+    """Lowercase title, replace non-alphanumeric with hyphens, truncate.
+
+    Strips a leading [JIRA-KEY] prefix (e.g. "[DAP09A-1] ") before slugifying
+    so the key does not appear twice when combined with issue_identifier().
+    """
+    # Strip leading [PROJECT-123] prefix before downcasing
+    stripped = re.sub(r"^\[[A-Z][A-Z0-9]+-\d+\]\s*", "", title)
+    slug = stripped.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     slug = slug.strip("-")
     return slug[:max_len].rstrip("-")
@@ -861,6 +875,12 @@ def _extract_epic_info(fields: dict) -> tuple[str, str]:
 
     # Epic key known but name not available — slug resolution won't work;
     # speckit_epic_map is the only resolution path.
+    logger.warning(
+        "speckit: epic key %r found but name unavailable "
+        "(customfield_10014_detail absent and parent.key mismatch); "
+        "add %r to speckit_epic_map to enable slug resolution",
+        epic_key, epic_key,
+    )
     return epic_key, ""
 
 
@@ -873,12 +893,16 @@ def resolve_capability_folder(cfg: Config, epic_name: str, epic_key: str) -> "Pa
     """Return the capability folder path for the given epic, or None if not found."""
     if not cfg.capability_specs_path:
         return None
+    # No epic at all — silently skip; no reason to log
+    if not epic_name and not epic_key:
+        return None
     # Slug match on epic name
     if epic_name:
         slug = re.sub(r"[^a-z0-9]+", "-", epic_name.lower()).strip("-")
         folder = cfg.capability_specs_path / slug
         if folder.exists():
             return folder
+        logger.info("speckit: slug %r not found in %s", slug, cfg.capability_specs_path)
     # Map fallback via speckit_epic_map[epic_key]
     if epic_key and epic_key in cfg.speckit_epic_map:
         folder = cfg.capability_specs_path / cfg.speckit_epic_map[epic_key]
@@ -925,11 +949,20 @@ def read_bpa_specs_bundle(capability_dir: Path, story_id: str) -> dict:
 
 
 def pin_capability_sha(cfg: Config) -> str:
-    """Return the HEAD SHA of the capability_specs_path repo."""
+    """Return the HEAD SHA of the capability_specs_path repo.
+
+    Raises RuntimeError (not CalledProcessError) if the path is not a git repo,
+    so the error surfaces with a user-readable message rather than a raw traceback.
+    """
     result = subprocess.run(
         ["git", "-C", str(cfg.capability_specs_path), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"capability_specs_path ({cfg.capability_specs_path}) is not a git repository "
+            f"or has no commits: {result.stderr.strip()}"
+        )
     return result.stdout.strip()
 
 
@@ -946,11 +979,22 @@ def copy_spec_refs(bundle: dict, worktree: Path) -> Path:
 
 
 def load_speckit_prompt(cfg: Config, template_name: str, **kwargs) -> str:
-    """Read a speckit prompt template and render it with kwargs."""
+    """Read a speckit prompt template and render it with kwargs.
+
+    Uses str.format() with named placeholders — literal braces in templates must
+    be escaped as {{ and }} (standard Python format string rules).
+    """
     template_path = cfg.speckit_prompt_dir / f"{template_name}.md"
     if not template_path.exists():
         raise FileNotFoundError(f"Speckit prompt template not found: {template_path}")
-    return template_path.read_text().format(**kwargs)
+    text = template_path.read_text()
+    try:
+        return text.format(**kwargs)
+    except KeyError as e:
+        raise KeyError(
+            f"Speckit template {template_path.name!r} references placeholder {e} "
+            f"that was not supplied. Check the template for typos or unescaped braces."
+        ) from e
 
 
 def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
@@ -983,7 +1027,9 @@ def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
                     f"`{missing_label}` label to retry.")
             except Exception as label_err:
                 logger.warning("speckit: could not apply missing-spec label: %s", label_err)
-        raise
+        # Raise SpeckitSkipError so process_issue suppresses the generic crash comment —
+        # the user-facing message was already posted above.
+        raise SpeckitSkipError(str(e)) from e
     sha = pin_capability_sha(cfg)
 
     spec_refs = copy_spec_refs(bundle, worktree)
@@ -1032,7 +1078,8 @@ def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
     """Run the speckit implement phase using spec-refs/ + plan.md from the merged proposal."""
     spec_refs = worktree / "spec-refs"
     plan_path = worktree / "plan.md"
-    tasks_path = worktree / "tasks.md"
+    tasks_file = worktree / "tasks.md"
+    tasks_path = str(tasks_file) if tasks_file.exists() else "(not present)"
     clarifications_file = spec_refs / "clarifications.md"
     clarifications_path = (
         str(clarifications_file) if clarifications_file.exists() else "(not present)"
@@ -1049,7 +1096,7 @@ def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
         story_spec_path=str(spec_refs / "story-spec.md"),
         clarifications_path=clarifications_path,
         plan_path=str(plan_path),
-        tasks_path=str(tasks_path),
+        tasks_path=tasks_path,
     )
 
     with tempfile.NamedTemporaryFile(
@@ -1131,7 +1178,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     issue_body = issue.get("body") or ""
 
     update_issue_state(state, key,
-                       status="in_progress",
+                       status="specifying" if cfg.speckit_enabled else "in_progress",
                        issue_number=issue_number,
                        repo=repo,
                        title=title,
@@ -1186,13 +1233,13 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         )
 
         in_progress_label = f"{cfg.github_user}:in-progress"
-        proposal_label = f"{cfg.github_user}:proposal-open"
-        gh_ensure_label_exists(repo, proposal_label)
-        gh_issue_add_label(repo, issue_number, proposal_label)
+        open_label = f"{cfg.github_user}:{'spec-open' if used_speckit else 'proposal-open'}"
+        gh_ensure_label_exists(repo, open_label)
+        gh_issue_add_label(repo, issue_number, open_label)
         gh_issue_remove_label(repo, issue_number, in_progress_label)
 
         update_issue_state(state, key,
-                           status="proposal_open",
+                           status="spec_open" if used_speckit else "proposal_open",
                            proposal_pr=pr_number,
                            proposal_branch=branch,
                            proposal_worktree=str(worktree))
@@ -1200,6 +1247,11 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         log_decision("proposal_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Proposal PR #%d created for issue %s", pr_number, key)
 
+    except SpeckitSkipError as e:
+        # Comment already posted by run_speckit_plan — don't post a second one.
+        logger.warning("Skipping issue %s — speckit artifacts missing: %s", key, e)
+        log_decision("speckit_skip", repo=repo, issue=issue_number, reason=str(e))
+        update_issue_state(state, key, status="failed")
     except RuntimeError as e:
         # Specific errors like "no commits" should be commented
         logger.error("Failed processing issue %s: %s", key, e, exc_info=True)
@@ -2063,7 +2115,7 @@ def rollback_issue(cfg: Config, state: dict, key: str, reason: str) -> None:
 
     # Remove all hunter labels from GitHub
     if repo and issue_number:
-        for suffix in (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification", ":speckit-missing-spec"):
+        for suffix in (":in-progress", ":proposal-open", ":spec-open", ":implementing", ":awaiting-verification", ":speckit-missing-spec"):
             label = f"{cfg.github_user}{suffix}"
             try:
                 gh_issue_remove_label(repo, issue_number, label)
@@ -2106,22 +2158,24 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
         repo = entry.get("repo", "")
         issue_number = entry.get("issue_number")
 
-        if status == "in_progress":
+        if status in ("in_progress", "specifying"):
             # Was mid-proposal-creation — check if worktree has commits
             wt = entry.get("proposal_worktree")
             if wt and Path(wt).exists():
                 base = entry.get("base_branch", "main")
                 if worktree_has_commits_since(Path(wt), base):
-                    logger.info("Resuming %s from in_progress — worktree has commits, checking for existing PR", key)
+                    logger.info("Resuming %s from %s — worktree has commits, checking for existing PR", key, status)
                     # Check if a PR already exists with our marker
                     marker = f"hunter:issue-{issue_number}"
                     try:
                         prs = gh_list_prs_with_marker(repo, marker)
                         if prs:
                             pr_number = prs[0]["number"]
-                            logger.info("Found existing proposal PR #%d for %s — advancing to proposal_open", pr_number, key)
+                            resume_status = "spec_open" if entry.get("used_speckit") else "proposal_open"
+                            logger.info("Found existing proposal PR #%d for %s — advancing to %s",
+                                        pr_number, key, resume_status)
                             update_issue_state(state, key,
-                                               status="proposal_open",
+                                               status=resume_status,
                                                proposal_pr=pr_number,
                                                resume_attempts=resume_attempts + 1)
                         else:
@@ -2130,15 +2184,15 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
                     except Exception as e:
                         logger.warning("Could not check PRs for %s: %s", key, e)
                 else:
-                    rollback_issue(cfg, state, key, "worktree exists but has no commits")
+                    rollback_issue(cfg, state, key, f"{status} with no commits in worktree")
             else:
-                rollback_issue(cfg, state, key, "in_progress with no worktree")
+                rollback_issue(cfg, state, key, f"{status} with no worktree")
 
-        elif status == "proposal_open":
+        elif status in ("proposal_open", "spec_open"):
             # Check proposal PR still exists
             proposal_pr = entry.get("proposal_pr")
             if not proposal_pr:
-                rollback_issue(cfg, state, key, "proposal_open with no proposal_pr")
+                rollback_issue(cfg, state, key, f"{status} with no proposal_pr")
             # Otherwise fine — poll loop will check merge status
 
         elif status in ("implementing", "self_reviewing"):
@@ -2161,10 +2215,11 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
                     except Exception as e:
                         logger.warning("Could not check impl PRs for %s: %s", key, e)
                 else:
-                    # Roll back to proposal_open so we re-run impl from scratch
-                    logger.warning("Resetting %s to proposal_open — impl worktree missing", key)
+                    # Roll back so we re-run impl from scratch
+                    reset_status = "spec_open" if entry.get("used_speckit") else "proposal_open"
+                    logger.warning("Resetting %s to %s — impl worktree missing", key, reset_status)
                     update_issue_state(state, key,
-                                       status="proposal_open",
+                                       status=reset_status,
                                        impl_pr=None,
                                        impl_worktree=None,
                                        resume_attempts=resume_attempts + 1)
@@ -2188,8 +2243,8 @@ def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
     labels_to_check = [
         f"{cfg.github_user}:in-progress",
         f"{cfg.github_user}:proposal-open",
+        f"{cfg.github_user}:spec-open",
         f"{cfg.github_user}:implementing",
-        f"{cfg.github_user}:speckit-missing-spec",
     ]
     for repo in repos:
         for label in labels_to_check:
@@ -2459,7 +2514,7 @@ def start(once: bool):
 
                     _current_issue_key[:] = [key]
                     try:
-                        if status == "proposal_open":
+                        if status in ("proposal_open", "spec_open"):
                             check_proposal_merged(cfg, state, repo, key, entry)
                         elif status in ("implementing", "self_reviewing"):
                             # After proposal merges, check if impl PR is ready

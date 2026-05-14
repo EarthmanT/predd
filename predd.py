@@ -493,6 +493,8 @@ class Config:
             if "capability_specs_path" in data else None
         )
         self.speckit_epic_map: dict[str, str] = data.get("speckit_epic_map", {})
+        self.speckit_skip_clarify: bool = data.get("speckit_skip_clarify", False)
+        self.speckit_run_analyze: bool = data.get("speckit_run_analyze", False)
 
     @property
     def repos(self) -> list[str]:
