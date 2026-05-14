@@ -63,6 +63,33 @@ Anything ambiguous that needs clarification before merging.
 Be direct. No praise sandwich. No ceremony.
 """
 
+# Failure comment templates
+_PREDD_NO_OUTPUT_COMMENT = """\
+⚠️ Predd could not review this PR.
+
+The AI review skill ran but produced no review output.
+
+**PR:** {repo}#{pr_number}
+**Error:** Review skill produced no output
+
+Please either:
+1. Review this PR manually
+2. Check the skill prompt at ~/.windsurf/skills/pr-review/SKILL.md
+3. Check logs: tail -f ~/.config/predd/log.txt
+"""
+
+_PREDD_CRASH_COMMENT = """\
+⚠️ Predd crashed while reviewing this PR.
+
+The AI review subprocess exited unexpectedly.
+
+**PR:** {repo}#{pr_number}
+**Error:** {error}
+
+Please check the logs for details:
+tail -f ~/.config/predd/log.txt
+"""
+
 DEFAULT_CONFIG_TEMPLATE = """\
 # Repos to watch. Format: "owner/name"
 repos = [
@@ -147,11 +174,18 @@ status_server_enabled = true
 status_port = 8080
 status_refresh_interval = 30
 
-# Obsidian daemon settings
-observe_interval = 3600       # seconds between observe runs
-analyze_hour = 8              # hour of day to run analyze (local time)
+# Obsidian daemon settings (tight test intervals, will loosen to 1hr/12hr once working)
+observe_interval = 600        # seconds between observe runs (10 min for testing)
+analyze_interval = 600        # seconds between analyze runs (10 min for testing)
+fix_interval = 1200           # seconds between fix retry runs (20 min for testing)
 analyze_days = 7              # days of observations to analyze
 analyze_model = "claude-opus-4-7"
+
+# Failure commenting and cleanup
+comment_on_failures = true
+predd_failure_label = "{github_user}:predd-failed"
+failure_cleanup_days = 7
+failure_cleanup_interval = 10
 """
 
 # ---------------------------------------------------------------------------
@@ -230,10 +264,15 @@ class Config:
         self.status_server_enabled: bool = data.get("status_server_enabled", True)
         self.status_port: int = data.get("status_port", 8080)
         self.status_refresh_interval: int = data.get("status_refresh_interval", 30)
-        self.observe_interval: int = data.get("observe_interval", 3600)
-        self.analyze_hour: int = data.get("analyze_hour", 8)
+        self.observe_interval: int = data.get("observe_interval", 600)
+        self.analyze_interval: int = data.get("analyze_interval", 600)
+        self.fix_interval: int = data.get("fix_interval", 1200)
         self.analyze_days: int = data.get("analyze_days", 7)
         self.analyze_model: str = data.get("analyze_model", "claude-opus-4-7")
+        self.comment_on_failures: bool = data.get("comment_on_failures", True)
+        self.predd_failure_label: str = data.get("predd_failure_label", "{github_user}:predd-failed")
+        self.failure_cleanup_days: int = data.get("failure_cleanup_days", 7)
+        self.failure_cleanup_interval: int = data.get("failure_cleanup_interval", 10)
         # Bedrock backend settings
         self.aws_profile: str = data.get("aws_profile", "default")
         self.aws_region: str = data.get("aws_region", "us-east-1")
@@ -270,9 +309,14 @@ class Config:
             "status_port": self.status_port,
             "status_refresh_interval": self.status_refresh_interval,
             "observe_interval": self.observe_interval,
-            "analyze_hour": self.analyze_hour,
+            "analyze_interval": self.analyze_interval,
+            "fix_interval": self.fix_interval,
             "analyze_days": self.analyze_days,
             "analyze_model": self.analyze_model,
+            "comment_on_failures": self.comment_on_failures,
+            "predd_failure_label": self.predd_failure_label,
+            "failure_cleanup_days": self.failure_cleanup_days,
+            "failure_cleanup_interval": self.failure_cleanup_interval,
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "bedrock_model": self.bedrock_model,
@@ -454,6 +498,48 @@ def gh_pr_review(repo: str, pr_number: int, review_type: str, body_file: Path) -
         flag,
         "--body-file", str(body_file),
     ])
+
+
+def gh_pr_comment(repo: str, pr_number: int, body: str) -> None:
+    """Post a comment on a PR."""
+    gh_run([
+        "pr", "comment", str(pr_number),
+        "--repo", repo,
+        "--body", body,
+    ])
+
+
+def gh_issue_comment(repo: str, issue_number: int, body: str) -> None:
+    """Post a comment on an issue."""
+    gh_run([
+        "issue", "comment", str(issue_number),
+        "--repo", repo,
+        "--body", body,
+    ])
+
+
+def gh_pr_add_label(repo: str, pr_number: int, label: str) -> None:
+    """Add a label to a PR."""
+    try:
+        gh_run([
+            "pr", "edit", str(pr_number),
+            "--repo", repo,
+            "--add-label", label,
+        ])
+    except Exception:
+        pass  # Label already exists or other issue, don't crash
+
+
+def gh_issue_add_label(repo: str, issue_number: int, label: str) -> None:
+    """Add a label to an issue."""
+    try:
+        gh_run([
+            "issue", "edit", str(issue_number),
+            "--repo", repo,
+            "--add-label", label,
+        ])
+    except Exception:
+        pass  # Label already exists or other issue, don't crash
 
 # ---------------------------------------------------------------------------
 # Worktree helpers
@@ -726,6 +812,21 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
 
         review_text = run_review(cfg, repo, pr_number, worktree)
 
+        # Check for empty review output
+        if not review_text or not review_text.strip():
+            logger.error("Review skill produced no output for %s", key)
+            if cfg.comment_on_failures:
+                try:
+                    comment = _PREDD_NO_OUTPUT_COMMENT.format(repo=repo, pr_number=pr_number)
+                    gh_pr_comment(repo, pr_number, comment)
+                    label = cfg.predd_failure_label.format(github_user=cfg.github_user)
+                    gh_pr_add_label(repo, pr_number, label)
+                    log_decision("pr_failure_commented", repo=repo, pr=pr_number, reason="no_output")
+                except Exception as comment_err:
+                    logger.error("Failed to post failure comment for %s: %s", key, comment_err)
+            update_pr_state(state, key, status="failed")
+            return
+
         # Skill posts directly to GitHub; save output for reference
         summary_path = worktree / "review-summary.md"
         summary_path.write_text(review_text)
@@ -750,6 +851,15 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
 
     except Exception as e:
         logger.error("Failed processing %s: %s", key, e, exc_info=True)
+        if cfg.comment_on_failures:
+            try:
+                comment = _PREDD_CRASH_COMMENT.format(repo=repo, pr_number=pr_number, error=str(e))
+                gh_pr_comment(repo, pr_number, comment)
+                label = cfg.predd_failure_label.format(github_user=cfg.github_user)
+                gh_pr_add_label(repo, pr_number, label)
+                log_decision("pr_failure_commented", repo=repo, pr=pr_number, reason="crash", error=str(e))
+            except Exception as comment_err:
+                logger.error("Failed to post failure comment for %s: %s", key, comment_err)
         log_decision("pr_review_failed", repo=repo, pr=pr_number, error=str(e))
         update_pr_state(state, key, status="failed")
 

@@ -48,7 +48,65 @@ _now_iso = _predd._now_iso
 start_status_server = _predd.start_status_server
 stop_status_server = _predd.stop_status_server
 _run_bedrock_skill = _predd._run_bedrock_skill
+gh_issue_comment = _predd.gh_issue_comment
+gh_issue_add_label = _predd.gh_issue_add_label
+gh_run = _predd.gh_run
 
+# Failure comment templates for hunter
+_HUNTER_NO_COMMITS_COMMENT = """\
+⚠️ Hunter could not create a PR for this issue.
+
+The AI skill ran but produced no git commits. This usually means:
+- The issue description is too vague for the AI to understand what to build
+- The issue requires context not present in the description
+- The skill prompt needs improvement for this type of work
+
+**Issue:** {repo}#{issue_number}
+**Skill:** {skill}
+**Error:** Skill produced no commits — not creating empty PR
+
+Please either:
+1. Add more details to the issue description
+2. Create the PR manually
+3. Improve the skill prompt at ~/.windsurf/skills/{skill}/SKILL.md
+"""
+
+_HUNTER_PUSH_FAILURE_COMMENT = """\
+⚠️ Hunter could not push the PR branch for this issue.
+
+The AI skill produced commits, but git push failed. This usually means:
+- Branch protection rules blocking direct pushes
+- Branch already exists remotely with conflicts
+- Git authentication or permissions issue
+
+**Issue:** {repo}#{issue_number}
+**Branch:** {branch}
+**Error:** {error}
+
+The worktree with commits is preserved at:
+{worktree_path}
+
+Please either:
+1. Fix branch protection rules to allow pushes from hunter
+2. Manually push from the worktree and create the PR
+3. Delete the worktree if the work should be discarded
+"""
+
+_HUNTER_CRASH_COMMENT = """\
+⚠️ Hunter crashed while processing this issue.
+
+The AI skill subprocess exited unexpectedly.
+
+**Issue:** {repo}#{issue_number}
+**Skill:** {skill}
+**Error:** {error}
+
+The worktree is preserved at:
+{worktree_path}
+
+Please check the logs for details:
+tail -f ~/.config/predd/hunter-log.txt
+"""
 
 # ---------------------------------------------------------------------------
 # Hunter-local subprocess runner — tracks _active_proc_hunter for shutdown
@@ -690,8 +748,41 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         log_decision("proposal_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Proposal PR #%d created for issue %s", pr_number, key)
 
+    except RuntimeError as e:
+        # Specific errors like "no commits" should be commented
+        logger.error("Failed processing issue %s: %s", key, e, exc_info=True)
+        if cfg.comment_on_failures:
+            try:
+                if "no commits" in str(e).lower():
+                    comment = _HUNTER_NO_COMMITS_COMMENT.format(
+                        repo=repo, issue_number=issue_number, skill="proposal"
+                    )
+                else:
+                    comment = _HUNTER_CRASH_COMMENT.format(
+                        repo=repo, issue_number=issue_number, skill="proposal",
+                        error=str(e), worktree_path=worktree
+                    )
+                gh_issue_comment(repo, issue_number, comment)
+                failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_issue_add_label(repo, issue_number, failure_label)
+                log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason=str(e)[:100])
+            except Exception as comment_err:
+                logger.error("Failed to post failure comment for %s: %s", key, comment_err)
+        update_issue_state(state, key, status="failed")
     except Exception as e:
         logger.error("Failed processing issue %s: %s", key, e, exc_info=True)
+        if cfg.comment_on_failures:
+            try:
+                comment = _HUNTER_CRASH_COMMENT.format(
+                    repo=repo, issue_number=issue_number, skill="proposal",
+                    error=str(e), worktree_path=worktree
+                )
+                gh_issue_comment(repo, issue_number, comment)
+                failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_issue_add_label(repo, issue_number, failure_label)
+                log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason="crash", error=str(e)[:100])
+            except Exception as comment_err:
+                logger.error("Failed to post failure comment for %s: %s", key, comment_err)
         update_issue_state(state, key, status="failed")
 
 
