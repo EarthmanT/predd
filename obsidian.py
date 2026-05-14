@@ -537,9 +537,20 @@ def run_observe(cfg: Config, since: str | None = None, dry_run: bool = False) ->
     effective_since = since if since is not None else _load_last_observe()
     now = _now_iso()
 
-    hunter_state = _load_hunter_state_file()
-    hunter_events = _read_jsonl_since(HUNTER_DECISION_LOG, effective_since)
-    predd_events = _read_jsonl_since(DECISION_LOG, effective_since)
+    obsidian_repos: set[str] = set(cfg.repos_for("obsidian"))
+
+    hunter_state_raw = _load_hunter_state_file()
+    # Filter hunter state to only repos enabled for obsidian
+    hunter_state = {
+        k: v for k, v in hunter_state_raw.items()
+        if v.get("repo", "") in obsidian_repos
+    }
+
+    hunter_events_raw = _read_jsonl_since(HUNTER_DECISION_LOG, effective_since)
+    hunter_events = [e for e in hunter_events_raw if e.get("repo", "") in obsidian_repos]
+
+    predd_events_raw = _read_jsonl_since(DECISION_LOG, effective_since)
+    predd_events = [e for e in predd_events_raw if e.get("repo", "") in obsidian_repos]
 
     observations = _build_observations(hunter_state, hunter_events, predd_events, effective_since)
 

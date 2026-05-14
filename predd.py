@@ -23,6 +23,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -93,16 +94,12 @@ tail -f ~/.config/predd/log.txt
 """
 
 DEFAULT_CONFIG_TEMPLATE = """\
-# Repos to watch. Format: "owner/name"
-repos = [
-  "owner/repo",
-]
-
-# Repos only watched by predd (not hunter)
-predd_only_repos = []
-
-# Repos only watched by hunter (not predd)
-hunter_only_repos = []
+# Per-repo configuration. One [[repo]] block per GitHub repo.
+[[repo]]
+name = "owner/repo"
+predd = true
+hunter = true
+obsidian = true
 
 # Polling interval in seconds
 poll_interval = 90
@@ -155,8 +152,6 @@ max_review_fix_loops = 1
 auto_review_draft = false
 
 # Jira integration (optional)
-# CSV ingest: uncomment jira_csv_dir to enable
-# jira_csv_dir = "./jira"
 # jira_base_url = "https://jira.cec.lab.emc.com"
 # require_jira_conformance = true
 # API integration: uncomment jira_api_enabled (token via JIRA_API_TOKEN env var)
@@ -164,6 +159,10 @@ auto_review_draft = false
 # jira_projects = ["DAP09A"]  # Jira projects to ingest (defaults to DAP09A)
 # Jira issue types to skip during ingest (case-insensitive)
 skip_jira_issue_types = ["sub-task", "subtask", "sub task"]
+
+# Sprint filter for Jira ingest.
+# Options: "active" (default), "all", "named:<sprint-name>"
+jira_sprint_filter = "active"
 
 # Max new issues to pick up per repo per poll cycle
 max_new_issues_per_cycle = 1
@@ -311,11 +310,94 @@ class JiraClient:
 # Config
 # ---------------------------------------------------------------------------
 
+@dataclass
+class RepoConfig:
+    name: str
+    predd: bool = True
+    hunter: bool = True
+    obsidian: bool = True
+
+
+def _load_repo_configs(data: dict) -> list[RepoConfig]:
+    """Parse repo configuration from TOML data, supporting both new [[repo]] and old flat schemas."""
+    has_new = "repo" in data
+    has_old = any(k in data for k in ("repos", "predd_only_repos", "hunter_only_repos"))
+
+    if has_new and has_old:
+        logger.warning(
+            "config: both [[repo]] blocks and legacy repos/predd_only_repos/hunter_only_repos "
+            "present — using new [[repo]] schema. Remove legacy keys to silence this warning."
+        )
+
+    if has_new:
+        result = []
+        for entry in data["repo"]:
+            result.append(RepoConfig(
+                name=entry["name"],
+                predd=entry.get("predd", True),
+                hunter=entry.get("hunter", True),
+                obsidian=entry.get("obsidian", True),
+            ))
+        return result
+
+    # Old flat schema — synthesize RepoConfig entries
+    if has_old:
+        deprecated = []
+        if data.get("predd_only_repos"):
+            deprecated.append("predd_only_repos")
+        if data.get("hunter_only_repos"):
+            deprecated.append("hunter_only_repos")
+        if deprecated:
+            logger.info(
+                "config: using legacy flat schema (repos / %s). "
+                "Migration to [[repo]] blocks recommended — see CLAUDE.md.",
+                " / ".join(deprecated),
+            )
+        else:
+            logger.info(
+                "config: using legacy flat schema (repos / *_only_repos). "
+                "Migration to [[repo]] blocks recommended — see CLAUDE.md."
+            )
+
+    result = []
+    seen: set[str] = set()
+
+    for name in data.get("repos", []):
+        if name not in seen:
+            seen.add(name)
+            result.append(RepoConfig(
+                name=name,
+                predd=True,
+                hunter=True,
+                obsidian=True,
+            ))
+
+    for name in data.get("predd_only_repos", []):
+        if name not in seen:
+            seen.add(name)
+            result.append(RepoConfig(
+                name=name,
+                predd=True,
+                hunter=False,
+                obsidian=False,
+            ))
+
+    for name in data.get("hunter_only_repos", []):
+        if name not in seen:
+            seen.add(name)
+            result.append(RepoConfig(
+                name=name,
+                predd=False,
+                hunter=True,
+                obsidian=False,
+            ))
+
+    return result
+
+
 class Config:
     def __init__(self, data: dict):
-        self.repos: list[str] = data["repos"]
-        self.predd_only_repos: list[str] = data.get("predd_only_repos", [])
-        self.hunter_only_repos: list[str] = data.get("hunter_only_repos", [])
+        self.repo_configs: list[RepoConfig] = _load_repo_configs(data)
         self.poll_interval: int = data.get("poll_interval", 90)
         self.sound_new_pr: str = data.get("sound_new_pr", "new_pr")
         self.sound_review_ready: str = data.get("sound_review_ready", "review_ready")
@@ -349,9 +431,9 @@ class Config:
         self.max_review_fix_loops: int = data.get("max_review_fix_loops", 1)
         self.auto_review_draft: bool = data.get("auto_review_draft", False)
         self.max_resume_retries: int = data.get("max_resume_retries", 2)
-        self.jira_csv_dir: Path | None = (
-            Path(data["jira_csv_dir"]).expanduser() if "jira_csv_dir" in data else None
-        )
+        # Max lines changed (additions + deletions) before skipping review and posting a comment.
+        # Large diffs blow the model context window and rarely get useful reviews anyway.
+        self.max_pr_diff_lines: int = data.get("max_pr_diff_lines", 2000)
         self.jira_base_url: str = data.get("jira_base_url", "https://jira.cec.lab.emc.com")
         self.jira_api_enabled: bool = data.get("jira_api_enabled", False)
         self.jira_projects: list[str] = data.get("jira_projects", ["DAP09A"])
@@ -382,6 +464,16 @@ class Config:
             "skip_jira_issue_types",
             ["sub-task", "subtask", "sub task"],
         )
+        self.jira_sprint_filter: str = data.get("jira_sprint_filter", "active")
+        self.jira_active_sprint_name: str = data.get("jira_active_sprint_name", "")
+        # Validate jira_sprint_filter
+        _jsf = self.jira_sprint_filter
+        if _jsf not in ("active", "all") and not _jsf.startswith("named:"):
+            logger.warning(
+                "config: unrecognized jira_sprint_filter %r — falling back to 'active'",
+                _jsf,
+            )
+            self.jira_sprint_filter = "active"
         # Post-CI review (sentinel)
         self.post_ci_review_enabled: bool = data.get("post_ci_review_enabled", False)
         self.post_ci_skill_path: Path = Path(
@@ -390,35 +482,80 @@ class Config:
         self.max_open_auto_issues: int = data.get("max_open_auto_issues", 5)
         self.auto_assign_filed_issues: bool = data.get("auto_assign_filed_issues", True)
 
+    @property
+    def repos(self) -> list[str]:
+        """All repo names (predd + hunter + obsidian, deduped, order-preserving)."""
+        seen: set[str] = set()
+        result = []
+        for rc in self.repo_configs:
+            if rc.name not in seen:
+                seen.add(rc.name)
+                result.append(rc.name)
+        return result
+
+    @property
+    def predd_only_repos(self) -> list[str]:
+        """Repos where predd=True and hunter=False (backward compat view)."""
+        return [rc.name for rc in self.repo_configs if rc.predd and not rc.hunter]
+
+    @property
+    def hunter_only_repos(self) -> list[str]:
+        """Repos where hunter=True and predd=False (backward compat view)."""
+        return [rc.name for rc in self.repo_configs if rc.hunter and not rc.predd]
+
+    def repos_for(self, daemon: str) -> list[str]:
+        """Return repo names where the given daemon is enabled.
+        daemon: 'predd' | 'hunter' | 'obsidian'"""
+        return [rc.name for rc in self.repo_configs if getattr(rc, daemon)]
+
+    def repo_config(self, repo: str) -> RepoConfig | None:
+        """Return the RepoConfig for a given repo slug, or None."""
+        for rc in self.repo_configs:
+            if rc.name == repo:
+                return rc
+        return None
+
     def to_dict(self) -> dict:
+        """Serialize config to a dict suitable for TOML output.
+
+        Uses the new [[repo]] schema (list of dicts under key "repo").
+        """
+        repo_list = []
+        for rc in self.repo_configs:
+            entry: dict = {
+                "name": rc.name,
+                "predd": rc.predd,
+                "hunter": rc.hunter,
+                "obsidian": rc.obsidian,
+            }
+            repo_list.append(entry)
+
         return {
-            "repos": self.repos,
-            "predd_only_repos": self.predd_only_repos,
-            "hunter_only_repos": self.hunter_only_repos,
-            "poll_interval": self.poll_interval,
-            "sound_new_pr": self.sound_new_pr,
-            "sound_review_ready": self.sound_review_ready,
-            "worktree_base": str(self.worktree_base),
             "github_user": self.github_user,
-            "skill_path": str(self.skill_path),
-            "proposal_skill_path": str(self.proposal_skill_path),
-            "impl_skill_path": str(self.impl_skill_path),
-            "trigger": self.trigger,
+            "worktree_base": str(self.worktree_base),
             "backend": self.backend,
             "model": self.model,
+            "trigger": self.trigger,
             "branch_prefix": self.branch_prefix,
             "max_review_fix_loops": self.max_review_fix_loops,
             "auto_review_draft": self.auto_review_draft,
             "max_resume_retries": self.max_resume_retries,
-            "jira_csv_dir": str(self.jira_csv_dir) if self.jira_csv_dir else None,
-            "jira_base_url": self.jira_base_url,
-            "jira_api_enabled": self.jira_api_enabled,
-            "jira_projects": self.jira_projects,
-            "require_jira_conformance": self.require_jira_conformance,
             "max_new_issues_per_cycle": self.max_new_issues_per_cycle,
             "orphan_scan_interval": self.orphan_scan_interval,
             "auto_label_prs": self.auto_label_prs,
             "collect_pr_feedback": self.collect_pr_feedback,
+            "poll_interval": self.poll_interval,
+            "sound_new_pr": self.sound_new_pr,
+            "sound_review_ready": self.sound_review_ready,
+            "skill_path": str(self.skill_path),
+            "proposal_skill_path": str(self.proposal_skill_path),
+            "impl_skill_path": str(self.impl_skill_path),
+            "jira_base_url": self.jira_base_url,
+            "jira_api_enabled": self.jira_api_enabled,
+            "jira_projects": self.jira_projects,
+            "require_jira_conformance": self.require_jira_conformance,
+            "jira_sprint_filter": self.jira_sprint_filter,
+            "skip_jira_issue_types": self.skip_jira_issue_types,
             "status_server_enabled": self.status_server_enabled,
             "status_port": self.status_port,
             "status_refresh_interval": self.status_refresh_interval,
@@ -427,6 +564,7 @@ class Config:
             "fix_interval": self.fix_interval,
             "analyze_days": self.analyze_days,
             "analyze_model": self.analyze_model,
+            "analyze_hour": self.analyze_hour,
             "predd_auto_post": self.predd_auto_post,
             "comment_on_failures": self.comment_on_failures,
             "predd_failure_label": self.predd_failure_label,
@@ -435,12 +573,11 @@ class Config:
             "aws_profile": self.aws_profile,
             "aws_region": self.aws_region,
             "bedrock_model": self.bedrock_model,
-            "analyze_hour": self.analyze_hour,
-            "skip_jira_issue_types": self.skip_jira_issue_types,
             "post_ci_review_enabled": self.post_ci_review_enabled,
             "post_ci_skill_path": str(self.post_ci_skill_path),
             "max_open_auto_issues": self.max_open_auto_issues,
             "auto_assign_filed_issues": self.auto_assign_filed_issues,
+            "repo": repo_list,
         }
 
 
@@ -457,6 +594,272 @@ def load_config() -> Config:
     with open(CONFIG_FILE, "rb") as f:
         data = tomllib.load(f)
     return Config(data)
+
+
+# ---------------------------------------------------------------------------
+# Config TOML serializer
+# ---------------------------------------------------------------------------
+
+def _toml_value(v) -> str:
+    """Render a Python value as a TOML value string."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(v)
+    if isinstance(v, str):
+        escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(v, list):
+        items = ", ".join(_toml_value(x) for x in v)
+        return f"[{items}]"
+    return f'"{v}"'
+
+
+def _serialize_config_toml(d: dict) -> str:
+    """Serialize a config dict to TOML text.
+
+    Handles scalar fields and the special 'repo' list-of-dicts key,
+    which becomes [[repo]] array-of-tables blocks.
+    """
+    lines = []
+    repo_list = d.pop("repo", [])
+
+    for k, v in d.items():
+        if v is None:
+            continue
+        lines.append(f"{k} = {_toml_value(v)}")
+
+    for repo_entry in repo_list:
+        lines.append("")
+        lines.append("[[repo]]")
+        for rk, rv in repo_entry.items():
+            lines.append(f"{rk} = {_toml_value(rv)}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _write_config_atomic(cfg_dict: dict, path: Path | None = None) -> None:
+    """Write config dict to path atomically via a .tmp file."""
+    if path is None:
+        path = CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(_serialize_config_toml(cfg_dict))
+    tmp.rename(path)
+
+
+# ---------------------------------------------------------------------------
+# Config wizard
+# ---------------------------------------------------------------------------
+
+_WIZARD_SCALAR_KEYS = [
+    "github_user", "worktree_base", "backend", "model", "trigger",
+    "max_review_fix_loops", "auto_review_draft", "max_resume_retries",
+    "max_new_issues_per_cycle", "orphan_scan_interval", "auto_label_prs",
+    "collect_pr_feedback", "branch_prefix", "jira_base_url",
+    "jira_api_enabled", "jira_sprint_filter",
+]
+
+
+def run_config_wizard(force: bool = False) -> None:
+    """Interactive config wizard. Writes ~/.config/predd/config.toml."""
+    existing: Config | None = None
+
+    if CONFIG_FILE.exists() and not force:
+        click.echo(f"Config already exists at {CONFIG_FILE}")
+        overwrite = click.confirm("Overwrite from scratch?", default=False)
+        if not overwrite:
+            click.echo("Starting in edit-in-place mode (existing values shown as defaults).")
+            try:
+                with open(CONFIG_FILE, "rb") as f:
+                    _data = tomllib.load(f)
+                existing = Config(_data)
+            except Exception as e:
+                click.echo(f"Warning: could not load existing config ({e}). Using defaults.")
+
+    click.echo("\nWelcome to predd setup. Press Enter to accept defaults.\n")
+
+    # --- Required fields ---
+    def _d(field: str, fallback):
+        """Return existing value if available, else fallback."""
+        if existing is not None:
+            val = getattr(existing, field, fallback)
+            if isinstance(val, Path):
+                return str(val)
+            return val
+        return fallback
+
+    github_user = click.prompt("GitHub username (used to skip your own PRs)", default=_d("github_user", ""))
+    if not github_user or " " in github_user:
+        click.echo("Error: github_user must be a non-empty string with no spaces.")
+        raise SystemExit(1)
+
+    worktree_base = click.prompt(
+        "Worktree base directory (where git worktrees are created)",
+        default=_d("worktree_base", "~/worktrees"),
+    )
+
+    # --- Backend ---
+    backend_default = _d("backend", "devin")
+    backend = click.prompt("Backend (devin|claude|bedrock)", default=backend_default)
+    while backend not in ("devin", "claude", "bedrock"):
+        click.echo("Error: backend must be one of: devin, claude, bedrock")
+        backend = click.prompt("Backend (devin|claude|bedrock)", default=backend_default)
+
+    model_defaults = {"devin": "swe-1.6", "claude": "claude-opus-4-7", "bedrock": "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"}
+    model = click.prompt("Model name", default=_d("model", model_defaults.get(backend, "swe-1.6")))
+
+    # --- Advanced / behaviour ---
+    advanced = click.confirm("\nConfigure advanced settings?", default=False)
+    trigger = _d("trigger", "ready")
+    max_review_fix_loops = _d("max_review_fix_loops", 1)
+    auto_review_draft = _d("auto_review_draft", False)
+    max_resume_retries = _d("max_resume_retries", 2)
+    max_new_issues_per_cycle = _d("max_new_issues_per_cycle", 1)
+    orphan_scan_interval = _d("orphan_scan_interval", 10)
+    auto_label_prs = _d("auto_label_prs", True)
+    collect_pr_feedback = _d("collect_pr_feedback", True)
+    branch_prefix = _d("branch_prefix", "usr/at")
+
+    if advanced:
+        trigger_val = click.prompt("Trigger mode (ready/requested)", default=trigger)
+        while trigger_val not in ("ready", "requested"):
+            click.echo("Error: trigger must be 'ready' or 'requested'")
+            trigger_val = click.prompt("Trigger mode (ready/requested)", default=trigger)
+        trigger = trigger_val
+        max_review_fix_loops = click.prompt("Max self-review fix loops", default=max_review_fix_loops, type=int)
+        auto_review_draft = click.confirm("Review draft PRs?", default=auto_review_draft)
+        max_resume_retries = click.prompt("Max resume retries before rollback", default=max_resume_retries, type=int)
+        max_new_issues_per_cycle = click.prompt("Max new issues per repo per cycle", default=max_new_issues_per_cycle, type=int)
+        orphan_scan_interval = click.prompt("Orphan label scan interval (cycles, 0=startup only)", default=orphan_scan_interval, type=int)
+        auto_label_prs = click.confirm("Auto-label proposal/impl PRs?", default=auto_label_prs)
+        collect_pr_feedback = click.confirm("Collect PR review feedback?", default=collect_pr_feedback)
+        branch_prefix = click.prompt("Branch prefix for hunter-created branches", default=branch_prefix)
+
+    # --- Jira ---
+    jira_base_url = _d("jira_base_url", "")
+    jira_api_enabled = _d("jira_api_enabled", False)
+    jira_sprint_filter = _d("jira_sprint_filter", "active")
+
+    configure_jira = click.confirm("\nConfigure Jira integration?", default=bool(jira_base_url and jira_base_url != "https://jira.cec.lab.emc.com"))
+    if configure_jira:
+        jira_base_url = click.prompt("Jira base URL", default=jira_base_url or "https://jira.example.com")
+        jira_api_enabled = click.confirm("Use Jira REST API?", default=jira_api_enabled)
+        jira_sprint_filter = click.prompt("Sprint filter (active/all/named:...)", default=jira_sprint_filter)
+
+    # --- Repos ---
+    click.echo("")
+    repo_configs: list[RepoConfig] = []
+    if existing and existing.repo_configs:
+        click.echo("Existing repos:")
+        for rc in existing.repo_configs:
+            click.echo(f"  {rc.name}  predd={rc.predd}  hunter={rc.hunter}  obsidian={rc.obsidian}")
+        keep_existing = click.confirm("Keep existing repos?", default=True)
+        if keep_existing:
+            repo_configs = list(existing.repo_configs)
+
+    while True:
+        prompt_text = "Add another repo? (owner/repo or blank to finish)" if repo_configs else "Add a repo (owner/repo)"
+        repo_name = click.prompt(prompt_text, default="")
+        if not repo_name:
+            if not repo_configs:
+                click.echo("At least one repo is required.")
+                continue
+            break
+        if "/" not in repo_name:
+            click.echo("Error: repo must be in owner/repo format.")
+            continue
+        predd_enabled = click.confirm(f"  predd enabled for {repo_name}?", default=True)
+        hunter_enabled = click.confirm(f"  hunter enabled for {repo_name}?", default=True)
+        obsidian_enabled = click.confirm(f"  obsidian enabled for {repo_name}?", default=False)
+        repo_configs.append(RepoConfig(
+            name=repo_name,
+            predd=predd_enabled,
+            hunter=hunter_enabled,
+            obsidian=obsidian_enabled,
+        ))
+
+    # --- Validation checks ---
+    click.echo("\nRunning validation checks...")
+    warnings: list[str] = []
+
+    # Check gh available
+    try:
+        subprocess.run(["gh", "--version"], capture_output=True, check=True)
+        click.echo("  gh available: ok")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        click.echo("  Warning: 'gh' not found. Install from https://cli.github.com/")
+        warnings.append("'gh' not found. Install from https://cli.github.com/")
+
+    # Check gh auth
+    try:
+        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        if result.returncode == 0:
+            click.echo("  GitHub auth: ok")
+        else:
+            click.echo("  Warning: not authenticated with GitHub. Run: gh auth login")
+            warnings.append("GitHub auth not verified. Run: gh auth login")
+    except FileNotFoundError:
+        pass  # already warned about gh not found
+
+    # Check worktree_base
+    wb_path = Path(worktree_base).expanduser()
+    if wb_path.is_dir():
+        click.echo(f"  worktree_base {worktree_base}: ok")
+    else:
+        create_wb = click.confirm(f"  worktree_base {worktree_base} does not exist. Create it?", default=True)
+        if create_wb:
+            wb_path.mkdir(parents=True, exist_ok=True)
+            click.echo(f"  Created {worktree_base}")
+            warnings.append(f"worktree_base {worktree_base} did not exist (created)")
+        else:
+            warnings.append(f"worktree_base {worktree_base} does not exist")
+
+    # --- Build config dict and write ---
+    cfg_dict: dict = {
+        "github_user": github_user,
+        "worktree_base": worktree_base,
+        "backend": backend,
+        "model": model,
+        "trigger": trigger,
+        "max_review_fix_loops": max_review_fix_loops,
+        "auto_review_draft": auto_review_draft,
+        "max_resume_retries": max_resume_retries,
+        "max_new_issues_per_cycle": max_new_issues_per_cycle,
+        "orphan_scan_interval": orphan_scan_interval,
+        "auto_label_prs": auto_label_prs,
+        "collect_pr_feedback": collect_pr_feedback,
+        "branch_prefix": branch_prefix,
+    }
+    if jira_base_url:
+        cfg_dict["jira_base_url"] = jira_base_url
+    if jira_api_enabled:
+        cfg_dict["jira_api_enabled"] = jira_api_enabled
+    cfg_dict["jira_sprint_filter"] = jira_sprint_filter
+
+    repo_list = []
+    for rc in repo_configs:
+        entry: dict = {
+            "name": rc.name,
+            "predd": rc.predd,
+            "hunter": rc.hunter,
+            "obsidian": rc.obsidian,
+        }
+        repo_list.append(entry)
+    cfg_dict["repo"] = repo_list
+
+    _write_config_atomic(cfg_dict)
+    click.echo(f"\nConfig written to {CONFIG_FILE}")
+
+    if warnings:
+        click.echo("\nWarnings:")
+        for w in warnings:
+            click.echo(f"  - {w}")
+
+    click.echo("\nNext steps: predd start --once")
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -574,7 +977,7 @@ def gh_list_open_prs(repo: str) -> list[dict]:
         "pr", "list",
         "--repo", repo,
         "--state", "open",
-        "--json", "number,title,author,headRefName,headRefOid,isDraft,reviewRequests",
+        "--json", "number,title,author,headRefName,headRefOid,baseRefName,isDraft,reviewRequests",
         "--limit", "100",
     ])
     prs = json.loads(result.stdout)
@@ -939,6 +1342,33 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
 
         worktree = setup_worktree(cfg, repo, pr_number, head_sha, head_ref)
         logger.info("Worktree at %s", worktree)
+
+        # Diff-size gate: skip PRs too large to review meaningfully
+        base_ref = pr.get("baseRefName", "main")
+        try:
+            stat_result = subprocess.run(
+                ["git", "diff", f"origin/{base_ref}", "--shortstat"],
+                cwd=str(worktree), capture_output=True, text=True, timeout=30
+            )
+            # shortstat format: " 12 files changed, 450 insertions(+), 123 deletions(-)"
+            m_ins = re.search(r"(\d+) insertion", stat_result.stdout)
+            m_del = re.search(r"(\d+) deletion",  stat_result.stdout)
+            insertions = int(m_ins.group(1)) if m_ins else 0
+            deletions  = int(m_del.group(1)) if m_del else 0
+            total_lines = insertions + deletions
+            if total_lines > cfg.max_pr_diff_lines:
+                msg = (
+                    f"⏭️ Skipping review — diff is too large ({total_lines:,} lines changed, "
+                    f"limit is {cfg.max_pr_diff_lines:,}).\n\n"
+                    f"Review this PR manually. To raise the limit: `predd config set max_pr_diff_lines {total_lines + 500}`"
+                )
+                logger.info("Skipping %s — diff too large (%d lines)", key, total_lines)
+                gh_pr_comment(repo, pr_number, msg)
+                update_pr_state(state, key, status="rejected", head_sha=head_sha)
+                log_decision("pr_skip", repo=repo, pr=pr_number, reason="diff_too_large", lines=total_lines)
+                return
+        except Exception as e:
+            logger.warning("Could not check diff size for %s: %s — proceeding anyway", key, e)
 
         review_text = run_review(cfg, repo, pr_number, worktree)
 
@@ -1762,7 +2192,11 @@ def _handle_bedrock_tool(name: str, input_data: dict, worktree: Path) -> str:
     try:
         if name == "read_file":
             path = worktree / input_data.get("path", "")
-            return path.read_text()
+            content = path.read_text()
+            limit = 30_000
+            if len(content) > limit:
+                content = content[:limit] + f"\n... [truncated — {len(content) - limit} chars omitted]"
+            return content
 
         if name == "list_files":
             target = worktree / input_data.get("path", ".")
@@ -1785,7 +2219,12 @@ def _handle_bedrock_tool(name: str, input_data: dict, worktree: Path) -> str:
             out = result.stdout or ""
             if result.stderr:
                 out += f"\n--- stderr ---\n{result.stderr}"
-            return f"exit={result.returncode}\n{out}"
+            output = f"exit={result.returncode}\n{out}"
+            # Truncate large outputs to avoid exceeding model context window
+            limit = 30_000
+            if len(output) > limit:
+                output = output[:limit] + f"\n... [truncated — {len(output) - limit} chars omitted]"
+            return output
 
         return f"Unknown tool: {name}"
     except Exception as e:
@@ -1870,7 +2309,17 @@ def _run_bedrock_skill(cfg: Config, prompt: str, skill_path: Path, worktree: Pat
                 })
 
         # Continue conversation with tool results
-        messages.append({"role": "assistant", "content": [b.model_dump() if hasattr(b, "model_dump") else {"type": b.type, "id": b.id, "name": b.name, "input": b.input} for b in resp.content]})
+        # Serialize only API-accepted fields — model_dump() includes internal SDK fields (e.g. "caller") that Bedrock rejects
+        def _serialize_block(b):
+            if hasattr(b, "type") and b.type == "tool_use":
+                return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+            elif hasattr(b, "type") and b.type == "text":
+                return {"type": "text", "text": b.text}
+            elif hasattr(b, "model_dump"):
+                return b.model_dump()
+            else:
+                return {"type": b.type}
+        messages.append({"role": "assistant", "content": [_serialize_block(b) for b in resp.content]})
         messages.append({"role": "user", "content": tool_results})
 
     logger.warning("Bedrock hit max turns (%d)", max_turns)
@@ -2220,7 +2669,7 @@ def start(once: bool):
     try:
         while not _stop.is_set():
             state = load_state()
-            for repo in cfg.repos:
+            for repo in cfg.repos_for("predd"):
                 if _stop.is_set():
                     break
                 try:
@@ -2413,22 +2862,102 @@ def reject(pr: str):
     click.echo("Discarded.")
 
 
-@cli.command(name="config")
-def config_cmd():
-    """Print resolved config."""
+@cli.command(name="init")
+@click.option("--force", is_flag=True, help="Overwrite existing config without prompting.")
+@click.option("--ui", is_flag=True, help="Serve a web UI instead of terminal wizard.")
+def init_cmd(force: bool, ui: bool):
+    """Interactive config wizard."""
+    if ui:
+        click.echo("Web UI not yet implemented.")
+        return
+    run_config_wizard(force=force)
+
+
+@cli.group(name="config", invoke_without_command=True)
+@click.pass_context
+def config_group(ctx):
+    """Show or update configuration."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(config_show)
+
+
+@config_group.command(name="show")
+def config_show():
+    """Print current config as a human-readable table."""
+    if not CONFIG_FILE.exists():
+        raise click.ClickException(f"Config file not found: {CONFIG_FILE}")
     cfg = load_config()
-    # Print as TOML-ish key = value
     d = cfg.to_dict()
-    lines = []
+    repo_list = d.pop("repo", [])
+
+    col = 30
     for k, v in d.items():
         if isinstance(v, list):
-            items = ", ".join(f'"{x}"' for x in v)
-            lines.append(f"{k} = [{items}]")
-        elif isinstance(v, str):
-            lines.append(f'{k} = "{v}"')
+            items = ", ".join(str(x) for x in v)
+            click.echo(f"{k:<{col}} [{items}]")
         else:
-            lines.append(f"{k} = {v}")
-    click.echo("\n".join(lines))
+            click.echo(f"{k:<{col}} {v}")
+
+    if repo_list:
+        click.echo("\nRepos:")
+        for rc in repo_list:
+            click.echo(
+                f"  {rc['name']:<40} predd={str(rc.get('predd', True)).lower():<5} "
+                f"hunter={str(rc.get('hunter', True)).lower():<5} "
+                f"obsidian={str(rc.get('obsidian', False)).lower():<5}"
+            )
+
+
+_CONFIG_SET_KEYS = {
+    "github_user": str,
+    "worktree_base": str,
+    "backend": str,
+    "model": str,
+    "trigger": str,
+    "max_review_fix_loops": int,
+    "auto_review_draft": lambda v: v.lower() in ("true", "1", "yes"),
+    "max_resume_retries": int,
+    "max_new_issues_per_cycle": int,
+    "orphan_scan_interval": int,
+    "auto_label_prs": lambda v: v.lower() in ("true", "1", "yes"),
+    "collect_pr_feedback": lambda v: v.lower() in ("true", "1", "yes"),
+    "branch_prefix": str,
+    "jira_base_url": str,
+    "jira_api_enabled": lambda v: v.lower() in ("true", "1", "yes"),
+    "jira_sprint_filter": str,
+}
+
+
+@config_group.command(name="set")
+@click.argument("key")
+@click.argument("value")
+def config_set(key: str, value: str):
+    """Update a single config field."""
+    if key not in _CONFIG_SET_KEYS:
+        raise click.ClickException(
+            f"Unknown config key: {key!r}. Supported keys: {', '.join(sorted(_CONFIG_SET_KEYS))}"
+        )
+    if not CONFIG_FILE.exists():
+        raise click.ClickException(f"Config file not found: {CONFIG_FILE}")
+
+    with open(CONFIG_FILE, "rb") as f:
+        data = tomllib.load(f)
+
+    converter = _CONFIG_SET_KEYS[key]
+    try:
+        data[key] = converter(value)
+    except (ValueError, TypeError) as e:
+        raise click.ClickException(f"Invalid value for {key}: {e}")
+
+    # Rebuild via Config to validate, then re-serialize
+    try:
+        cfg = Config(data)
+    except Exception as e:
+        raise click.ClickException(f"Config validation failed: {e}")
+
+    cfg_dict = cfg.to_dict()
+    _write_config_atomic(cfg_dict)
+    click.echo(f"Set {key} = {data[key]}")
 
 
 if __name__ == "__main__":

@@ -86,8 +86,29 @@ class TestConfigLoading:
         monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
         cfg = pw.load_config()
         d = cfg.to_dict()
-        assert d["repos"] == ["owner/repo"]
+        # New schema: repo list, not flat repos key
+        assert "repo" in d
+        assert d["repo"][0]["name"] == "owner/repo"
         assert "github_user" in d
+
+    def test_config_load_default_sprint_filter(self, tmp_path, monkeypatch):
+        """Config without jira_sprint_filter defaults to 'active'."""
+        cfg_file = _write_config(tmp_path, MINIMAL_CONFIG)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        cfg = pw.load_config()
+        assert cfg.jira_sprint_filter == "active"
+        assert cfg.jira_active_sprint_name == ""
+
+    def test_config_load_invalid_sprint_filter(self, tmp_path, monkeypatch, caplog):
+        """Unrecognized jira_sprint_filter logs a warning and defaults to 'active'."""
+        import logging
+        content = MINIMAL_CONFIG + 'jira_sprint_filter = "bogus-value"\n'
+        cfg_file = _write_config(tmp_path, content)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        with caplog.at_level(logging.WARNING, logger="predd"):
+            cfg = pw.load_config()
+        assert cfg.jira_sprint_filter == "active"
+        assert any("jira_sprint_filter" in r.message for r in caplog.records)
 
 # ---------------------------------------------------------------------------
 # State read/write atomicity
@@ -737,3 +758,439 @@ class TestGhRunPermanentErrors:
                 pw.gh_run(["pr", "list"])
         assert mock_run.call_count == 1
         mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-repo config (RepoConfig / _load_repo_configs / Config accessors)
+# ---------------------------------------------------------------------------
+
+_REPO_BASE_FIELDS = 'worktree_base = "/tmp/pr-reviews"\ngithub_user = "testuser"\n\n'
+
+
+class TestRepoConfig:
+    def _cfg(self, toml_text: str, tmp_path, monkeypatch) -> pw.Config:
+        cfg_dir = tmp_path / ".config" / "predd"
+        cfg_dir.mkdir(parents=True)
+        cfg_file = cfg_dir / "config.toml"
+        # Base fields must come before [[repo]] blocks (TOML array-of-tables)
+        cfg_file.write_text(_REPO_BASE_FIELDS + toml_text)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        return pw.load_config()
+
+    # ---- New schema --------------------------------------------------------
+
+    def test_new_schema_parses(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = true\nhunter = true\nobsidian = true\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = false\nhunter = true\nobsidian = false\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert len(cfg.repo_configs) == 2
+        assert cfg.repo_configs[0].name == "owner/a"
+        assert cfg.repo_configs[1].name == "owner/b"
+        assert cfg.repo_configs[1].predd is False
+        assert cfg.repo_configs[1].hunter is True
+        assert cfg.repo_configs[1].obsidian is False
+
+    # ---- Old flat schema ---------------------------------------------------
+
+    def test_old_schema_repos(self, tmp_path, monkeypatch):
+        toml = 'repos = ["owner/a", "owner/b"]\n'
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos_for("predd") == ["owner/a", "owner/b"]
+        assert cfg.repos_for("hunter") == ["owner/a", "owner/b"]
+        assert cfg.repos_for("obsidian") == ["owner/a", "owner/b"]
+
+    def test_old_schema_predd_only_repos(self, tmp_path, monkeypatch):
+        toml = 'repos = ["owner/a"]\npredd_only_repos = ["owner/p"]\nhunter_only_repos = ["owner/h"]\n'
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert "owner/p" in cfg.repos_for("predd")
+        assert "owner/p" not in cfg.repos_for("hunter")
+        assert "owner/h" in cfg.repos_for("hunter")
+        assert "owner/h" not in cfg.repos_for("predd")
+        assert "owner/p" not in cfg.repos_for("obsidian")
+        assert "owner/h" not in cfg.repos_for("obsidian")
+
+    def test_old_schema_logs_deprecation(self, tmp_path, monkeypatch, caplog):
+        toml = 'repos = ["owner/a"]\npredd_only_repos = ["owner/p"]\n'
+        import logging
+        with caplog.at_level(logging.INFO, logger="predd"):
+            self._cfg(toml, tmp_path, monkeypatch)
+        assert any("legacy flat schema" in r.message for r in caplog.records)
+
+    # ---- Both schemas present ----------------------------------------------
+
+    def test_both_schemas_uses_new(self, tmp_path, monkeypatch, caplog):
+        toml = (
+            'repos = ["owner/old"]\n'
+            '[[repo]]\nname = "owner/new"\npredd = true\nhunter = false\nobsidian = true\n'
+        )
+        import logging
+        with caplog.at_level(logging.WARNING, logger="predd"):
+            cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos_for("predd") == ["owner/new"]
+        assert cfg.repos_for("hunter") == []
+        assert any("both" in r.message for r in caplog.records)
+
+    # ---- Accessor methods --------------------------------------------------
+
+    def test_repos_for_predd(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = true\nhunter = true\nobsidian = true\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = false\nhunter = true\nobsidian = true\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos_for("predd") == ["owner/a"]
+
+    def test_repos_for_hunter(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = true\nhunter = true\nobsidian = true\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = true\nhunter = false\nobsidian = true\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos_for("hunter") == ["owner/a"]
+
+    def test_repos_for_obsidian(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = true\nhunter = true\nobsidian = false\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = true\nhunter = true\nobsidian = true\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos_for("obsidian") == ["owner/b"]
+
+    def test_repo_config_lookup(self, tmp_path, monkeypatch):
+        toml = '[[repo]]\nname = "owner/a"\npredd = true\nhunter = false\nobsidian = true\n'
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        rc = cfg.repo_config("owner/a")
+        assert rc is not None
+        assert rc.hunter is False
+        assert cfg.repo_config("owner/missing") is None
+
+
+    # ---- Backward-compat properties ----------------------------------------
+
+    def test_repos_property_deduped(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = false\nhunter = true\nobsidian = false\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repos == ["owner/a", "owner/b"]
+
+    def test_predd_only_repos_property(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = true\nhunter = false\nobsidian = false\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = true\nhunter = true\nobsidian = true\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.predd_only_repos == ["owner/a"]
+
+    def test_hunter_only_repos_property(self, tmp_path, monkeypatch):
+        toml = (
+            '[[repo]]\nname = "owner/a"\npredd = false\nhunter = true\nobsidian = false\n\n'
+            '[[repo]]\nname = "owner/b"\npredd = true\nhunter = true\nobsidian = true\n'
+        )
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.hunter_only_repos == ["owner/a"]
+
+    # ---- Empty config edge case --------------------------------------------
+
+    def test_empty_repos_new_schema(self, tmp_path, monkeypatch):
+        toml = ""
+        cfg = self._cfg(toml, tmp_path, monkeypatch)
+        assert cfg.repo_configs == []
+        assert cfg.repos_for("predd") == []
+        assert cfg.repos_for("hunter") == []
+        assert cfg.repos_for("obsidian") == []
+
+
+# ---------------------------------------------------------------------------
+# Config wizard and config commands
+# ---------------------------------------------------------------------------
+
+class TestConfigToDict:
+    """Config.to_dict() must emit the new [[repo]] schema."""
+
+    def _cfg_from_toml(self, toml_str: str, tmp_path, monkeypatch):
+        cfg_file = _write_config(tmp_path, toml_str)
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        return pw.load_config()
+
+    def test_to_dict_has_repo_list(self, tmp_path, monkeypatch):
+        toml = (
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n'
+        )
+        cfg = self._cfg_from_toml(toml, tmp_path, monkeypatch)
+        d = cfg.to_dict()
+        assert "repo" in d
+        assert isinstance(d["repo"], list)
+        assert len(d["repo"]) == 1
+        assert d["repo"][0]["name"] == "owner/repo"
+        assert d["repo"][0]["predd"] is True
+        assert d["repo"][0]["hunter"] is True
+        assert d["repo"][0]["obsidian"] is False
+
+    def test_to_dict_no_flat_repo_keys(self, tmp_path, monkeypatch):
+        """to_dict() should not include old-schema keys repos/predd_only_repos."""
+        cfg = self._cfg_from_toml(
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n',
+            tmp_path, monkeypatch,
+        )
+        d = cfg.to_dict()
+        assert "repos" not in d
+        assert "predd_only_repos" not in d
+        assert "hunter_only_repos" not in d
+
+    def test_to_dict_scalar_fields(self, tmp_path, monkeypatch):
+        cfg = self._cfg_from_toml(
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\nbackend = "claude"\n',
+            tmp_path, monkeypatch,
+        )
+        d = cfg.to_dict()
+        assert d["github_user"] == "alice"
+        assert d["backend"] == "claude"
+        assert "worktree_base" in d
+
+    def test_to_dict_jira_csv_dir_not_in_repo_entry(self, tmp_path, monkeypatch):
+        toml = (
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n'
+        )
+        cfg = self._cfg_from_toml(toml, tmp_path, monkeypatch)
+        d = cfg.to_dict()
+        assert "jira_csv_dir" not in d["repo"][0]
+
+
+class TestSerializeConfigToml:
+    """_serialize_config_toml produces valid TOML that round-trips."""
+
+    def test_scalar_fields_rendered(self):
+        d = {
+            "github_user": "bob",
+            "worktree_base": "/tmp/wt",
+            "backend": "devin",
+            "max_review_fix_loops": 2,
+            "auto_review_draft": False,
+            "repo": [],
+        }
+        out = pw._serialize_config_toml(d)
+        assert 'github_user = "bob"' in out
+        assert "max_review_fix_loops = 2" in out
+        assert "auto_review_draft = false" in out
+
+    def test_repo_blocks_rendered(self):
+        d = {
+            "github_user": "bob",
+            "repo": [
+                {"name": "owner/repo", "predd": True, "hunter": False, "obsidian": False}
+            ],
+        }
+        out = pw._serialize_config_toml(d)
+        assert "[[repo]]" in out
+        assert 'name = "owner/repo"' in out
+        assert "predd = true" in out
+        assert "hunter = false" in out
+
+    def test_none_values_omitted(self):
+        d = {"github_user": "bob", "jira_csv_dir": None, "repo": []}
+        out = pw._serialize_config_toml(d)
+        assert "jira_csv_dir" not in out
+
+    def test_roundtrip_via_tomllib(self, tmp_path):
+        import tomllib as tl
+        d = {
+            "github_user": "alice",
+            "worktree_base": "/tmp/wt",
+            "backend": "devin",
+            "max_review_fix_loops": 1,
+            "auto_review_draft": False,
+            "repo": [
+                {"name": "owner/repo", "predd": True, "hunter": True, "obsidian": False}
+            ],
+        }
+        out = pw._serialize_config_toml(d)
+        path = tmp_path / "test.toml"
+        path.write_text(out)
+        loaded = tl.loads(out)
+        assert loaded["github_user"] == "alice"
+        assert loaded["repo"][0]["name"] == "owner/repo"
+
+
+class TestWriteConfigAtomic:
+    def test_writes_via_tmp_then_renames(self, tmp_path, monkeypatch):
+        dest = tmp_path / "config.toml"
+        monkeypatch.setattr(pw, "CONFIG_FILE", dest)
+        d = {"github_user": "carol", "repo": []}
+        pw._write_config_atomic(d, dest)
+        assert dest.exists()
+        assert not (tmp_path / "config.toml.tmp").exists()
+        content = dest.read_text()
+        assert "carol" in content
+
+    def test_original_unchanged_on_rename_failure(self, tmp_path, monkeypatch):
+        dest = tmp_path / "config.toml"
+        dest.write_text("original content\n")
+
+        original_rename = Path.rename
+
+        def fail_rename(self, target):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "rename", fail_rename)
+        with pytest.raises(OSError):
+            pw._write_config_atomic({"github_user": "new", "repo": []}, dest)
+        assert dest.read_text() == "original content\n"
+
+
+class TestConfigShow:
+    def test_prints_fields(self, tmp_path, monkeypatch, capsys):
+        cfg_file = _write_config(
+            tmp_path,
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\nbackend = "devin"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n',
+        )
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config", "show"])
+        assert result.exit_code == 0, result.output
+        assert "github_user" in result.output
+        assert "alice" in result.output
+        assert "owner/repo" in result.output
+
+    def test_exits_nonzero_when_no_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pw, "CONFIG_FILE", tmp_path / "nonexistent.toml")
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config", "show"])
+        assert result.exit_code != 0
+
+    def test_config_group_default_shows(self, tmp_path, monkeypatch, capsys):
+        """'predd config' with no subcommand should behave like 'predd config show'."""
+        cfg_file = _write_config(
+            tmp_path,
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n',
+        )
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config"])
+        assert result.exit_code == 0, result.output
+        assert "github_user" in result.output
+
+
+class TestConfigSet:
+    def test_set_scalar_updates_field(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(
+            tmp_path,
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\nbackend = "devin"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n',
+        )
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config", "set", "backend", "claude"])
+        assert result.exit_code == 0, result.output
+
+        # Reload and verify
+        import tomllib
+        with open(cfg_file, "rb") as f:
+            data = tomllib.load(f)
+        assert data["backend"] == "claude"
+
+    def test_set_integer_field(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(
+            tmp_path,
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n',
+        )
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config", "set", "max_review_fix_loops", "3"])
+        assert result.exit_code == 0, result.output
+        import tomllib
+        with open(cfg_file, "rb") as f:
+            data = tomllib.load(f)
+        assert data["max_review_fix_loops"] == 3
+
+    def test_set_unknown_key_exits_nonzero(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(tmp_path, 'worktree_base = "/tmp/wt"\ngithub_user = "alice"\n')
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["config", "set", "not_a_real_key", "value"])
+        assert result.exit_code != 0
+
+    def test_set_leaves_other_fields_unchanged(self, tmp_path, monkeypatch):
+        cfg_file = _write_config(
+            tmp_path,
+            'worktree_base = "/tmp/wt"\ngithub_user = "alice"\nbackend = "devin"\n'
+            'branch_prefix = "usr/test"\n'
+            '[[repo]]\nname = "owner/repo"\npredd = true\nhunter = true\nobsidian = false\n',
+        )
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        from click.testing import CliRunner
+        runner = CliRunner()
+        runner.invoke(pw.cli, ["config", "set", "backend", "claude"])
+        import tomllib
+        with open(cfg_file, "rb") as f:
+            data = tomllib.load(f)
+        # Other fields preserved
+        assert data["github_user"] == "alice"
+        assert data["branch_prefix"] == "usr/test"
+        assert data["backend"] == "claude"
+
+
+class TestInitCommand:
+    def test_ui_flag_prints_not_implemented(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pw, "CONFIG_FILE", tmp_path / "config.toml")
+        from click.testing import CliRunner
+        runner = CliRunner()
+        result = runner.invoke(pw.cli, ["init", "--ui"])
+        assert result.exit_code == 0
+        assert "not yet implemented" in result.output.lower()
+
+    def test_wizard_writes_config(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "config.toml"
+        monkeypatch.setattr(pw, "CONFIG_FILE", cfg_file)
+        monkeypatch.setattr(pw, "CONFIG_DIR", tmp_path)
+
+        # Stub out subprocess.run so gh checks pass silently
+        monkeypatch.setattr(
+            pw.subprocess, "run",
+            lambda *a, **kw: type("R", (), {"returncode": 0})(),
+        )
+
+        from click.testing import CliRunner
+        runner = CliRunner()
+        # Provide interactive input: github_user, worktree_base, backend, model,
+        # advanced(n), jira(n), repo name, predd(y), hunter(y), obsidian(n),
+        # add another(blank)
+        user_input = "\n".join([
+            "alice",          # github_user
+            str(tmp_path),    # worktree_base (exists, so no create prompt)
+            "devin",          # backend
+            "swe-1.6",        # model
+            "n",              # advanced?
+            "n",              # jira?
+            "owner/repo",     # repo name
+            "y",              # predd?
+            "y",              # hunter?
+            "n",              # obsidian?
+            "",               # add another repo? (blank = done)
+        ]) + "\n"
+
+        result = runner.invoke(pw.cli, ["init"], input=user_input)
+        assert result.exit_code == 0, result.output
+        assert cfg_file.exists()
+
+        import tomllib
+        with open(cfg_file, "rb") as f:
+            data = tomllib.load(f)
+        assert data["github_user"] == "alice"
+        assert data["backend"] == "devin"
+        assert len(data["repo"]) == 1
+        assert data["repo"][0]["name"] == "owner/repo"

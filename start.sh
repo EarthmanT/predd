@@ -1,41 +1,37 @@
 #!/usr/bin/env bash
-# Start all predd daemons in tmux sessions.
-# Usage: ./start.sh [--restart]
+# Start (or restart) all predd daemons via systemd user services.
+# Usage: ./start.sh
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-restart=false
-if [[ "${1}" == "--restart" ]]; then
-  restart=true
+# Load JIRA_API_TOKEN from .bashrc if not already set
+if [[ -z "${JIRA_API_TOKEN}" ]]; then
+  JIRA_API_TOKEN="$(grep -oP '(?<=JIRA_API_TOKEN=)[^\s"'\'']+' ~/.bashrc | tail -1)"
 fi
 
-start_session() {
-  local name=$1
-  local cmd=$2
+# Write token into hunter systemd override so the service picks it up
+if [[ -n "${JIRA_API_TOKEN}" ]]; then
+  mkdir -p ~/.config/systemd/user/hunter.service.d
+  cat > ~/.config/systemd/user/hunter.service.d/jira.conf <<EOF
+[Service]
+Environment="JIRA_API_TOKEN=${JIRA_API_TOKEN}"
+EOF
+  echo "JIRA_API_TOKEN loaded"
+else
+  echo "WARNING: JIRA_API_TOKEN not found in ~/.bashrc — Jira API ingest will be skipped"
+fi
 
-  if tmux has-session -t "$name" 2>/dev/null; then
-    if $restart; then
-      echo "Stopping $name..."
-      tmux kill-session -t "$name"
-    else
-      echo "$name already running — skipping (use --restart to force)"
-      return
-    fi
-  fi
+# Reload systemd and restart everything (restarts if running, starts if stopped)
+systemctl --user daemon-reload
+echo "Restarting all services..."
+systemctl --user restart predd hunter obsidian
 
-  echo "Starting $name..."
-  tmux new-session -d -s "$name" -c "$SCRIPT_DIR" "$cmd"
-  echo "  $name started (tmux attach -t $name)"
-}
-
-start_session predd   "uv run predd.py start"
-start_session hunter  "uv run hunter.py start"
-start_session obsidian "uv run obsidian.py start"
+systemctl --user status predd hunter obsidian --no-pager
 
 echo ""
-echo "All services started. Monitor logs:"
+echo "Monitor logs:"
 echo "  tail -f ~/.config/predd/log.txt"
 echo "  tail -f ~/.config/predd/hunter-log.txt"
 echo "  tail -f ~/.config/predd/obsidian-log.txt"

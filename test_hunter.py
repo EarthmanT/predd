@@ -103,8 +103,8 @@ class TestHunterConfig:
         monkeypatch.setattr(h._predd, "CONFIG_FILE", cfg_file)
         cfg = h.load_config()
         d = cfg.to_dict()
-        assert "predd_only_repos" in d
-        assert "hunter_only_repos" in d
+        # New schema: repo list replaces flat repos/predd_only_repos/hunter_only_repos
+        assert "repo" in d
         assert "branch_prefix" in d
         assert "max_review_fix_loops" in d
         assert "auto_review_draft" in d
@@ -152,7 +152,6 @@ class TestMaxNewIssuesPerCycle:
              patch.object(h, "process_issue", side_effect=fake_process), \
              patch.object(h, "load_hunter_state", return_value=state), \
              patch.object(h, "resume_in_flight_issues"), \
-             patch.object(h, "ingest_jira_csv"), \
              patch.object(h, "scan_orphaned_labels"), \
              patch.object(h, "_stop") as mock_stop:
             mock_stop.is_set.side_effect = [False, True]  # one iteration
@@ -2357,23 +2356,6 @@ class TestScanOrphanedLabels:
         mock_remove.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# TestJiraCsvIngestion
-# ---------------------------------------------------------------------------
-
-class TestParseCsvRow:
-    def test_lowercases_keys(self):
-        row = {"Issue Key": "DAP-1", "Summary": "Fix it"}
-        result = h._parse_csv_row(row)
-        assert result["issue key"] == "DAP-1"
-        assert result["summary"] == "Fix it"
-
-    def test_strips_whitespace(self):
-        row = {"  Issue Key  ": "  DAP-1  "}
-        result = h._parse_csv_row(row)
-        assert result["issue key"] == "DAP-1"
-
-
 class TestParseCapability:
     def test_parses_capability_line(self):
         result = h._parse_capability("Some text\ncapability: 123 cool feature\nmore")
@@ -2487,141 +2469,70 @@ class TestGhIssueCreate:
             assert h.gh_issue_create("owner/repo", "Title", "Body") is None
 
 
-class TestIngestJiraCsv:
-    def _make_cfg_with_csv(self, tmp_path):
-        csv_dir = tmp_path / "jira"
-        csv_dir.mkdir()
+
+
+# ---------------------------------------------------------------------------
+# TestSprintGate
+# ---------------------------------------------------------------------------
+
+class TestSprintGate:
+    # --- _sprint_jql_clause ---
+
+    def test_sprint_jql_active(self):
+        assert h._sprint_jql_clause("active") == "sprint in openSprints()"
+
+    def test_sprint_jql_all(self):
+        assert h._sprint_jql_clause("all") is None
+
+    def test_sprint_jql_named(self):
+        assert h._sprint_jql_clause("named:Sprint-10") == 'sprint = "Sprint-10"'
+
+    def test_sprint_jql_named_escapes_quotes(self):
+        result = h._sprint_jql_clause('named:Sprint "X"')
+        assert result == 'sprint = "Sprint \\"X\\""'
+
+    def test_sprint_jql_unknown_falls_back(self):
+        assert h._sprint_jql_clause("bogus") == "sprint in openSprints()"
+
+    # --- _passes_sprint_gate ---
+
+    def _cfg_with_filter(self, tmp_path, sprint_filter, active_sprint_name=""):
         cfg = _make_cfg(tmp_path)
-        cfg.jira_csv_dir = csv_dir
-        cfg.jira_base_url = "https://jira.example.com"
-        cfg.require_jira_conformance = True
-        return cfg, csv_dir
+        cfg.jira_sprint_filter = sprint_filter
+        cfg.jira_active_sprint_name = active_sprint_name
+        return cfg
 
-    def _write_csv(self, csv_dir, filename, rows):
-        import csv as _csv
-        path = csv_dir / filename
-        with open(path, "w", newline="") as f:
-            writer = _csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-        return path
+    def test_passes_sprint_gate_all_empty_sprint(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "all")
+        assert h._passes_sprint_gate("", cfg) is True
 
-    def test_skips_when_no_csv_dir(self, tmp_path):
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_csv_dir = None
-        with patch.object(h, "gh_issue_exists") as mock_exists:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_exists.assert_not_called()
+    def test_passes_sprint_gate_all_any_sprint(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "all")
+        assert h._passes_sprint_gate("Sprint-99", cfg) is True
 
-    def test_skips_existing_issues(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-1", "Summary": "Fix", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "DAP-100",
-            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
-        }])
-        with patch.object(h, "gh_issue_exists", return_value=True), \
-             patch.object(h, "gh_issue_create") as mock_create:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_create.assert_not_called()
+    def test_passes_sprint_gate_active_empty_sprint(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "active")
+        assert h._passes_sprint_gate("", cfg) is False
 
-    def test_creates_conformant_issue_with_assignee(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-1", "Summary": "Fix", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "DAP-100",
-            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
-        }])
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=10) as mock_create, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"):
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_create.assert_called_once()
-        assert mock_create.call_args.kwargs.get("assignee") == cfg.github_user
+    def test_passes_sprint_gate_active_nonempty_no_name_filter(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "active")
+        assert h._passes_sprint_gate("Sprint-10", cfg) is True
 
-    def test_non_conformant_not_assigned_when_require_conformance(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        cfg.require_jira_conformance = True
-        # Has Sprint (passes hard gate) but missing Epic and capability (non-conformant)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-2", "Summary": "Missing fields", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "", "Sprint": "Sprint-1", "Description": "no cap",
-        }])
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=11) as mock_create, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"):
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        assert mock_create.call_args.kwargs.get("assignee") is None
+    def test_passes_sprint_gate_active_named_match(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "active", active_sprint_name="Sprint-10")
+        assert h._passes_sprint_gate("Sprint-10", cfg) is True
 
-    def test_needs_jira_info_label_added_for_non_conformant(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        # Has Sprint (passes hard gate) but missing Epic and capability (non-conformant)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-3", "Summary": "Bad", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "", "Sprint": "Sprint-1", "Description": "",
-        }])
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=12), \
-             patch.object(h, "gh_ensure_label_exists") as mock_ensure, \
-             patch.object(h, "gh_issue_add_label") as mock_label:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        label_calls = [str(c) for c in mock_label.call_args_list]
-        assert any("needs-jira-info" in c for c in label_calls)
+    def test_passes_sprint_gate_active_named_mismatch(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "active", active_sprint_name="Sprint-10")
+        assert h._passes_sprint_gate("Sprint-9", cfg) is False
 
-    def test_csv_ingest_skips_subtask(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-10", "Summary": "Child task", "Issue Type": "Sub-task",
-            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
-        }])
-        with patch.object(h, "gh_issue_exists") as mock_exists:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_exists.assert_not_called()
+    def test_passes_sprint_gate_named_filter_match(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "named:Sprint-10")
+        assert h._passes_sprint_gate("Sprint-10", cfg) is True
 
-    def test_csv_ingest_skips_subtask_case_insensitive(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-11", "Summary": "Child", "Issue Type": "SUB-TASK",
-            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
-        }])
-        with patch.object(h, "gh_issue_exists") as mock_exists:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_exists.assert_not_called()
-
-    def test_csv_ingest_creates_story(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        self._write_csv(csv_dir, "sprint.csv", [{
-            "Issue Key": "DAP-12", "Summary": "A story", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "DAP-100",
-            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
-        }])
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=20) as mock_create, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"):
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_create.assert_called_once()
-
-    def test_csv_ingest_respects_custom_skip_list(self, tmp_path):
-        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
-        cfg.skip_jira_issue_types = ["sub-task", "epic"]
-        self._write_csv(csv_dir, "sprint.csv", [
-            {"Issue Key": "DAP-13", "Summary": "An epic", "Issue Type": "Epic",
-             "Status": "Open", "Epic Link": "", "Sprint": "", "Description": ""},
-            {"Issue Key": "DAP-14", "Summary": "A story", "Issue Type": "Story",
-             "Status": "Open", "Epic Link": "DAP-100",
-             "Sprint": "Sprint-1", "Description": "capability: 1 feat"},
-        ])
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=30) as mock_create, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"):
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        # Only Story should be created, Epic should be skipped
-        mock_create.assert_called_once()
-        assert "[DAP-14]" in mock_create.call_args[1].get("title", mock_create.call_args[0][1])
+    def test_passes_sprint_gate_named_filter_mismatch(self, tmp_path):
+        cfg = self._cfg_with_filter(tmp_path, "named:Sprint-10")
+        assert h._passes_sprint_gate("Sprint-9", cfg) is False
 
 
 # ---------------------------------------------------------------------------
@@ -2805,7 +2716,7 @@ class TestJiraLabeling:
 # ---------------------------------------------------------------------------
 
 class TestEpicSprintConformance:
-    """Tests for _find_epic, _find_sprint, and Sprint hard gate."""
+    """Tests for _find_epic."""
 
     def test_find_epic_uses_epic_link(self):
         row = {"epic link": "DAP-100", "epic name": "", "parent": ""}
@@ -2818,61 +2729,6 @@ class TestEpicSprintConformance:
     def test_find_epic_returns_empty_when_all_missing(self):
         row = {"epic link": "", "epic name": ""}
         assert h._find_epic(row) == ""
-
-    def test_csv_ingest_skips_row_without_sprint(self, tmp_path):
-        cfg = _make_cfg(tmp_path)
-        csv_dir = tmp_path / "jira"
-        csv_dir.mkdir()
-        cfg.jira_csv_dir = csv_dir
-        cfg.jira_base_url = "https://jira.example.com"
-        cfg.require_jira_conformance = True
-
-        import csv as _csv
-        path = csv_dir / "test.csv"
-        with open(path, "w", newline="") as f:
-            writer = _csv.DictWriter(f, fieldnames=[
-                "Issue Key", "Summary", "Issue Type", "Status",
-                "Epic Link", "Sprint", "Description",
-            ])
-            writer.writeheader()
-            writer.writerow({
-                "Issue Key": "DAP-20", "Summary": "No sprint", "Issue Type": "Story",
-                "Status": "Open", "Epic Link": "DAP-100", "Sprint": "",
-                "Description": "capability: 1 feat",
-            })
-
-        with patch.object(h, "gh_issue_exists") as mock_exists:
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_exists.assert_not_called()
-
-    def test_csv_ingest_creates_row_with_sprint(self, tmp_path):
-        cfg = _make_cfg(tmp_path)
-        csv_dir = tmp_path / "jira"
-        csv_dir.mkdir()
-        cfg.jira_csv_dir = csv_dir
-        cfg.jira_base_url = "https://jira.example.com"
-        cfg.require_jira_conformance = True
-
-        import csv as _csv
-        path = csv_dir / "test.csv"
-        with open(path, "w", newline="") as f:
-            writer = _csv.DictWriter(f, fieldnames=[
-                "Issue Key", "Summary", "Issue Type", "Status",
-                "Epic Link", "Sprint", "Description",
-            ])
-            writer.writeheader()
-            writer.writerow({
-                "Issue Key": "DAP-21", "Summary": "Has sprint", "Issue Type": "Story",
-                "Status": "Open", "Epic Link": "DAP-100", "Sprint": "Sprint-1",
-                "Description": "capability: 1 feat",
-            })
-
-        with patch.object(h, "gh_issue_exists", return_value=False), \
-             patch.object(h, "gh_issue_create", return_value=30) as mock_create, \
-             patch.object(h, "gh_ensure_label_exists"), \
-             patch.object(h, "gh_issue_add_label"):
-            h.ingest_jira_csv(cfg, ["owner/repo"])
-        mock_create.assert_called_once()
 
 
 class TestBranchNamingJiraKey:
@@ -3059,8 +2915,8 @@ class TestIngestJiraApi:
             h.ingest_jira_api(cfg, ["owner/repo"])
         mock_exists.assert_not_called()
 
-    def test_falls_back_when_validate_fails(self, tmp_path):
-        """Test falls back to CSV when API validation fails."""
+    def test_returns_early_when_validate_fails(self, tmp_path):
+        """Test returns early when API validation fails."""
         cfg = self._cfg_with_api(tmp_path)
         with patch.dict(os.environ, {"JIRA_API_TOKEN": "badtoken"}), \
              patch.object(_predd.JiraClient, "validate", return_value=False), \
@@ -3096,7 +2952,7 @@ class TestIngestJiraApi:
         mock_create.assert_called_once()
         call_args = mock_create.call_args
         assert "[DAP-1]" in call_args.args[2]  # title
-        assert call_args.kwargs.get("assignee") == cfg.github_user
+        assert call_args.kwargs.get("assignee") is None
 
     def test_skips_subtask(self, tmp_path):
         """Test skips sub-task issues."""
@@ -3314,3 +3170,317 @@ class TestIngestJiraApi:
 
         # Should not match due to case difference
         mock_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestJiraFrontmatter
+# ---------------------------------------------------------------------------
+
+def _full_jira_issue(key="DAP09A-1184"):
+    """Return a Jira issue dict with all fields populated."""
+    return {
+        "key": key,
+        "fields": {
+            "issuetype": {"name": "Story"},
+            "customfield_10014": "DAP09A-1000",
+            "parent": {
+                "key": "DAP09A-1000",
+                "fields": {"summary": "Epic Name"},
+            },
+            "customfield_10020": [
+                {"name": "DAP09A Sprint-9 2026-04-01"},
+                {"name": "DAP09A Sprint-10 2026-05-12"},
+            ],
+            "description": "Some text\ncapability: 12345 cool feature\nmore text",
+        },
+    }
+
+
+class TestJiraFrontmatter:
+    BASE_URL = "https://jira.cec.lab.emc.com"
+
+    # ------------------------------------------------------------------
+    # _build_jira_frontmatter
+    # ------------------------------------------------------------------
+
+    def test_full_data_all_fields_present(self):
+        issue = _full_jira_issue()
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        assert "| Jira | [DAP09A-1184](https://jira.cec.lab.emc.com/browse/DAP09A-1184) |" in result
+        assert "| Type | Story |" in result
+        assert "DAP09A-1000" in result
+        assert "Epic Name" in result
+        assert "| Sprint | DAP09A Sprint-10 2026-05-12 |" in result
+        assert "| Capability | 12345 — cool feature |" in result
+        # Ends with separator
+        assert result.endswith("\n\n---\n\n")
+
+    def test_missing_epic_row_omitted(self):
+        issue = _full_jira_issue()
+        issue["fields"]["customfield_10014"] = None
+        issue["fields"]["parent"] = None
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        assert "| Epic |" not in result
+        # Other rows still present
+        assert "| Jira |" in result
+        assert "| Sprint |" in result
+
+    def test_missing_sprint_row_omitted(self):
+        issue = _full_jira_issue()
+        issue["fields"]["customfield_10020"] = None
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        assert "| Sprint |" not in result
+        assert "| Jira |" in result
+
+    def test_missing_capability_row_omitted(self):
+        issue = _full_jira_issue()
+        issue["fields"]["description"] = "No capability line here"
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        assert "| Capability |" not in result
+        assert "| Type | Story |" in result
+
+    def test_sprint_takes_last_entry(self):
+        issue = _full_jira_issue()
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        # Should use last sprint, not first
+        assert "Sprint-10" in result
+        assert "Sprint-9" not in result
+
+    def test_epic_from_parent_key_when_no_customfield_10014(self):
+        issue = _full_jira_issue()
+        issue["fields"]["customfield_10014"] = ""  # empty, not None
+        issue["fields"]["parent"] = {"key": "DAP09A-2000", "fields": {"summary": "Other Epic"}}
+        result = h._build_jira_frontmatter(issue, self.BASE_URL)
+        assert "DAP09A-2000" in result
+        assert "Other Epic" in result
+
+    # ------------------------------------------------------------------
+    # _check_jira_conformance
+    # ------------------------------------------------------------------
+
+    def test_conformance_all_present_returns_empty(self):
+        issue = _full_jira_issue()
+        missing = h._check_jira_conformance(issue)
+        assert missing == []
+
+    def test_conformance_missing_sprint(self):
+        issue = _full_jira_issue()
+        issue["fields"]["customfield_10020"] = None
+        missing = h._check_jira_conformance(issue)
+        assert "Sprint" in missing
+
+    def test_conformance_missing_epic(self):
+        issue = _full_jira_issue()
+        issue["fields"]["customfield_10014"] = None
+        issue["fields"]["parent"] = None
+        missing = h._check_jira_conformance(issue)
+        assert "Epic" in missing
+
+    def test_conformance_missing_capability(self):
+        issue = _full_jira_issue()
+        issue["fields"]["description"] = "No capability here"
+        missing = h._check_jira_conformance(issue)
+        assert "Capability" in missing
+
+    def test_conformance_all_missing(self):
+        issue = {
+            "key": "DAP09A-1",
+            "fields": {
+                "issuetype": {"name": "Bug"},
+                "customfield_10014": None,
+                "parent": None,
+                "customfield_10020": [],
+                "description": "",
+            },
+        }
+        missing = h._check_jira_conformance(issue)
+        assert set(missing) == {"Sprint", "Epic", "Capability"}
+
+    # ------------------------------------------------------------------
+    # process_issue: Jira conformance gate
+    # ------------------------------------------------------------------
+
+    def test_process_issue_skips_nonconformant_when_require_true(self, tmp_path):
+        cfg = _make_cfg(tmp_path, require_jira_conformance=True, jira_api_enabled=True)
+        monkeypatch_state_file(tmp_path)
+        state = {}
+        issue = {
+            "number": 42,
+            "title": "[DAP09A-1184] Fix the widget",
+            "author": {"login": "reporter"},
+            "labels": [],
+            "body": "desc",
+        }
+
+        missing_fields = ["Sprint", "Capability"]
+
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", missing_fields)), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_comment"), \
+             patch.object(h, "try_claim_issue") as mock_claim, \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        # Should not attempt to claim the issue
+        mock_claim.assert_not_called()
+        # State should remain empty (issue was skipped, not failed)
+        assert "owner/repo!42" not in state
+
+    def test_process_issue_continues_when_conformant(self, tmp_path):
+        cfg = _make_cfg(tmp_path, require_jira_conformance=True, jira_api_enabled=True)
+        monkeypatch_state_file(tmp_path)
+        skill = tmp_path / "proposal-skill.md"
+        skill.write_text("Write proposal")
+        cfg.proposal_skill_path = skill
+        state = {}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        issue = {
+            "number": 42,
+            "title": "[DAP09A-1184] Fix the widget",
+            "author": {"login": "reporter"},
+            "labels": [],
+            "body": "desc",
+        }
+
+        frontmatter = "| Field | Value |\n|-------|-------|\n| Jira | [DAP09A-1184](...) |\n\n---\n\n"
+
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [])), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value="proposal text"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=55), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        assert state.get("owner/repo!42", {}).get("status") == "proposal_open"
+        assert state.get("owner/repo!42", {}).get("jira_frontmatter") == frontmatter
+
+    def test_process_issue_proceeds_when_conformance_not_required(self, tmp_path):
+        cfg = _make_cfg(tmp_path, require_jira_conformance=False, jira_api_enabled=True)
+        monkeypatch_state_file(tmp_path)
+        skill = tmp_path / "proposal-skill.md"
+        skill.write_text("Write proposal")
+        cfg.proposal_skill_path = skill
+        state = {}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        issue = {
+            "number": 43,
+            "title": "[DAP09A-1185] Another issue",
+            "author": {"login": "reporter"},
+            "labels": [],
+            "body": "desc",
+        }
+
+        # Non-empty missing but require_jira_conformance=False => should continue
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", ["Sprint"])), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value="proposal"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=56), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        # Should have proceeded and created proposal
+        assert state.get("owner/repo!43", {}).get("status") == "proposal_open"
+
+    def test_process_issue_no_jira_key_skips_frontmatter(self, tmp_path):
+        cfg = _make_cfg(tmp_path, require_jira_conformance=True, jira_api_enabled=True)
+        monkeypatch_state_file(tmp_path)
+        skill = tmp_path / "proposal-skill.md"
+        skill.write_text("Write proposal")
+        cfg.proposal_skill_path = skill
+        state = {}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        issue = {
+            "number": 44,
+            "title": "Fix the widget (no jira key)",
+            "author": {"login": "reporter"},
+            "labels": [],
+            "body": "desc",
+        }
+
+        with patch.object(h, "_fetch_jira_frontmatter") as mock_fetch, \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value="proposal"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=57), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        # _fetch_jira_frontmatter should not be called when no Jira key in title
+        mock_fetch.assert_not_called()
+        assert state.get("owner/repo!44", {}).get("status") == "proposal_open"
+
+    def test_proposal_pr_body_includes_frontmatter(self, tmp_path):
+        cfg = _make_cfg(tmp_path, require_jira_conformance=False, jira_api_enabled=True)
+        monkeypatch_state_file(tmp_path)
+        skill = tmp_path / "proposal-skill.md"
+        skill.write_text("Write proposal")
+        cfg.proposal_skill_path = skill
+        state = {}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        issue = {
+            "number": 45,
+            "title": "[DAP09A-100] Feature request",
+            "author": {"login": "reporter"},
+            "labels": [],
+            "body": "desc",
+        }
+        frontmatter = "| Field | Value |\n|-------|-------|\n| Jira | [DAP09A-100](...) |\n\n---\n\n"
+
+        pr_body_captured = []
+
+        def _capture_pr(**kwargs):
+            pr_body_captured.append(kwargs.get("body", ""))
+            return 99
+
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [])), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value="proposal"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_create_branch_and_pr", side_effect=_capture_pr), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        assert pr_body_captured, "gh_create_branch_and_pr was not called"
+        body = pr_body_captured[0]
+        assert body.startswith(frontmatter)
+        assert "Proposal for issue #45" in body

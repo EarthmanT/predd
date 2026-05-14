@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "click",
+#   "anthropic[bedrock]>=0.42.0",
 # ]
 # ///
 
@@ -728,6 +729,33 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     # Apply jira label if title contains a Jira key
     label_jira_issue(repo, issue_number, title)
 
+    # Jira conformance check (if Jira API is configured)
+    jira_key = extract_jira_key(title)
+    jira_frontmatter = ""
+    if jira_key:
+        jira_frontmatter, missing_fields = _fetch_jira_frontmatter(cfg, jira_key)
+        if missing_fields and cfg.require_jira_conformance:
+            needs_label = f"{cfg.github_user}:needs-jira-info"
+            missing_lines = "\n".join(f"- No {f.lower()} assigned" if f != "Capability"
+                                      else f"- No capability found in description (add `capability: <id> <name>`)"
+                                      for f in missing_fields)
+            comment = (
+                f"⚠️ This issue is missing required Jira fields:\n{missing_lines}\n\n"
+                "Hunter will not process this issue until it conforms."
+            )
+            try:
+                gh_ensure_label_exists(repo, needs_label, color="e11d48")
+                gh_issue_add_label(repo, issue_number, needs_label)
+                gh_issue_comment(repo, issue_number, comment)
+            except Exception as e:
+                logger.warning("Could not apply needs-jira-info label/comment for %s#%d: %s",
+                               repo, issue_number, e)
+            log_decision("jira_conformance_failed", repo=repo, issue=issue_number,
+                         jira_key=jira_key, missing=missing_fields)
+            logger.info("Skipping %s#%d — non-conformant Jira issue (%s)",
+                        repo, issue_number, ", ".join(missing_fields))
+            return
+
     if not try_claim_issue(cfg, repo, issue_number):
         logger.info("Could not claim issue %s — skipping", key)
         log_decision("claim_failed", repo=repo, issue=issue_number, reason="try_claim_returned_false")
@@ -754,6 +782,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                        base_branch=base_branch,
                        proposal_branch=branch,
                        proposal_worktree=str(worktree),
+                       jira_frontmatter=jira_frontmatter,
                        resume_attempts=0,
                        first_seen=_now_iso())
 
@@ -776,7 +805,8 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="proposal")
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
 
-        pr_body = f"Proposal for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->"
+        frontmatter = state.get(key, {}).get("jira_frontmatter", "")
+        pr_body = f"{frontmatter}Proposal for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->"
         gh_ensure_label_exists(repo, "sdd-proposal", color="0075ca")
         pr_number = gh_create_branch_and_pr(
             repo=repo,
@@ -980,7 +1010,8 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="impl")
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
 
-        pr_body = f"Implementation for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->\n<!-- hunter:impl-{issue_number} -->"
+        frontmatter = entry.get("jira_frontmatter", "")
+        pr_body = f"{frontmatter}Implementation for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->\n<!-- hunter:impl-{issue_number} -->"
         gh_ensure_label_exists(repo, "sdd-implementation", color="e4e669")
         pr_number = gh_create_branch_and_pr(
             repo=repo,
@@ -1179,20 +1210,122 @@ TERMINAL_STATES = {"merged", "awaiting_verification", "submitted"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
 
 
-# ---------------------------------------------------------------------------
-# Jira CSV ingestion
-# ---------------------------------------------------------------------------
-
-def _parse_csv_row(row: dict) -> dict:
-    """Normalise a CSV row to lowercase keys."""
-    return {(k or "").lower().strip(): (v or "").strip() for k, v in row.items()}
-
-
 def _parse_capability(description: str) -> str | None:
     m = re.search(r"capability:\s*(\d+)\s+(.+)", description, re.IGNORECASE)
     if m:
         return f"{m.group(1)} — {m.group(2).strip()}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Jira API frontmatter
+# ---------------------------------------------------------------------------
+
+def _build_jira_frontmatter(issue_data: dict, jira_base_url: str) -> str:
+    """Build a markdown table frontmatter block from a Jira issue dict.
+
+    Returns a string ending with a separator line and a trailing newline, ready
+    to be prepended to a PR body.
+    """
+    fields = issue_data.get("fields") or {}
+    jira_key = issue_data.get("key", "")
+    base_url = jira_base_url.rstrip("/")
+
+    lines = ["| Field | Value |", "|-------|-------|"]
+
+    # Jira row — always present when key is known
+    if jira_key:
+        lines.append(f"| Jira | [{jira_key}]({base_url}/browse/{jira_key}) |")
+
+    # Type row — always present
+    issue_type = (fields.get("issuetype") or {}).get("name", "")
+    if issue_type:
+        lines.append(f"| Type | {issue_type} |")
+
+    # Epic row — try customfield_10014 (epic link key) then parent.key
+    epic_key = fields.get("customfield_10014") or ""
+    if not epic_key:
+        parent = fields.get("parent") or {}
+        epic_key = parent.get("key", "")
+    if epic_key:
+        # Try to get epic summary from customfield_10014_detail or parent.fields.summary
+        epic_summary = ""
+        parent = fields.get("parent") or {}
+        if parent.get("key") == epic_key:
+            epic_summary = (parent.get("fields") or {}).get("summary", "")
+        if epic_summary:
+            lines.append(f"| Epic | [{epic_key}]({base_url}/browse/{epic_key}) {epic_summary} |")
+        else:
+            lines.append(f"| Epic | [{epic_key}]({base_url}/browse/{epic_key}) |")
+
+    # Sprint row — customfield_10020 is an array; take last entry's name
+    sprints = fields.get("customfield_10020") or []
+    sprint_name = ""
+    if sprints and isinstance(sprints, list):
+        last_sprint = sprints[-1]
+        if isinstance(last_sprint, dict):
+            sprint_name = last_sprint.get("name", "")
+        else:
+            sprint_name = str(last_sprint)
+    if sprint_name:
+        lines.append(f"| Sprint | {sprint_name} |")
+
+    # Capability row — parsed from description
+    description = fields.get("description") or ""
+    capability = _parse_capability(description)
+    if capability:
+        lines.append(f"| Capability | {capability} |")
+
+    return "\n".join(lines) + "\n\n---\n\n"
+
+
+def _check_jira_conformance(issue_data: dict) -> list[str]:
+    """Return list of missing required Jira field names.
+
+    A non-empty list means the issue is non-conformant.
+    """
+    fields = issue_data.get("fields") or {}
+    missing = []
+
+    # Sprint
+    sprints = fields.get("customfield_10020") or []
+    if not sprints:
+        missing.append("Sprint")
+
+    # Epic
+    epic_key = fields.get("customfield_10014") or ""
+    if not epic_key:
+        parent = fields.get("parent") or {}
+        epic_key = parent.get("key", "")
+    if not epic_key:
+        missing.append("Epic")
+
+    # Capability
+    description = fields.get("description") or ""
+    if not _parse_capability(description):
+        missing.append("Capability")
+
+    return missing
+
+
+def _fetch_jira_frontmatter(cfg: "Config", jira_key: str) -> tuple[str, list[str]]:
+    """Fetch Jira issue and build frontmatter. Returns (frontmatter, missing_fields).
+
+    Returns ("", []) if Jira API is not configured or unavailable.
+    """
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not token or not cfg.jira_api_enabled:
+        return "", []
+
+    try:
+        client = JiraClient(cfg.jira_base_url, token)
+        issue_data = client.get_issue(jira_key)
+        missing = _check_jira_conformance(issue_data)
+        frontmatter = _build_jira_frontmatter(issue_data, cfg.jira_base_url)
+        return frontmatter, missing
+    except Exception as e:
+        logger.warning("Could not fetch Jira data for %s: %s", jira_key, e)
+        return "", []
 
 
 EPIC_COLUMNS = (
@@ -1202,11 +1335,6 @@ EPIC_COLUMNS = (
     "custom field (epic name)",
     "parent",
     "parent key",
-)
-
-SPRINT_COLUMNS = (
-    "sprint",
-    "custom field (sprint)",
 )
 
 
@@ -1219,22 +1347,13 @@ def _find_epic(row: dict) -> str:
     return ""
 
 
-def _find_sprint(row: dict) -> str:
-    """Find Sprint value from the first non-empty column in SPRINT_COLUMNS."""
-    for col in SPRINT_COLUMNS:
-        val = row.get(col, "")
-        if val:
-            return val
-    return ""
-
-
 def _build_issue_body(row: dict, jira_base_url: str) -> tuple[str, list[str]]:
     """Build the GH issue body and return (body, missing_fields)."""
     jira_key = row.get("issue key", "")
     summary = row.get("summary", "")
     issue_type = row.get("issue type", "")
     epic = _find_epic(row)
-    sprint = _find_sprint(row)
+    sprint = row.get("sprint", "")
     description = row.get("description", "")
     capability = _parse_capability(description)
 
@@ -1302,117 +1421,51 @@ def gh_issue_create(repo: str, title: str, body: str, assignee: str | None = Non
     return int(m.group(1)) if m else None
 
 
-def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
-    """Read CSV files from jira_csv_dir and create missing GH issues."""
-    if not cfg.jira_csv_dir or not cfg.jira_csv_dir.exists():
-        return
+def _sprint_jql_clause(sprint_filter: str) -> str | None:
+    """Return the sprint JQL clause for the given filter, or None if no clause needed."""
+    if sprint_filter == "active":
+        return "sprint in openSprints()"
+    elif sprint_filter == "all":
+        return None
+    elif sprint_filter.startswith("named:"):
+        name = sprint_filter[len("named:"):]
+        escaped = name.replace('"', '\\"')
+        return f'sprint = "{escaped}"'
+    else:
+        return "sprint in openSprints()"
 
-    csv_files = sorted(cfg.jira_csv_dir.glob("*.csv"))
-    if not csv_files:
-        return
 
-    logger.info("CSV ingest: scanning %d file(s) in %s", len(csv_files), cfg.jira_csv_dir)
-
-    for csv_file in csv_files:
-        try:
-            import csv as _csv
-            with open(csv_file, newline="", encoding="utf-8-sig") as f:
-                reader = _csv.reader(f)
-                header = next(reader)
-                rows = []
-                for values in reader:
-                    # Build dict keeping first non-empty value for duplicate keys
-                    row: dict[str, str] = {}
-                    for col, val in zip(header, values):
-                        key = (col or "").lower().strip()
-                        if key not in row or not row[key]:
-                            row[key] = (val or "").strip()
-                    rows.append(row)
-        except Exception as e:
-            logger.warning("CSV ingest: failed to read %s: %s", csv_file, e)
-            continue
-
-        if rows:
-            logger.info("CSV ingest: %s columns: %s", csv_file.name, sorted(rows[0].keys()))
-
-        for row in rows:
-            jira_key = row.get("issue key", "").strip()
-            summary = row.get("summary", "").strip()
-            if not jira_key or not summary:
-                continue
-
-            issue_type = row.get("issue type", "").strip().lower()
-            if issue_type in {t.lower() for t in cfg.skip_jira_issue_types}:
-                log_decision(
-                    "csv_issue_skip",
-                    jira_key=jira_key,
-                    reason="excluded_type",
-                    issue_type=issue_type,
-                )
-                logger.info(
-                    "CSV ingest: skipping %s (type=%s) per skip_jira_issue_types",
-                    jira_key, issue_type,
-                )
-                continue
-
-            sprint = _find_sprint(row).strip()
-            if not sprint:
-                log_decision(
-                    "csv_issue_skip",
-                    jira_key=jira_key,
-                    reason="no_sprint",
-                )
-                logger.info("CSV ingest: skipping %s — no sprint assigned", jira_key)
-                continue
-
-            title = f"[{jira_key}] {summary}"
-            body, missing = _build_issue_body(row, cfg.jira_base_url)
-            conformant = len(missing) == 0
-
-            for repo in repos:
-                try:
-                    if gh_issue_exists(repo, jira_key):
-                        log_decision("csv_issue_skip", repo=repo, jira_key=jira_key, reason="already_exists")
-                        continue
-
-                    assignee = cfg.github_user if (conformant or not cfg.require_jira_conformance) else None
-                    issue_number = gh_issue_create(repo, title, body, assignee=assignee)
-
-                    if issue_number is None:
-                        logger.warning("CSV ingest: failed to create issue for %s in %s", jira_key, repo)
-                        continue
-
-                    log_decision("csv_issue_created", repo=repo, jira_key=jira_key, issue=issue_number, conformant=conformant)
-                    label_jira_issue(repo, issue_number, title)
-                    logger.info("CSV ingest: created issue #%d for %s in %s%s",
-                                issue_number, jira_key, repo,
-                                " (non-conformant, not assigned)" if not conformant else "")
-
-                    if not conformant:
-                        needs_label = f"{cfg.github_user}:needs-jira-info"
-                        try:
-                            gh_ensure_label_exists(repo, needs_label, color="e11d48")
-                            gh_issue_add_label(repo, issue_number, needs_label)
-                        except Exception as e:
-                            logger.warning("CSV ingest: could not add needs-jira-info label: %s", e)
-
-                except Exception as e:
-                    logger.error("CSV ingest: error processing %s in %s: %s", jira_key, repo, e)
+def _passes_sprint_gate(sprint_value: str, cfg: Config) -> bool:
+    """Return True if sprint_value satisfies the configured sprint filter."""
+    f = cfg.jira_sprint_filter
+    if f == "all":
+        return True
+    elif f == "active":
+        if not sprint_value:
+            return False
+        if cfg.jira_active_sprint_name:
+            return sprint_value == cfg.jira_active_sprint_name
+        return True
+    elif f.startswith("named:"):
+        target = f[len("named:"):]
+        return sprint_value == target
+    else:
+        return bool(sprint_value)
 
 
 def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
     """Query Jira API for sprint issues and create missing GH issues."""
     token = os.environ.get("JIRA_API_TOKEN")
     if not token or not cfg.jira_api_enabled:
-        return  # Fall back to CSV ingest
+        return
 
     try:
         client = JiraClient(cfg.jira_base_url, token)
         if not client.validate():
-            logger.warning("Jira API authentication failed — falling back to CSV ingest")
+            logger.warning("Jira API authentication failed")
             return
     except Exception as e:
-        logger.warning("Jira API validation error: %s — falling back to CSV ingest", e)
+        logger.warning("Jira API validation error: %s", e)
         return
 
     logger.info("Jira API ingest: starting")
@@ -1423,7 +1476,11 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
         return
 
     projects_str = ", ".join(cfg.jira_projects)
-    jql = f"project in ({projects_str}) AND sprint in openSprints()"
+    clauses = [f"project in ({projects_str})"]
+    sprint_clause = _sprint_jql_clause(cfg.jira_sprint_filter)
+    if sprint_clause:
+        clauses.append(sprint_clause)
+    jql = " AND ".join(clauses)
 
     try:
         issues = client.search(
@@ -1436,7 +1493,7 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
             max_results=1000,
         )
     except Exception as e:
-        logger.warning("Jira API search failed: %s — falling back to CSV ingest", e)
+        logger.warning("Jira API search failed: %s", e)
         return
 
     if not issues:
@@ -1497,7 +1554,7 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
                     jira_key=jira_key,
                     reason="no_sprint",
                 )
-                logger.info("Jira API ingest: skipping %s — no sprint assigned", jira_key)
+                logger.debug("Jira API ingest: skipping %s — no sprint assigned", jira_key)
                 continue
 
             # Extract labels and filter repos (repo label routing)
@@ -1511,14 +1568,13 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
                     reason="no_matching_repo_labels",
                     labels=issue_labels,
                 )
-                logger.info(
+                logger.debug(
                     "Jira API ingest: skipping %s — no matching repo labels (has: %s)",
                     jira_key, ", ".join(issue_labels) if issue_labels else "(none)",
                 )
                 continue
 
-            # Build issue body (reuse CSV logic)
-            # Convert API issue dict to CSV-like row format for _build_issue_body
+            # Build issue body
             row = {
                 "issue key": jira_key,
                 "summary": summary,
@@ -1536,8 +1592,7 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
                         log_decision("api_issue_skip", repo=repo, jira_key=jira_key, reason="already_exists")
                         continue
 
-                    assignee = cfg.github_user if (conformant or not cfg.require_jira_conformance) else None
-                    issue_number = gh_issue_create(repo, title, body, assignee=assignee)
+                    issue_number = gh_issue_create(repo, title, body)
 
                     if issue_number is None:
                         logger.warning("Jira API ingest: failed to create issue for %s in %s", jira_key, repo)
@@ -1904,7 +1959,7 @@ def start(once: bool):
     if not once and cfg.status_server_enabled:
         start_status_server(cfg.status_port)
 
-    hunter_repos = list(dict.fromkeys(cfg.repos + cfg.hunter_only_repos))
+    hunter_repos = cfg.repos_for("hunter")
 
     poll_cycle_count = 0
     # Scan for orphaned labels from crashed previous runs
@@ -1923,9 +1978,8 @@ def start(once: bool):
                 scan_orphaned_labels(cfg, state, hunter_repos)
                 state = load_hunter_state()
 
-            # Ingest new issues from Jira API (if configured) or CSV exports (fallback)
+            # Ingest new issues from Jira API (if configured)
             ingest_jira_api(cfg, hunter_repos)
-            ingest_jira_csv(cfg, hunter_repos)
 
             # Auto-label unlabelled proposal/implementation PRs
             auto_label_prs(cfg, hunter_repos)
@@ -2073,6 +2127,17 @@ def status():
         return
     for s, c in sorted(counts.items()):
         click.echo(f"{s}: {c}")
+
+
+@cli.command(name="init")
+@click.option("--force", is_flag=True, help="Overwrite existing config without prompting.")
+@click.option("--ui", is_flag=True, help="Serve a web UI instead of terminal wizard.")
+def init_cmd(force: bool, ui: bool):
+    """Interactive config wizard (alias for predd init)."""
+    if ui:
+        click.echo("Web UI not yet implemented.")
+        return
+    _predd.run_config_wizard(force=force)
 
 
 if __name__ == "__main__":
