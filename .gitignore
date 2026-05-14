@@ -4,3 +4,5 @@ __pycache__/
 .aider*
 .skills/
 .coverage
+.jira
+

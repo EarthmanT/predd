@@ -1952,36 +1952,29 @@ Based on these observations from the last {days} days:
 
 ## Your Task
 
-Analyze the patterns and identify:
-
-1. **Critical Issues** - What's broken? (e.g., high rollback rate, claim failures)
-2. **Root Causes** - Why are things failing?
-3. **Improvement Opportunities** - What specs should be implemented to fix this?
-4. **Quick Wins** - Low-effort, high-impact improvements
-
-Generate 2-4 improvement spec titles that hunter can implement.
+Analyze the patterns and generate 1-3 concrete improvement specs that can be implemented.
 
 ## Output Format
 
-```
-# Analysis Report
+Output a JSON object with this exact structure (no markdown fencing, raw JSON only):
 
-## Critical Issues
-- Issue 1: ...
-- Issue 2: ...
+{{
+  "analysis": "Brief summary of what you found (2-3 sentences)",
+  "specs": [
+    {{
+      "filename": "short-kebab-case-name.md",
+      "title": "Human readable title",
+      "content": "Full spec content in markdown. Include: ## Problem, ## Solution, ## Implementation, ## Testing sections."
+    }}
+  ]
+}}
 
-## Root Causes
-- Cause 1: ...
-
-## Proposed Improvements
-1. **Spec Title**: Brief description
-2. **Another Spec**: Description
-
-## Implementation Priority
-[Ranked by impact/effort]
-```
-
-Be specific and actionable. Focus on measurable improvements."""
+Rules:
+- filename must be kebab-case, end in .md
+- content must be actionable — specific enough for an AI agent to implement
+- Focus on the highest-impact improvements based on the failure patterns
+- Do not propose changes that are already working well
+- Each spec should be a single, focused change"""
 
     # Call Claude/Sonnet to analyze
     click.echo("Calling Claude for analysis...")
