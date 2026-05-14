@@ -55,7 +55,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Story"},
             "status": {"name": "To Do"},
-            "labels": ["predd-demo"],
+            "labels": ["fusion-e/ai-bp-toolkit"],
             "customfield_10014": "DEMO-1",   # epic link
             "customfield_10020": [SPRINT],   # sprint
         },
@@ -79,7 +79,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Bug"},
             "status": {"name": "To Do"},
-            "labels": ["predd-demo"],
+            "labels": ["fusion-e/ai-bp-toolkit"],
             "customfield_10014": "DEMO-1",
             "customfield_10020": [SPRINT],
         },
@@ -101,7 +101,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Story"},
             "status": {"name": "To Do"},
-            "labels": ["predd-demo"],
+            "labels": ["fusion-e/ai-bp-toolkit"],
             "customfield_10014": "DEMO-1",
             "customfield_10020": [SPRINT],
         },
