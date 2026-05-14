@@ -867,6 +867,40 @@ class TestCheckProposalMerged:
         assert state.get("owner/repo!3", {}).get("impl_pr") == 99
         assert state.get("owner/repo!3", {}).get("status") == "implementing"
 
+    def test_removes_proposal_label_when_starting_implementation(self, tmp_path):
+        """Verify proposal-open label is removed when transitioning to implementing."""
+        cfg = _make_cfg(tmp_path)
+        monkeypatch_state_file(tmp_path)
+
+        skill = tmp_path / "impl-skill.md"
+        skill.write_text("Implement $ARGUMENTS")
+        cfg.impl_skill_path = skill
+
+        state = {}
+        entry = self._entry()
+        worktree = tmp_path / "impl-wt"
+        worktree.mkdir()
+
+        with patch.object(h, "gh_find_merged_proposal", return_value=42), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_skill", return_value="done"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=99), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label") as mock_add_label, \
+             patch.object(h, "gh_issue_remove_label") as mock_remove_label, \
+             patch.object(h, "gh_pr_reviews", return_value=[]), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
+
+        # Verify both add and remove were called for the labels
+        mock_add_label.assert_called_with("owner/repo", 3, "testuser:implementing")
+        mock_remove_label.assert_called_with("owner/repo", 3, "testuser:proposal-open")
+
     def test_gh_error_skips_gracefully(self, tmp_path):
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)

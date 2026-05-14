@@ -938,8 +938,10 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         )
 
         implementing_label = f"{cfg.github_user}:implementing"
+        proposal_label = f"{cfg.github_user}:proposal-open"
         gh_ensure_label_exists(repo, implementing_label)
         gh_issue_add_label(repo, issue_number, implementing_label)
+        gh_issue_remove_label(repo, issue_number, proposal_label)
 
         update_issue_state(state, key,
                            status="implementing",
