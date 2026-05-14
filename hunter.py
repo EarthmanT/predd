@@ -1315,8 +1315,17 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
         try:
             import csv as _csv
             with open(csv_file, newline="", encoding="utf-8-sig") as f:
-                reader = _csv.DictReader(f)
-                rows = [_parse_csv_row(r) for r in reader]
+                reader = _csv.reader(f)
+                header = next(reader)
+                rows = []
+                for values in reader:
+                    # Build dict keeping first non-empty value for duplicate keys
+                    row: dict[str, str] = {}
+                    for col, val in zip(header, values):
+                        key = (col or "").lower().strip()
+                        if key not in row or not row[key]:
+                            row[key] = (val or "").strip()
+                    rows.append(row)
         except Exception as e:
             logger.warning("CSV ingest: failed to read %s: %s", csv_file, e)
             continue
