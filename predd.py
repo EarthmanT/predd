@@ -1031,7 +1031,10 @@ def gh_repo_default_branch(repo: str) -> str:
     """Return the default branch name for a repo."""
     result = gh_run(["repo", "view", repo, "--json", "defaultBranchRef"])
     data = json.loads(result.stdout)
-    return data["defaultBranchRef"]["name"]
+    name = (data.get("defaultBranchRef") or {}).get("name")
+    if not name:
+        raise RuntimeError(f"Could not determine default branch for {repo}")
+    return name
 
 
 def gh_pr_comment(repo: str, pr_number: int, body: str) -> None:
@@ -1466,25 +1469,26 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
         return
 
     # Only act on comments newer than our last fix
-    last_processed_id = entry.get("last_moonlight_review_id")
-    new_comments = [c for c in comments if c.get("id") != last_processed_id
-                    and c.get("id", 0) > (last_processed_id or 0)]
-    if not new_comments:
-        return
-
-    # Check there are actual review requests or bodies to address
-    actionable = [c for c in new_comments if c.get("body") or c.get("state") == "CHANGES_REQUESTED"]
+    last_processed_id = entry.get("last_moonlight_review_id") or 0
+    actionable = [
+        c for c in comments
+        if (c.get("id") or 0) > last_processed_id
+        and (c.get("body") or c.get("state") == "CHANGES_REQUESTED")
+    ]
     if not actionable:
         return
 
     logger.info("Moonlight: %d new review comment(s) on %s — starting fix (turn %d/%d)",
                 len(actionable), key, turns_done + 1, cfg.max_moonlight_turns)
 
-    # Find existing worktree or create fresh one
+    # Find existing worktree or create fresh one.
+    # Include the repo slug in the glob so we don't accidentally pick up a worktree
+    # from a different repo with a similarly-named branch.
     worktree: Path | None = None
     worktree_base = Path(cfg.worktree_base)
+    repo_slug = repo.replace("/", "-")
     branch_slug = branch.replace("/", "-").replace("_", "-")
-    candidates = list(worktree_base.glob(f"*{branch_slug[:40]}*"))
+    candidates = list(worktree_base.glob(f"{repo_slug}*{branch_slug[:40]}*"))
     if candidates:
         worktree = candidates[0]
         logger.debug("Moonlight: using existing worktree %s", worktree)
@@ -1497,18 +1501,26 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
             logger.error("Moonlight: could not create worktree for %s: %s", key, e)
             return
 
+    # Mark state before running skill so we don't re-process the same comments
+    # even if the process dies between push and state write.
+    latest_id = max((c.get("id") or 0 for c in actionable), default=0)
+    update_pr_state(state, key,
+                    moonlight_turns=turns_done + 1,
+                    last_moonlight_review_id=latest_id)
+
     prompt = _build_moonlight_prompt(repo, pr_number, branch, worktree, actionable)
 
     try:
         _run_skill_prompt(cfg, prompt, worktree)
     except Exception as e:
         logger.error("Moonlight: skill failed for %s: %s", key, e)
+        # State already updated — we consumed this turn so we don't loop on the same error
         return
 
     # Push changes if any commits were made
     try:
         result = subprocess.run(
-            ["git", "log", "origin/" + branch + "..HEAD", "--oneline"],
+            ["git", "log", f"origin/{branch}..HEAD", "--oneline"],
             cwd=str(worktree), capture_output=True, text=True,
         )
         if result.stdout.strip():
@@ -1518,7 +1530,6 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
             )
             logger.info("Moonlight: pushed fixes for %s", key)
 
-            # Post summary comment on PR
             summary_comment = (
                 f"Addressed review comments (moonlight fix, turn {turns_done + 1}/{cfg.max_moonlight_turns})."
             )
@@ -1532,15 +1543,9 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
         logger.error("Moonlight: push failed for %s: %s", key, e)
         return
 
-    # Update state
-    latest_id = max((c.get("id", 0) for c in actionable), default=0)
-    update_pr_state(state, key,
-                    moonlight_turns=turns_done + 1,
-                    last_moonlight_review_id=latest_id)
-
     if turns_done + 1 >= cfg.max_moonlight_turns:
         exhausted_msg = (
-            f"I've applied fixes {cfg.max_moonlight_turns} time(s) in response to review comments. "
+            f"I've applied fixes {turns_done + 1} time(s) in response to review comments. "
             f"Please take another look and let me know if anything else needs changing."
         )
         try:
