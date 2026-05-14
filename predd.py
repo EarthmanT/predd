@@ -488,11 +488,11 @@ class Config:
         self.speckit_enabled: bool = data.get("speckit_enabled", False)
         self.speckit_prompt_dir: Path = Path(data.get("speckit_prompt_dir",
             str(Path(__file__).parent / "prompts" / "speckit"))).expanduser()
-        self.capability_specs_path: "Path | None" = (
+        self.capability_specs_path: Path | None = (
             Path(data["capability_specs_path"]).expanduser()
             if "capability_specs_path" in data else None
         )
-        self.speckit_epic_map: dict = data.get("speckit_epic_map", {})
+        self.speckit_epic_map: dict[str, str] = data.get("speckit_epic_map", {})
 
     @property
     def repos(self) -> list[str]:

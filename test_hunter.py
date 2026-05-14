@@ -4157,3 +4157,113 @@ class TestCheckProposalMergedFork:
         mock_legacy.assert_called_once()
         args = mock_legacy.call_args[0]
         assert args[1] == cfg.impl_skill_path
+
+
+# ---------------------------------------------------------------------------
+# TestRunSpeckitImplement
+# ---------------------------------------------------------------------------
+
+class TestRunSpeckitImplement:
+    """Tests for run_speckit_implement directly (N7)."""
+
+    def _make_entry(self):
+        return {
+            "issue_number": 7,
+            "repo": "owner/repo",
+            "title": "My story",
+            "jira_key": "PROJ-7",
+            "epic_key": "EPIC-1",
+            "epic_name": "My Epic",
+            "status": "implementing",
+        }
+
+    def test_calls_run_skill_with_tmp_file(self, tmp_path):
+        """run_skill is called; tmp file is cleaned up afterward."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "plan.md").write_text("# Plan")
+        (worktree / "tasks.md").write_text("# Tasks")
+
+        captured_paths = []
+
+        def fake_run_skill(c, skill_path, context, wt):
+            captured_paths.append(Path(skill_path))
+            # Confirm the tmp file still exists during the call
+            assert Path(skill_path).exists(), "tmp skill file should exist during run_skill"
+
+        with patch.object(h, "load_speckit_prompt", return_value="implement prompt") as mock_load, \
+             patch.object(h, "build_issue_context", return_value="ctx") as mock_ctx, \
+             patch.object(h, "run_skill", side_effect=fake_run_skill):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        mock_load.assert_called_once()
+        call_kwargs = mock_load.call_args
+        assert call_kwargs[1]["template_name"] == "implement"
+        mock_ctx.assert_called_once()
+        # Tmp file cleaned up after call
+        assert len(captured_paths) == 1
+        assert not captured_paths[0].exists(), "tmp skill file should be deleted after run_skill"
+
+    def test_clarifications_absent_uses_placeholder(self, tmp_path):
+        """When clarifications.md absent, path passed to template is '(not present)'."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        (worktree / "spec-refs").mkdir(parents=True)
+        worktree.mkdir(exist_ok=True)
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["clarifications_path"] == "(not present)"
+
+    def test_clarifications_present_uses_real_path(self, tmp_path):
+        """When clarifications.md exists, path passed to template is the actual path."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        spec_refs = worktree / "spec-refs"
+        spec_refs.mkdir(parents=True)
+        clarif = spec_refs / "clarifications.md"
+        clarif.write_text("Q: ...")
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["clarifications_path"] == str(clarif)
+
+    def test_tmp_file_cleaned_up_on_run_skill_error(self, tmp_path):
+        """Tmp file is deleted even if run_skill raises."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured_path = []
+
+        def exploding_run_skill(c, skill_path, context, wt):
+            captured_path.append(Path(skill_path))
+            raise RuntimeError("boom")
+
+        with patch.object(h, "load_speckit_prompt", return_value="prompt"), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill", side_effect=exploding_run_skill):
+            with pytest.raises(RuntimeError, match="boom"):
+                h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert len(captured_path) == 1
+        assert not captured_path[0].exists(), "tmp file should be cleaned up even after error"

@@ -829,6 +829,41 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
 # ---------------------------------------------------------------------------
 
 
+def _extract_epic_info(fields: dict) -> tuple[str, str]:
+    """Return (epic_key, epic_name) from a Jira API issue fields dict.
+
+    Tries customfield_10014 (Epic Link) first, then parent.key.
+    Epic name is sourced from customfield_10014_detail (present on many Jira Server
+    versions) or parent.fields.summary when the epic key comes from parent.
+    """
+    epic_key = fields.get("customfield_10014") or ""
+    if not epic_key:
+        parent = fields.get("parent") or {}
+        epic_key = parent.get("key", "")
+    if not epic_key:
+        return "", ""
+
+    # Try to get the epic name.
+    # Path 1: customfield_10014_detail (Jira Server often returns this alongside
+    #          customfield_10014 when you request the field).
+    detail = fields.get("customfield_10014_detail") or {}
+    if isinstance(detail, dict):
+        epic_name = detail.get("summary") or detail.get("displayName") or detail.get("name") or ""
+        if epic_name:
+            return epic_key, epic_name
+
+    # Path 2: parent.fields.summary (works when the epic is the direct parent,
+    #          i.e. the epic key came from parent.key, not customfield_10014).
+    parent = fields.get("parent") or {}
+    if parent.get("key") == epic_key:
+        epic_name = (parent.get("fields") or {}).get("summary", "")
+        return epic_key, epic_name
+
+    # Epic key known but name not available — slug resolution won't work;
+    # speckit_epic_map is the only resolution path.
+    return epic_key, ""
+
+
 def spec_branch(cfg: Config, issue_id: str, title_slug: str) -> str:
     """Branch name for speckit proposals: {branch_prefix}/{issue_id}-spec-{slug}."""
     return f"{cfg.branch_prefix}/{issue_id}-spec-{title_slug}"
@@ -930,7 +965,25 @@ def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
         return False
 
     story_id = jira_key or str(issue_number)
-    bundle = read_bpa_specs_bundle(capability_dir, story_id)
+    repo = entry.get("repo", "")
+    try:
+        bundle = read_bpa_specs_bundle(capability_dir, story_id)
+    except RuntimeError as e:
+        missing_label = f"{cfg.github_user}:speckit-missing-spec"
+        log_decision("speckit_missing_spec", issue=issue_number, story_id=story_id,
+                     capability=str(capability_dir.name), reason=str(e))
+        logger.warning("speckit: missing required artifacts for %s — %s", story_id, e)
+        if repo:
+            try:
+                gh_ensure_label_exists(repo, missing_label, color="e11d48")
+                gh_issue_add_label(repo, issue_number, missing_label)
+                gh_issue_comment(repo, issue_number,
+                    f"⚠️ Spec Kit cannot process this story: {e}\n\n"
+                    "Add the missing artifacts to BPA-Specs, then remove the "
+                    f"`{missing_label}` label to retry.")
+            except Exception as label_err:
+                logger.warning("speckit: could not apply missing-spec label: %s", label_err)
+        raise
     sha = pin_capability_sha(cfg)
 
     spec_refs = copy_spec_refs(bundle, worktree)
@@ -964,11 +1017,10 @@ def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
     context = build_issue_context(issue_number, title, issue_body, entry)
     try:
         run_skill(cfg, tmp_path, context, worktree)
+        if not (worktree / "plan.md").exists():
+            raise RuntimeError("speckit plan skill did not produce plan.md")
     finally:
         tmp_path.unlink(missing_ok=True)
-
-    if not (worktree / "plan.md").exists():
-        raise RuntimeError("speckit plan skill did not produce plan.md")
 
     log_decision("plan_completed", issue=issue_number, story_id=story_id,
                  capability=str(capability_dir.name), sha=sha)
@@ -981,6 +1033,10 @@ def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
     spec_refs = worktree / "spec-refs"
     plan_path = worktree / "plan.md"
     tasks_path = worktree / "tasks.md"
+    clarifications_file = spec_refs / "clarifications.md"
+    clarifications_path = (
+        str(clarifications_file) if clarifications_file.exists() else "(not present)"
+    )
 
     prompt = load_speckit_prompt(
         cfg, template_name="implement",
@@ -991,7 +1047,7 @@ def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
         constitution_path=str(spec_refs / "constitution.md"),
         capability_spec_path=str(spec_refs / "capability-spec.md"),
         story_spec_path=str(spec_refs / "story-spec.md"),
-        clarifications_path=str(spec_refs / "clarifications.md"),
+        clarifications_path=clarifications_path,
         plan_path=str(plan_path),
         tasks_path=str(tasks_path),
     )
@@ -1028,20 +1084,11 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     # Jira conformance check (if Jira API is configured)
     jira_key = extract_jira_key(title)
     jira_frontmatter = ""
-    _epic_key = ""
-    _epic_name = ""
+    epic_key = ""
+    epic_name = ""
     if jira_key:
-        jira_frontmatter, missing_fields, _issue_data = _fetch_jira_frontmatter(cfg, jira_key)
-        # Extract epic info for speckit capability resolution
-        _fields = _issue_data.get("fields") or {}
-        _epic_key = _fields.get("customfield_10014") or ""
-        if not _epic_key:
-            _parent = _fields.get("parent") or {}
-            _epic_key = _parent.get("key", "")
-        if _epic_key:
-            _parent = _fields.get("parent") or {}
-            if _parent.get("key") == _epic_key:
-                _epic_name = (_parent.get("fields") or {}).get("summary", "")
+        jira_frontmatter, missing_fields, issue_data = _fetch_jira_frontmatter(cfg, jira_key)
+        epic_key, epic_name = _extract_epic_info(issue_data.get("fields") or {})
         if missing_fields and cfg.require_jira_conformance:
             needs_label = f"{cfg.github_user}:needs-jira-info"
             missing_lines = "\n".join(f"- No {f.lower()} assigned" if f != "Capability"
@@ -1095,8 +1142,8 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                        proposal_worktree=str(worktree),
                        jira_frontmatter=jira_frontmatter,
                        jira_key=jira_key or "",
-                       epic_key=_epic_key,
-                       epic_name=_epic_name,
+                       epic_key=epic_key,
+                       epic_name=epic_name,
                        resume_attempts=0,
                        first_seen=_now_iso())
 
@@ -2016,7 +2063,7 @@ def rollback_issue(cfg: Config, state: dict, key: str, reason: str) -> None:
 
     # Remove all hunter labels from GitHub
     if repo and issue_number:
-        for suffix in (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification"):
+        for suffix in (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification", ":speckit-missing-spec"):
             label = f"{cfg.github_user}{suffix}"
             try:
                 gh_issue_remove_label(repo, issue_number, label)
@@ -2142,6 +2189,7 @@ def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
         f"{cfg.github_user}:in-progress",
         f"{cfg.github_user}:proposal-open",
         f"{cfg.github_user}:implementing",
+        f"{cfg.github_user}:speckit-missing-spec",
     ]
     for repo in repos:
         for label in labels_to_check:
