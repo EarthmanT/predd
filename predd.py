@@ -197,6 +197,12 @@ comment_on_failures = true
 predd_failure_label = "{github_user}:predd-failed"
 failure_cleanup_days = 7
 failure_cleanup_interval = 10
+
+# Post-CI review of hunter-created PRs (sentinel)
+# post_ci_review_enabled = false
+# post_ci_skill_path = "~/.windsurf/skills/post-ci-review/SKILL.md"
+# max_open_auto_issues = 5
+# auto_assign_filed_issues = true
 """
 
 # ---------------------------------------------------------------------------
@@ -376,6 +382,13 @@ class Config:
             "skip_jira_issue_types",
             ["sub-task", "subtask", "sub task"],
         )
+        # Post-CI review (sentinel)
+        self.post_ci_review_enabled: bool = data.get("post_ci_review_enabled", False)
+        self.post_ci_skill_path: Path = Path(
+            data.get("post_ci_skill_path", "~/.windsurf/skills/post-ci-review/SKILL.md")
+        ).expanduser()
+        self.max_open_auto_issues: int = data.get("max_open_auto_issues", 5)
+        self.auto_assign_filed_issues: bool = data.get("auto_assign_filed_issues", True)
 
     def to_dict(self) -> dict:
         return {
@@ -424,6 +437,10 @@ class Config:
             "bedrock_model": self.bedrock_model,
             "analyze_hour": self.analyze_hour,
             "skip_jira_issue_types": self.skip_jira_issue_types,
+            "post_ci_review_enabled": self.post_ci_review_enabled,
+            "post_ci_skill_path": str(self.post_ci_skill_path),
+            "max_open_auto_issues": self.max_open_auto_issues,
+            "auto_assign_filed_issues": self.auto_assign_filed_issues,
         }
 
 
@@ -2254,6 +2271,33 @@ def start(once: bool):
                     _current_pr_key[:] = [key]
                     process_pr(cfg, state, repo, pr)
                     _current_pr_key.clear()
+
+            # --- Sentinel post-CI pass ---
+            if cfg.post_ci_review_enabled and not _stop.is_set():
+                _sentinel = None
+                try:
+                    import importlib.util as _ilu
+                    _s_spec = _ilu.spec_from_file_location(
+                        "sentinel", Path(__file__).resolve().parent / "sentinel.py"
+                    )
+                    _sentinel = _ilu.module_from_spec(_s_spec)
+                    _s_spec.loader.exec_module(_sentinel)
+                except Exception as _e:
+                    logger.warning("Could not load sentinel: %s", _e)
+
+                if _sentinel:
+                    state = load_state()
+                    for _pr_key, _pr_entry in list(state.items()):
+                        if _stop.is_set():
+                            break
+                        if _pr_entry.get("status") == "submitted" and not _pr_entry.get("post_ci_reviewed"):
+                            _repo_from_key = _pr_key.rsplit("#", 1)[0]
+                            _pr_num_from_key = int(_pr_key.rsplit("#", 1)[1])
+                            try:
+                                _sentinel.run_post_ci_review(cfg, state, _repo_from_key, _pr_num_from_key)
+                                state = load_state()
+                            except Exception as _e:
+                                logger.error("Sentinel error on %s: %s", _pr_key, _e)
 
             if once or _stop.wait(cfg.poll_interval):
                 break
