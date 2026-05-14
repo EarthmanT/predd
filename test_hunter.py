@@ -902,29 +902,36 @@ class TestCheckProposalMerged:
         mock_add_label.assert_called_with("owner/repo", 3, "testuser:implementing")
         mock_remove_label.assert_called_with("owner/repo", 3, "testuser:proposal-open")
 
-    def test_gh_error_skips_gracefully(self, tmp_path):
+    def test_gh_find_merged_proposal_error_propagates(self, tmp_path):
+        """gh_find_merged_proposal raising propagates to caller."""
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", side_effect=RuntimeError("network")), \
-             patch.object(h, "gh_issue_remove_label"):
-            h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_pr_reviews", return_value=[]), \
+             patch.object(h, "gh_pr_inline_comments", return_value=[]), \
+             patch.object(h, "gh_pr_issue_comments", return_value=[]), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "save_hunter_state"), \
+             patch.object(h, "gh_find_merged_proposal", side_effect=RuntimeError("network")):
+            with pytest.raises(RuntimeError, match="network"):
+                h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
-        assert state == {}
-
-    def test_missing_proposal_pr_returns_early(self, tmp_path):
+    def test_no_merged_proposal_returns_early(self, tmp_path):
+        """When gh_find_merged_proposal returns None, state is unchanged."""
         cfg = _make_cfg(tmp_path)
         monkeypatch_state_file(tmp_path)
         state = {}
         entry = {"issue_number": 3, "repo": "owner/repo", "title": "X", "status": "proposal_open"}
 
-        with patch.object(h, "gh_pr_is_merged") as mock_merged, \
-             patch.object(h, "gh_issue_remove_label"):
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_find_merged_proposal", return_value=None) as mock_find:
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
-        mock_merged.assert_not_called()
+        mock_find.assert_called_once()
+        assert state == {}
 
 
 # ---------------------------------------------------------------------------
