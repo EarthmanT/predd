@@ -481,6 +481,9 @@ class Config:
         ).expanduser()
         self.max_open_auto_issues: int = data.get("max_open_auto_issues", 5)
         self.auto_assign_filed_issues: bool = data.get("auto_assign_filed_issues", True)
+        # Moonlight — respond to review comments on hunter-created PRs
+        self.moonlight_enabled: bool = data.get("moonlight_enabled", True)
+        self.max_moonlight_turns: int = data.get("max_moonlight_turns", 2)
 
     @property
     def repos(self) -> list[str]:
@@ -1024,6 +1027,13 @@ def gh_pr_review(repo: str, pr_number: int, review_type: str, body_file: Path) -
     ])
 
 
+def gh_repo_default_branch(repo: str) -> str:
+    """Return the default branch name for a repo."""
+    result = gh_run(["repo", "view", repo, "--json", "defaultBranchRef"])
+    data = json.loads(result.stdout)
+    return data["defaultBranchRef"]["name"]
+
+
 def gh_pr_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a comment on a PR."""
     gh_run([
@@ -1319,6 +1329,228 @@ def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
     if cfg.backend == "bedrock":
         return _run_bedrock_skill(cfg, prompt, cfg.skill_path, worktree)
     raise ValueError(f"Unknown backend '{cfg.backend}'. Valid values: claude, devin, bedrock")
+
+# ---------------------------------------------------------------------------
+# Moonlight — fix hunter PRs in response to review comments
+# ---------------------------------------------------------------------------
+
+def _run_skill_prompt(cfg: "Config", prompt: str, worktree: Path) -> str:
+    """Run a free-form prompt through the configured backend. Returns output."""
+    if cfg.backend == "claude":
+        return _run_claude(cfg, prompt, worktree)
+    if cfg.backend == "devin":
+        return _run_devin(cfg, prompt, worktree)
+    if cfg.backend == "bedrock":
+        return _run_bedrock_skill(cfg, prompt, cfg.impl_skill_path, worktree)
+    raise ValueError(f"Unknown backend '{cfg.backend}'")
+
+
+def _fetch_pr_review_comments(repo: str, pr_number: int) -> list[dict]:
+    """Return all reviews + inline comments for a PR via gh api."""
+    comments = []
+
+    # Top-level reviews (REQUEST_CHANGES, APPROVE, COMMENT with body)
+    try:
+        result = gh_run(
+            ["api", f"repos/{repo}/pulls/{pr_number}/reviews",
+             "--paginate", "--jq", ".[]"],
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                try:
+                    obj = json.loads(line)
+                    if obj.get("body", "").strip() or obj.get("state") == "CHANGES_REQUESTED":
+                        comments.append({
+                            "id": obj.get("id"),
+                            "type": "review",
+                            "state": obj.get("state"),
+                            "author": (obj.get("user") or {}).get("login", ""),
+                            "body": obj.get("body", "").strip(),
+                            "submitted_at": obj.get("submitted_at", ""),
+                        })
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        logger.debug("Could not fetch reviews for PR #%d: %s", pr_number, e)
+
+    # Inline review comments
+    try:
+        result = gh_run(
+            ["api", f"repos/{repo}/pulls/{pr_number}/comments",
+             "--paginate", "--jq", ".[]"],
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                try:
+                    obj = json.loads(line)
+                    comments.append({
+                        "id": obj.get("id"),
+                        "type": "inline",
+                        "author": (obj.get("user") or {}).get("login", ""),
+                        "path": obj.get("path", ""),
+                        "line": obj.get("line") or obj.get("original_line"),
+                        "body": obj.get("body", "").strip(),
+                        "submitted_at": obj.get("created_at", ""),
+                    })
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        logger.debug("Could not fetch inline comments for PR #%d: %s", pr_number, e)
+
+    return comments
+
+
+def _build_moonlight_prompt(repo: str, pr_number: int, branch: str,
+                             worktree: Path, comments: list[dict]) -> str:
+    lines = [
+        f"You are fixing review comments on PR #{pr_number} in {repo}.",
+        f"Branch: {branch}",
+        f"Workspace: {worktree}",
+        "",
+        "## Review comments to address",
+        "",
+    ]
+    for c in comments:
+        author = c.get("author", "reviewer")
+        body = c.get("body", "").strip()
+        if not body:
+            continue
+        if c["type"] == "inline":
+            path = c.get("path", "")
+            line = c.get("line")
+            loc = f"{path}:{line}" if line else path
+            lines.append(f"**{author}** on `{loc}`:")
+        else:
+            state = c.get("state", "")
+            label = f" ({state})" if state and state != "COMMENTED" else ""
+            lines.append(f"**{author}**{label}:")
+        lines.append(f"> {body}")
+        lines.append("")
+
+    lines += [
+        "## Instructions",
+        "",
+        "1. Read each review comment above carefully.",
+        "2. Make the requested changes in the workspace.",
+        "3. Commit your changes with a message like `fix: address review comments`.",
+        "4. Do NOT push — the system will handle that.",
+        "5. When done, output a brief summary of what you changed.",
+    ]
+    return "\n".join(lines)
+
+
+def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
+    """If a hunter-created PR has unaddressed review comments, fix them."""
+    if not cfg.moonlight_enabled:
+        return
+
+    branch = pr.get("headRefName", "")
+    pr_number = pr["number"]
+    key = f"{repo}#{pr_number}"
+
+    # Only act on hunter-created branches
+    if not branch.startswith(cfg.branch_prefix):
+        return
+
+    entry = state.get(key, {})
+    turns_done = entry.get("moonlight_turns", 0)
+
+    if turns_done >= cfg.max_moonlight_turns:
+        return
+
+    # Fetch review comments
+    comments = _fetch_pr_review_comments(repo, pr_number)
+    if not comments:
+        return
+
+    # Only act on comments newer than our last fix
+    last_processed_id = entry.get("last_moonlight_review_id")
+    new_comments = [c for c in comments if c.get("id") != last_processed_id
+                    and c.get("id", 0) > (last_processed_id or 0)]
+    if not new_comments:
+        return
+
+    # Check there are actual review requests or bodies to address
+    actionable = [c for c in new_comments if c.get("body") or c.get("state") == "CHANGES_REQUESTED"]
+    if not actionable:
+        return
+
+    logger.info("Moonlight: %d new review comment(s) on %s — starting fix (turn %d/%d)",
+                len(actionable), key, turns_done + 1, cfg.max_moonlight_turns)
+
+    # Find existing worktree or create fresh one
+    worktree: Path | None = None
+    worktree_base = Path(cfg.worktree_base)
+    branch_slug = branch.replace("/", "-").replace("_", "-")
+    candidates = list(worktree_base.glob(f"*{branch_slug[:40]}*"))
+    if candidates:
+        worktree = candidates[0]
+        logger.debug("Moonlight: using existing worktree %s", worktree)
+    else:
+        try:
+            base_branch = gh_repo_default_branch(repo)
+            worktree = setup_new_branch_worktree(cfg, repo, branch, base_branch)
+            logger.debug("Moonlight: created fresh worktree %s", worktree)
+        except Exception as e:
+            logger.error("Moonlight: could not create worktree for %s: %s", key, e)
+            return
+
+    prompt = _build_moonlight_prompt(repo, pr_number, branch, worktree, actionable)
+
+    try:
+        _run_skill_prompt(cfg, prompt, worktree)
+    except Exception as e:
+        logger.error("Moonlight: skill failed for %s: %s", key, e)
+        return
+
+    # Push changes if any commits were made
+    try:
+        result = subprocess.run(
+            ["git", "log", "origin/" + branch + "..HEAD", "--oneline"],
+            cwd=str(worktree), capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            subprocess.run(
+                ["git", "push", "origin", branch],
+                cwd=str(worktree), check=True, capture_output=True,
+            )
+            logger.info("Moonlight: pushed fixes for %s", key)
+
+            # Post summary comment on PR
+            summary_comment = (
+                f"Addressed review comments (moonlight fix, turn {turns_done + 1}/{cfg.max_moonlight_turns})."
+            )
+            try:
+                gh_pr_comment(repo, pr_number, summary_comment)
+            except Exception as e:
+                logger.warning("Moonlight: could not post summary comment: %s", e)
+        else:
+            logger.info("Moonlight: skill ran but produced no commits for %s", key)
+    except Exception as e:
+        logger.error("Moonlight: push failed for %s: %s", key, e)
+        return
+
+    # Update state
+    latest_id = max((c.get("id", 0) for c in actionable), default=0)
+    update_pr_state(state, key,
+                    moonlight_turns=turns_done + 1,
+                    last_moonlight_review_id=latest_id)
+
+    if turns_done + 1 >= cfg.max_moonlight_turns:
+        exhausted_msg = (
+            f"I've applied fixes {cfg.max_moonlight_turns} time(s) in response to review comments. "
+            f"Please take another look and let me know if anything else needs changing."
+        )
+        try:
+            gh_pr_comment(repo, pr_number, exhausted_msg)
+        except Exception as e:
+            logger.warning("Moonlight: could not post exhaustion comment: %s", e)
+
+    log_decision("moonlight_fix", repo=repo, pr=pr_number, turn=turns_done + 1,
+                 comments=len(actionable))
+
 
 # ---------------------------------------------------------------------------
 # PR processing
@@ -2719,6 +2951,29 @@ def start(once: bool):
                     _current_pr_key[:] = [key]
                     process_pr(cfg, state, repo, pr)
                     _current_pr_key.clear()
+
+            # --- Moonlight pass — fix hunter PRs with review comments ---
+            if cfg.moonlight_enabled and not _stop.is_set():
+                state = load_state()
+                for repo in cfg.repos_for("predd"):
+                    if _stop.is_set():
+                        break
+                    try:
+                        prs = gh_list_open_prs(repo)
+                    except Exception as e:
+                        logger.warning("Moonlight: could not list PRs for %s: %s", repo, e)
+                        continue
+                    for pr in prs:
+                        if _stop.is_set():
+                            break
+                        if not pr.get("headRefName", "").startswith(cfg.branch_prefix):
+                            continue
+                        try:
+                            moonlight_fix_pr(cfg, state, repo, pr)
+                            state = load_state()
+                        except Exception as e:
+                            logger.error("Moonlight error on %s#%s: %s",
+                                         repo, pr.get("number"), e)
 
             # --- Sentinel post-CI pass ---
             if cfg.post_ci_review_enabled and not _stop.is_set():
