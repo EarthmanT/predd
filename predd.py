@@ -2002,29 +2002,56 @@ Rules:
         click.echo(f"✗ Error: {e}")
         return
 
-    # Write analysis report
+    # Parse JSON output and write specs to spec/changes/
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Strip markdown fencing if present
+    json_text = analysis_text.strip()
+    if json_text.startswith("```"):
+        json_text = "\n".join(json_text.split("\n")[1:])
+        if json_text.endswith("```"):
+            json_text = json_text[:-3].strip()
+
+    try:
+        result_data = json.loads(json_text)
+    except json.JSONDecodeError:
+        # Fall back: save raw analysis to obsidian dir
+        fallback = obsidian_dir / f"{today}-analysis.md"
+        fallback.write_text(analysis_text)
+        click.echo(f"✗ Could not parse structured output — raw analysis saved to {fallback}")
+        return
+
+    # Write analysis summary to obsidian dir for reference
     analysis_file = obsidian_dir / f"{today}-analysis.md"
-    analysis_file.write_text(f"""# Analysis Report: {today}
+    analysis_file.write_text(f"# Analysis: {today}\n\n{result_data.get('analysis', '')}\n\n---\nModel: {model} | Observations: {len(observations)} over {days} days\n")
+    click.echo(f"\n✓ Analysis summary written to {analysis_file}")
 
-{analysis_text}
+    # Write each spec to spec/changes/
+    specs = result_data.get("specs", [])
+    if not specs:
+        click.echo("✗ No improvement specs generated")
+        return
 
----
-Generated with model: {model}
-Based on {len(observations)} observations over {days} days
-""")
+    written = 0
+    for spec in specs:
+        filename = spec.get("filename", "").strip()
+        title = spec.get("title", "Untitled")
+        content = spec.get("content", "")
 
-    click.echo(f"\n✓ Analysis written to {analysis_file}")
+        if not filename or not content:
+            continue
 
-    # Parse and suggest spec creation
-    click.echo("\n" + "="*60)
-    click.echo("Analysis complete. Review the report to generate specs:")
-    click.echo(f"  cat {analysis_file}")
-    click.echo("\nTo create improvement specs from the analysis:")
-    click.echo("  1. Review the analysis report")
-    click.echo("  2. Create spec files in spec/changes/")
-    click.echo("  3. Hunter will pick them up and implement")
-    click.echo("="*60)
+        spec_file = spec_dir / filename
+        if spec_file.exists():
+            click.echo(f"  ⊘ {filename} already exists — skipping")
+            continue
+
+        spec_file.write_text(f"# {title}\n\n{content}\n")
+        click.echo(f"  ✓ spec/changes/{filename}")
+        log_decision("spec_generated", spec=filename, title=title, model=model)
+        written += 1
+
+    click.echo(f"\n✓ {written} spec(s) written to spec/changes/")
 
 
 @cli.command()
