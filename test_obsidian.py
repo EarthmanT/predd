@@ -66,8 +66,8 @@ class TestObsidianConfig:
         cfg_file = _write_config(tmp_path, MINIMAL_CONFIG)
         monkeypatch.setattr(ob._predd, "CONFIG_FILE", cfg_file)
         cfg = ob.load_config()
-        assert cfg.observe_interval == 3600
-        assert cfg.analyze_hour == 8
+        assert cfg.observe_interval == 600
+        assert cfg.analyze_hour == 9
         assert cfg.analyze_days == 7
         assert cfg.analyze_model == "claude-opus-4-7"
 
@@ -96,8 +96,8 @@ class TestObsidianConfig:
 
     def test_defaults_via_make_cfg(self, tmp_path):
         cfg = _make_cfg(tmp_path)
-        assert cfg.observe_interval == 3600
-        assert cfg.analyze_hour == 8
+        assert cfg.observe_interval == 600
+        assert cfg.analyze_hour == 9
         assert cfg.analyze_days == 7
         assert cfg.analyze_model == "claude-opus-4-7"
 
