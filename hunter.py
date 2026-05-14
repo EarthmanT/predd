@@ -960,6 +960,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                     )
                 gh_issue_comment(repo, issue_number, comment)
                 failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_ensure_label_exists(repo, failure_label, color="e11d48")
                 gh_issue_add_label(repo, issue_number, failure_label)
                 log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason=str(e)[:100])
             except Exception as comment_err:
@@ -975,6 +976,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                 )
                 gh_issue_comment(repo, issue_number, comment)
                 failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_ensure_label_exists(repo, failure_label, color="e11d48")
                 gh_issue_add_label(repo, issue_number, failure_label)
                 log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason="crash", error=str(e)[:100])
             except Exception as comment_err:
@@ -1162,7 +1164,9 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
                         error=str(e), worktree_path=worktree
                     )
                 gh_issue_comment(repo, issue_number, comment)
-                gh_issue_add_label(repo, issue_number, f"{cfg.github_user}:hunter-failed")
+                failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_ensure_label_exists(repo, failure_label, color="e11d48")
+                gh_issue_add_label(repo, issue_number, failure_label)
                 log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason=str(e)[:100])
             except Exception as comment_err:
                 logger.error("Failed to post failure comment for %s: %s", key, comment_err)
@@ -1176,7 +1180,9 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
                     error=str(e), worktree_path=worktree
                 )
                 gh_issue_comment(repo, issue_number, comment)
-                gh_issue_add_label(repo, issue_number, f"{cfg.github_user}:hunter-failed")
+                failure_label = f"{cfg.github_user}:hunter-failed"
+                gh_ensure_label_exists(repo, failure_label, color="e11d48")
+                gh_issue_add_label(repo, issue_number, failure_label)
                 log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason="crash", error=str(e)[:100])
             except Exception as comment_err:
                 logger.error("Failed to post failure comment for %s: %s", key, comment_err)
