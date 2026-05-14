@@ -6,7 +6,7 @@ Three daemons that run in the background and do your GitHub work:
 |--------|-------------|
 | **predd** | Polls GitHub for open PRs, reviews them via AI, posts inline comments automatically |
 | **hunter** | Picks up issues assigned to you, writes proposals, implements, self-reviews, closes on merge |
-| **obsidian** | (planned) Observes patterns in logs/feedback, generates improvement specs |
+| **obsidian** | Observes patterns in logs/feedback, generates improvement specs |
 
 ---
 
