@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -117,6 +118,14 @@ The worktree is preserved at:
 Please check the logs for details:
 tail -f ~/.config/predd/hunter-log.txt
 """
+
+class SpeckitSkipError(Exception):
+    """Raised by run_speckit_plan when required BPA-Specs artifacts are missing.
+
+    Distinct from RuntimeError so process_issue can suppress the generic crash
+    comment (run_speckit_plan already posted the user-facing comment and label).
+    """
+
 
 # ---------------------------------------------------------------------------
 # Hunter-local subprocess runner — tracks _active_proc_hunter for shutdown
@@ -365,8 +374,8 @@ _current_issue_key: list[str] = []
 
 
 def _cleanup_ephemeral_states(state: dict) -> int:
-    """Reset in_progress and implementing entries to failed. Returns count of entries reset."""
-    EPHEMERAL = {"in_progress", "implementing"}
+    """Reset in_progress/specifying and implementing entries to failed. Returns count reset."""
+    EPHEMERAL = {"in_progress", "specifying", "implementing"}
     changed = []
     for key, entry in state.items():
         if entry.get("status") in EPHEMERAL:
@@ -789,8 +798,14 @@ def try_claim_issue(cfg: Config, repo: str, issue_number: int) -> bool:
 
 
 def issue_slug(title: str, max_len: int = 30) -> str:
-    """Lowercase title, replace non-alphanumeric with hyphens, truncate."""
-    slug = title.lower()
+    """Lowercase title, replace non-alphanumeric with hyphens, truncate.
+
+    Strips a leading [JIRA-KEY] prefix (e.g. "[DAP09A-1] ") before slugifying
+    so the key does not appear twice when combined with issue_identifier().
+    """
+    # Strip leading [PROJECT-123] prefix before downcasing
+    stripped = re.sub(r"^\[[A-Z][A-Z0-9]+-\d+\]\s*", "", title)
+    slug = stripped.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
     slug = slug.strip("-")
     return slug[:max_len].rstrip("-")
@@ -880,6 +895,280 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Spec Kit (Phase I)
+# ---------------------------------------------------------------------------
+
+
+def _extract_epic_info(fields: dict) -> tuple[str, str]:
+    """Return (epic_key, epic_name) from a Jira API issue fields dict.
+
+    Tries customfield_10014 (Epic Link) first, then parent.key.
+    Epic name is sourced from customfield_10014_detail (present on many Jira Server
+    versions) or parent.fields.summary when the epic key comes from parent.
+    """
+    epic_key = fields.get("customfield_10014") or ""
+    if not epic_key:
+        parent = fields.get("parent") or {}
+        epic_key = parent.get("key", "")
+    if not epic_key:
+        return "", ""
+
+    # Try to get the epic name.
+    # Path 1: customfield_10014_detail (Jira Server often returns this alongside
+    #          customfield_10014 when you request the field).
+    detail = fields.get("customfield_10014_detail") or {}
+    if isinstance(detail, dict):
+        epic_name = detail.get("summary") or detail.get("displayName") or detail.get("name") or ""
+        if epic_name:
+            return epic_key, epic_name
+
+    # Path 2: parent.fields.summary (works when the epic is the direct parent,
+    #          i.e. the epic key came from parent.key, not customfield_10014).
+    parent = fields.get("parent") or {}
+    if parent.get("key") == epic_key:
+        epic_name = (parent.get("fields") or {}).get("summary", "")
+        return epic_key, epic_name
+
+    # Epic key known but name not available — slug resolution won't work;
+    # speckit_epic_map is the only resolution path.
+    logger.warning(
+        "speckit: epic key %r found but name unavailable "
+        "(customfield_10014_detail absent and parent.key mismatch); "
+        "add %r to speckit_epic_map to enable slug resolution",
+        epic_key, epic_key,
+    )
+    return epic_key, ""
+
+
+def spec_branch(cfg: Config, issue_id: str, title_slug: str) -> str:
+    """Branch name for speckit proposals: {branch_prefix}/{issue_id}-spec-{slug}."""
+    return f"{cfg.branch_prefix}/{issue_id}-spec-{title_slug}"
+
+
+def resolve_capability_folder(cfg: Config, epic_name: str, epic_key: str) -> "Path | None":
+    """Return the capability folder path for the given epic, or None if not found."""
+    if not cfg.capability_specs_path:
+        return None
+    # No epic at all — silently skip; no reason to log
+    if not epic_name and not epic_key:
+        return None
+    # Slug match on epic name
+    if epic_name:
+        slug = re.sub(r"[^a-z0-9]+", "-", epic_name.lower()).strip("-")
+        folder = cfg.capability_specs_path / slug
+        if folder.exists():
+            return folder
+        logger.info("speckit: slug %r not found in %s", slug, cfg.capability_specs_path)
+    # Map fallback via speckit_epic_map[epic_key]
+    if epic_key and epic_key in cfg.speckit_epic_map:
+        folder = cfg.capability_specs_path / cfg.speckit_epic_map[epic_key]
+        if folder.exists():
+            return folder
+    log_decision("speckit_no_capability", epic_name=epic_name, epic_key=epic_key)
+    logger.info("speckit: no capability folder for epic %r (%s) — legacy fallback",
+                epic_name, epic_key)
+    return None
+
+
+def read_bpa_specs_bundle(capability_dir: Path, story_id: str) -> dict:
+    """Read BPA-Specs artifacts for a story. Hard fails if required files missing."""
+    story_dir = capability_dir / "stories" / story_id
+    constitution = capability_dir / "constitution.md"
+    capability_spec = capability_dir / "spec.md"
+    story_spec = story_dir / "spec.md"
+    clarifications = capability_dir / "clarifications.md"
+
+    missing = []
+    if not constitution.exists():
+        missing.append("constitution.md")
+    if not capability_spec.exists():
+        missing.append("spec.md")
+    if not story_spec.exists():
+        missing.append(f"stories/{story_id}/spec.md")
+    if missing:
+        raise RuntimeError(
+            f"Missing required speckit artifacts in {capability_dir}: {', '.join(missing)}"
+        )
+
+    result = {
+        "constitution": constitution,
+        "capability_spec": capability_spec,
+        "story_spec": story_spec,
+        "clarifications": clarifications if clarifications.exists() else None,
+    }
+    if not clarifications.exists():
+        log_decision("speckit_no_clarifications",
+                     capability=str(capability_dir.name), story_id=story_id)
+        logger.info("speckit: no clarifications.md for %s — proceeding without",
+                    capability_dir.name)
+    return result
+
+
+def pin_capability_sha(cfg: Config) -> str:
+    """Return the HEAD SHA of the capability_specs_path repo.
+
+    Raises RuntimeError (not CalledProcessError) if the path is not a git repo,
+    so the error surfaces with a user-readable message rather than a raw traceback.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(cfg.capability_specs_path), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"capability_specs_path ({cfg.capability_specs_path}) is not a git repository "
+            f"or has no commits: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def copy_spec_refs(bundle: dict, worktree: Path) -> Path:
+    """Copy BPA-Specs bundle files into worktree/spec-refs/. Returns spec-refs path."""
+    spec_refs = worktree / "spec-refs"
+    spec_refs.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bundle["constitution"], spec_refs / "constitution.md")
+    shutil.copy2(bundle["capability_spec"], spec_refs / "capability-spec.md")
+    shutil.copy2(bundle["story_spec"], spec_refs / "story-spec.md")
+    if bundle.get("clarifications"):
+        shutil.copy2(bundle["clarifications"], spec_refs / "clarifications.md")
+    return spec_refs
+
+
+def load_speckit_prompt(cfg: Config, template_name: str, **kwargs) -> str:
+    """Read a speckit prompt template and render it with kwargs.
+
+    Uses str.format() with named placeholders — literal braces in templates must
+    be escaped as {{ and }} (standard Python format string rules).
+    """
+    template_path = cfg.speckit_prompt_dir / f"{template_name}.md"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Speckit prompt template not found: {template_path}")
+    text = template_path.read_text()
+    try:
+        return text.format(**kwargs)
+    except KeyError as e:
+        raise KeyError(
+            f"Speckit template {template_path.name!r} references placeholder {e} "
+            f"that was not supplied. Check the template for typos or unescaped braces."
+        ) from e
+
+
+def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
+                     issue_number: int, title: str, issue_body: str) -> bool:
+    """Run the speckit plan phase. Returns True if speckit ran, False to fall back to legacy."""
+    jira_key = entry.get("jira_key", "")
+    epic_name = entry.get("epic_name", "")
+    epic_key = entry.get("epic_key", "")
+
+    capability_dir = resolve_capability_folder(cfg, epic_name, epic_key)
+    if capability_dir is None:
+        return False
+
+    story_id = jira_key or str(issue_number)
+    repo = entry.get("repo", "")
+    try:
+        bundle = read_bpa_specs_bundle(capability_dir, story_id)
+    except RuntimeError as e:
+        missing_label = f"{cfg.github_user}:speckit-missing-spec"
+        log_decision("speckit_missing_spec", issue=issue_number, story_id=story_id,
+                     capability=str(capability_dir.name), reason=str(e))
+        logger.warning("speckit: missing required artifacts for %s — %s", story_id, e)
+        if repo:
+            try:
+                gh_ensure_label_exists(repo, missing_label, color="e11d48")
+                gh_issue_add_label(repo, issue_number, missing_label)
+                gh_issue_comment(repo, issue_number,
+                    f"⚠️ Spec Kit cannot process this story: {e}\n\n"
+                    "Add the missing artifacts to BPA-Specs, then remove the "
+                    f"`{missing_label}` label to retry.")
+            except Exception as label_err:
+                logger.warning("speckit: could not apply missing-spec label: %s", label_err)
+        # Raise SpeckitSkipError so process_issue suppresses the generic crash comment —
+        # the user-facing message was already posted above.
+        raise SpeckitSkipError(str(e)) from e
+    sha = pin_capability_sha(cfg)
+
+    spec_refs = copy_spec_refs(bundle, worktree)
+    commit_skill_output(worktree, f"speckit: copy spec-refs for issue #{issue_number}")
+
+    clarifications_path = (
+        str(spec_refs / "clarifications.md")
+        if bundle.get("clarifications") else "(not present)"
+    )
+    prompt = load_speckit_prompt(
+        cfg, template_name="plan",
+        issue_number=issue_number,
+        issue_title=title,
+        issue_body=issue_body or "(no description)",
+        constitution_path=str(spec_refs / "constitution.md"),
+        capability_spec_path=str(spec_refs / "capability-spec.md"),
+        story_spec_path=str(spec_refs / "story-spec.md"),
+        clarifications_path=clarifications_path,
+        spec_refs_dir=str(spec_refs),
+        capability_specs_sha=sha,
+        capability=str(capability_dir.name),
+        story_id=story_id,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, prefix="speckit-plan-"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(prompt)
+
+    context = build_issue_context(issue_number, title, issue_body, entry)
+    try:
+        run_skill(cfg, tmp_path, context, worktree)
+        if not (worktree / "plan.md").exists():
+            raise RuntimeError("speckit plan skill did not produce plan.md")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    log_decision("plan_completed", issue=issue_number, story_id=story_id,
+                 capability=str(capability_dir.name), sha=sha)
+    return True
+
+
+def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
+                          issue_number: int, title: str, issue_body: str) -> None:
+    """Run the speckit implement phase using spec-refs/ + plan.md from the merged proposal."""
+    spec_refs = worktree / "spec-refs"
+    plan_path = worktree / "plan.md"
+    tasks_file = worktree / "tasks.md"
+    tasks_path = str(tasks_file) if tasks_file.exists() else "(not present)"
+    clarifications_file = spec_refs / "clarifications.md"
+    clarifications_path = (
+        str(clarifications_file) if clarifications_file.exists() else "(not present)"
+    )
+
+    prompt = load_speckit_prompt(
+        cfg, template_name="implement",
+        issue_number=issue_number,
+        issue_title=title,
+        issue_body=issue_body or "(no description)",
+        spec_refs_dir=str(spec_refs),
+        constitution_path=str(spec_refs / "constitution.md"),
+        capability_spec_path=str(spec_refs / "capability-spec.md"),
+        story_spec_path=str(spec_refs / "story-spec.md"),
+        clarifications_path=clarifications_path,
+        plan_path=str(plan_path),
+        tasks_path=tasks_path,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, prefix="speckit-impl-"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(prompt)
+
+    context = build_issue_context(issue_number, title, issue_body, entry)
+    try:
+        run_skill(cfg, tmp_path, context, worktree)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Core processing functions
 # ---------------------------------------------------------------------------
 
@@ -888,7 +1177,10 @@ def _clean_hunter_labels(repo: str, issue_number: int, cfg) -> None:
     labels_to_remove = [
         f"{cfg.github_user}:in-progress",
         f"{cfg.github_user}:proposal-open",
+        f"{cfg.github_user}:spec-open",
         f"{cfg.github_user}:implementing",
+        f"{cfg.github_user}:awaiting-verification",
+        f"{cfg.github_user}:speckit-missing-spec",
         f"{cfg.github_user}:hunter-failed",
         "needs-jira-info",
     ]
@@ -913,8 +1205,11 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     # Jira conformance check (if Jira API is configured)
     jira_key = extract_jira_key(title)
     jira_frontmatter = ""
+    epic_key = ""
+    epic_name = ""
     if jira_key:
-        jira_frontmatter, missing_fields = _fetch_jira_frontmatter(cfg, jira_key)
+        jira_frontmatter, missing_fields, issue_data = _fetch_jira_frontmatter(cfg, jira_key)
+        epic_key, epic_name = _extract_epic_info(issue_data.get("fields") or {})
         if missing_fields and cfg.require_jira_conformance:
             needs_label = f"{cfg.github_user}:needs-jira-info"
             missing_lines = "\n".join(f"- No {f.lower()} assigned" if f != "Capability"
@@ -956,13 +1251,16 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         logger.error("Failed to get default branch for %s: %s", repo, e)
         return
 
-    branch = proposal_branch(cfg, issue_number, title)
-    _computed_worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
+    if cfg.speckit_enabled:
+        branch = spec_branch(cfg, issue_identifier(issue_number, title), issue_slug(title))
+    else:
+        branch = proposal_branch(cfg, issue_number, title)
+    worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
 
     issue_body = issue.get("body") or ""
 
     update_issue_state(state, key,
-                       status="in_progress",
+                       status="specifying" if cfg.speckit_enabled else "in_progress",
                        issue_number=issue_number,
                        repo=repo,
                        title=title,
@@ -970,8 +1268,11 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                        issue_author=issue.get("author", {}).get("login", ""),
                        base_branch=base_branch,
                        proposal_branch=branch,
-                       proposal_worktree=str(_computed_worktree),
+                       proposal_worktree=str(worktree),
                        jira_frontmatter=jira_frontmatter,
+                       jira_key=jira_key or "",
+                       epic_key=epic_key,
+                       epic_name=epic_name,
                        resume_attempts=0,
                        first_seen=_now_iso())
 
@@ -989,7 +1290,12 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             state.get(key, {}).get("issue_body", ""),
             state.get(key, {}),
         )
-        run_skill(cfg, cfg.proposal_skill_path, context, worktree)
+        used_speckit = cfg.speckit_enabled and run_speckit_plan(
+            cfg, state.get(key, {}), worktree, issue_number, title, issue_body,
+        )
+        if not used_speckit:
+            run_skill(cfg, cfg.proposal_skill_path, context, worktree)
+        update_issue_state(state, key, used_speckit=used_speckit)
         commit_skill_output(worktree, f"proposal: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
@@ -1011,13 +1317,13 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         )
 
         in_progress_label = f"{cfg.github_user}:in-progress"
-        proposal_label = f"{cfg.github_user}:proposal-open"
-        gh_ensure_label_exists(repo, proposal_label)
-        gh_issue_add_label(repo, issue_number, proposal_label)
+        open_label = f"{cfg.github_user}:{'spec-open' if used_speckit else 'proposal-open'}"
+        gh_ensure_label_exists(repo, open_label)
+        gh_issue_add_label(repo, issue_number, open_label)
         gh_issue_remove_label(repo, issue_number, in_progress_label)
 
         update_issue_state(state, key,
-                           status="proposal_open",
+                           status="spec_open" if used_speckit else "proposal_open",
                            proposal_pr=pr_number,
                            proposal_branch=branch,
                            proposal_worktree=str(worktree))
@@ -1025,6 +1331,11 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         log_decision("proposal_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Proposal PR #%d created for issue %s", pr_number, key)
 
+    except SpeckitSkipError as e:
+        # Comment already posted by run_speckit_plan — don't post a second one.
+        logger.warning("Skipping issue %s — speckit artifacts missing: %s", key, e)
+        log_decision("speckit_skip", repo=repo, issue=issue_number, reason=str(e))
+        update_issue_state(state, key, status="failed")
     except RuntimeError as e:
         # Specific errors like "no commits" should be commented
         logger.error("Failed processing issue %s: %s", key, e, exc_info=True)
@@ -1230,7 +1541,11 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             entry.get("issue_body", ""),
             entry,
         )
-        run_skill(cfg, cfg.impl_skill_path, context, worktree)
+        if entry.get("used_speckit"):
+            run_speckit_implement(cfg, entry, worktree, issue_number, title,
+                                  entry.get("issue_body", ""))
+        else:
+            run_skill(cfg, cfg.impl_skill_path, context, worktree)
         commit_skill_output(worktree, f"impl: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
@@ -1580,24 +1895,24 @@ def _check_jira_conformance(issue_data: dict) -> list[str]:
     return missing
 
 
-def _fetch_jira_frontmatter(cfg: "Config", jira_key: str) -> tuple[str, list[str]]:
-    """Fetch Jira issue and build frontmatter. Returns (frontmatter, missing_fields).
+def _fetch_jira_frontmatter(cfg: "Config", jira_key: str) -> tuple[str, list[str], dict]:
+    """Fetch Jira issue and build frontmatter. Returns (frontmatter, missing_fields, issue_data).
 
-    Returns ("", []) if Jira API is not configured or unavailable.
+    Returns ("", [], {}) if Jira API is not configured or unavailable.
     """
     token = os.environ.get("JIRA_API_TOKEN")
     if not token or not cfg.jira_api_enabled:
-        return "", []
+        return "", [], {}
 
     try:
         client = JiraClient(cfg.jira_base_url, token)
         issue_data = client.get_issue(jira_key)
         missing = _check_jira_conformance(issue_data)
         frontmatter = _build_jira_frontmatter(issue_data, cfg.jira_base_url)
-        return frontmatter, missing
+        return frontmatter, missing, issue_data
     except Exception as e:
         logger.warning("Could not fetch Jira data for %s: %s", jira_key, e)
-        return "", []
+        return "", [], {}
 
 
 EPIC_COLUMNS = (
@@ -2100,22 +2415,24 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
         repo = entry.get("repo", "")
         issue_number = entry.get("issue_number")
 
-        if status == "in_progress":
+        if status in ("in_progress", "specifying"):
             # Was mid-proposal-creation — check if worktree has commits
             wt = entry.get("proposal_worktree")
             if wt and Path(wt).exists():
                 base = entry.get("base_branch", "main")
                 if worktree_has_commits_since(Path(wt), base):
-                    logger.info("Resuming %s from in_progress — worktree has commits, checking for existing PR", key)
+                    logger.info("Resuming %s from %s — worktree has commits, checking for existing PR", key, status)
                     # Check if a PR already exists with our marker
                     marker = f"hunter:issue-{issue_number}"
                     try:
                         prs = gh_list_prs_with_marker(repo, marker)
                         if prs:
                             pr_number = prs[0]["number"]
-                            logger.info("Found existing proposal PR #%d for %s — advancing to proposal_open", pr_number, key)
+                            resume_status = "spec_open" if entry.get("used_speckit") else "proposal_open"
+                            logger.info("Found existing proposal PR #%d for %s — advancing to %s",
+                                        pr_number, key, resume_status)
                             update_issue_state(state, key,
-                                               status="proposal_open",
+                                               status=resume_status,
                                                proposal_pr=pr_number,
                                                resume_attempts=resume_attempts + 1)
                         else:
@@ -2124,15 +2441,15 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
                     except Exception as e:
                         logger.warning("Could not check PRs for %s: %s", key, e)
                 else:
-                    rollback_issue(cfg, state, key, "worktree exists but has no commits")
+                    rollback_issue(cfg, state, key, f"{status} with no commits in worktree")
             else:
-                rollback_issue(cfg, state, key, "in_progress with no worktree")
+                rollback_issue(cfg, state, key, f"{status} with no worktree")
 
-        elif status == "proposal_open":
+        elif status in ("proposal_open", "spec_open"):
             # Check proposal PR still exists
             proposal_pr = entry.get("proposal_pr")
             if not proposal_pr:
-                rollback_issue(cfg, state, key, "proposal_open with no proposal_pr")
+                rollback_issue(cfg, state, key, f"{status} with no proposal_pr")
             # Otherwise fine — poll loop will check merge status
 
         elif status in ("implementing", "self_reviewing"):
@@ -2174,10 +2491,11 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
                     except Exception as e:
                         logger.warning("Could not check impl PRs for %s: %s", key, e)
                 else:
-                    # Roll back to proposal_open so we re-run impl from scratch
-                    logger.warning("Resetting %s to proposal_open — impl worktree missing", key)
+                    # Roll back so we re-run impl from scratch
+                    reset_status = "spec_open" if entry.get("used_speckit") else "proposal_open"
+                    logger.warning("Resetting %s to %s — impl worktree missing", key, reset_status)
                     update_issue_state(state, key,
-                                       status="proposal_open",
+                                       status=reset_status,
                                        impl_pr=None,
                                        impl_worktree=None,
                                        resume_attempts=resume_attempts + 1)
@@ -2201,6 +2519,7 @@ def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
     labels_to_check = [
         f"{cfg.github_user}:in-progress",
         f"{cfg.github_user}:proposal-open",
+        f"{cfg.github_user}:spec-open",
         f"{cfg.github_user}:implementing",
     ]
     for repo in repos:
@@ -2480,7 +2799,7 @@ def start(once: bool):
 
                     _current_issue_key[:] = [key]
                     try:
-                        if status == "proposal_open":
+                        if status in ("proposal_open", "spec_open"):
                             check_proposal_merged(cfg, state, repo, key, entry)
                         elif status in ("implementing", "self_reviewing"):
                             # After proposal merges, check if impl PR is ready

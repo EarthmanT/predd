@@ -350,6 +350,19 @@ class TestIssueSlug:
         slug = h.issue_slug("A very long title that should be truncated", max_len=10)
         assert len(slug) <= 10
 
+    def test_jira_prefix_stripped(self):
+        slug = h.issue_slug("[DAP09A-1234] Add foo feature")
+        assert slug == "add-foo-feature"
+        assert "dap09a" not in slug
+
+    def test_jira_prefix_stripped_multi_char_project(self):
+        slug = h.issue_slug("[BPA-42] Fix the thing")
+        assert slug == "fix-the-thing"
+
+    def test_no_jira_prefix_unchanged(self):
+        slug = h.issue_slug("Fix the bug")
+        assert slug == "fix-the-bug"
+
 
 # ---------------------------------------------------------------------------
 # TestBranchNames
@@ -2793,6 +2806,14 @@ class TestBranchNamingJiraKey:
         branch = h.impl_branch(cfg, 377, "Fix thing")
         assert "377-impl-" in branch
 
+    def test_jira_key_not_duplicated_in_slug_portion(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        branch = h.proposal_branch(cfg, 377, "[DAP09A-1900] Add foo")
+        # Key appears once as the identifier, not again inside the slug
+        assert "DAP09A-1900-proposal-" in branch
+        slug_part = branch.split("-proposal-", 1)[1]
+        assert "dap09a" not in slug_part
+
 
 class TestJiraClient:
     """Tests for JiraClient REST API client."""
@@ -3345,7 +3366,7 @@ class TestJiraFrontmatter:
 
         missing_fields = ["Sprint", "Capability"]
 
-        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", missing_fields)), \
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", missing_fields, {})), \
              patch.object(h, "label_jira_issue"), \
              patch.object(h, "gh_ensure_label_exists"), \
              patch.object(h, "gh_issue_add_label"), \
@@ -3380,7 +3401,7 @@ class TestJiraFrontmatter:
 
         frontmatter = "| Field | Value |\n|-------|-------|\n| Jira | [DAP09A-1184](...) |\n\n---\n\n"
 
-        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [])), \
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [], {})), \
              patch.object(h, "label_jira_issue"), \
              patch.object(h, "try_claim_issue", return_value=True), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
@@ -3417,7 +3438,7 @@ class TestJiraFrontmatter:
         }
 
         # Non-empty missing but require_jira_conformance=False => should continue
-        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", ["Sprint"])), \
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=("", ["Sprint"], {})), \
              patch.object(h, "label_jira_issue"), \
              patch.object(h, "try_claim_issue", return_value=True), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
@@ -3497,7 +3518,7 @@ class TestJiraFrontmatter:
             pr_body_captured.append(kwargs.get("body", ""))
             return 99
 
-        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [])), \
+        with patch.object(h, "_fetch_jira_frontmatter", return_value=(frontmatter, [], {})), \
              patch.object(h, "label_jira_issue"), \
              patch.object(h, "try_claim_issue", return_value=True), \
              patch.object(h, "gh_repo_default_branch", return_value="main"), \
@@ -3916,3 +3937,739 @@ class TestIngestJiraApiSubtasks:
         mock_link.assert_not_called()
         skip_calls = [c for c in mock_log.call_args_list if c.args[0] == "api_subtask_skip_no_parent"]
         assert len(skip_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestSpeckitPhaseI — acceptance criteria 1-7
+# ---------------------------------------------------------------------------
+
+
+def _make_speckit_cfg(tmp_path: Path, capability_specs_path: Path | None = None,
+                      epic_map: dict | None = None) -> h.Config:
+    """Build a Config with speckit_enabled=True and a prompt dir."""
+    prompt_dir = tmp_path / "prompts" / "speckit"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    # Write minimal prompt templates
+    (prompt_dir / "plan.md").write_text(
+        "plan for {issue_number} {issue_title} {issue_body} "
+        "{constitution_path} {capability_spec_path} {story_spec_path} "
+        "{clarifications_path} {spec_refs_dir} {capability_specs_sha} "
+        "{capability} {story_id}"
+    )
+    (prompt_dir / "implement.md").write_text(
+        "implement for {issue_number} {issue_title} {issue_body} "
+        "{spec_refs_dir} {constitution_path} {capability_spec_path} "
+        "{story_spec_path} {clarifications_path} {plan_path} {tasks_path}"
+    )
+    data = {
+        "repos": ["owner/repo"],
+        "worktree_base": str(tmp_path / "worktrees"),
+        "github_user": "testuser",
+        "backend": "claude",
+        "model": "claude-opus-4-7",
+        "skill_path": str(tmp_path / "review-skill.md"),
+        "proposal_skill_path": str(tmp_path / "proposal-skill.md"),
+        "impl_skill_path": str(tmp_path / "impl-skill.md"),
+        "speckit_enabled": True,
+        "speckit_prompt_dir": str(prompt_dir),
+    }
+    if capability_specs_path:
+        data["capability_specs_path"] = str(capability_specs_path)
+    if epic_map:
+        data["speckit_epic_map"] = epic_map
+    return h.Config(data)
+
+
+def _make_capability_dir(base: Path, slug: str, story_id: str,
+                         with_clarifications: bool = False) -> Path:
+    """Create a minimal BPA-Specs capability folder structure."""
+    cap_dir = base / slug
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    (cap_dir / "constitution.md").write_text("# Constitution")
+    (cap_dir / "spec.md").write_text("# Capability spec")
+    story_dir = cap_dir / "stories" / story_id
+    story_dir.mkdir(parents=True, exist_ok=True)
+    (story_dir / "spec.md").write_text("# Story spec")
+    if with_clarifications:
+        (cap_dir / "clarifications.md").write_text("# Clarifications")
+    return cap_dir
+
+
+class TestSpeckitConfig:
+    """Config fields are loaded with correct defaults."""
+
+    def test_speckit_disabled_by_default(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert cfg.speckit_enabled is False
+
+    def test_speckit_fields_loaded(self, tmp_path):
+        specs_path = tmp_path / "bpa-specs"
+        specs_path.mkdir()
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "speckit_enabled": True,
+            "speckit_prompt_dir": str(tmp_path / "prompts"),
+            "capability_specs_path": str(specs_path),
+            "speckit_epic_map": {"EP-1": "my-capability"},
+        }
+        cfg = h.Config(data)
+        assert cfg.speckit_enabled is True
+        assert cfg.capability_specs_path == specs_path
+        assert cfg.speckit_epic_map == {"EP-1": "my-capability"}
+
+    def test_capability_specs_path_none_when_absent(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert cfg.capability_specs_path is None
+
+    def test_speckit_skip_clarify_defaults_false(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert cfg.speckit_skip_clarify is False
+
+    def test_speckit_run_analyze_defaults_false(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert cfg.speckit_run_analyze is False
+
+    def test_speckit_phase_flags_loaded(self, tmp_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "speckit_skip_clarify": True,
+            "speckit_run_analyze": True,
+        }
+        cfg = h.Config(data)
+        assert cfg.speckit_skip_clarify is True
+        assert cfg.speckit_run_analyze is True
+
+
+class TestResolveCapabilityFolder:
+    """resolve_capability_folder — slug match, map fallback, no epic, no config."""
+
+    def test_slug_match(self, tmp_path):
+        specs = tmp_path / "specs"
+        cap = specs / "my-capability"
+        cap.mkdir(parents=True)
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+
+        result = h.resolve_capability_folder(cfg, "My Capability", "EP-1")
+        assert result == cap
+
+    def test_map_fallback(self, tmp_path):
+        specs = tmp_path / "specs"
+        cap = specs / "mapped-cap"
+        cap.mkdir(parents=True)
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs,
+                                epic_map={"EP-99": "mapped-cap"})
+
+        # Epic name doesn't match any folder slug
+        result = h.resolve_capability_folder(cfg, "Unknown Epic Name", "EP-99")
+        assert result == cap
+
+    def test_no_epic_returns_none_without_logging(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+
+        with patch.object(h, "log_decision") as mock_log:
+            result = h.resolve_capability_folder(cfg, "", "")
+        assert result is None
+        mock_log.assert_not_called()  # No noisy log for issues that simply have no epic
+
+    def test_no_config_returns_none(self, tmp_path):
+        cfg = _make_cfg(tmp_path)  # capability_specs_path not set
+        result = h.resolve_capability_folder(cfg, "Some Epic", "EP-1")
+        assert result is None
+
+    def test_slug_no_folder_then_no_map_returns_none(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+
+        with patch.object(h, "log_decision"):
+            result = h.resolve_capability_folder(cfg, "Nonexistent Epic", "")
+        assert result is None
+
+
+class TestReadBpaSpecsBundle:
+    """read_bpa_specs_bundle — happy path, hard fail, soft warn."""
+
+    def test_happy_path_with_clarifications(self, tmp_path):
+        cap_dir = _make_capability_dir(tmp_path, "my-cap", "DAP09A-1234",
+                                       with_clarifications=True)
+        bundle = h.read_bpa_specs_bundle(cap_dir, "DAP09A-1234")
+
+        assert bundle["constitution"] == cap_dir / "constitution.md"
+        assert bundle["capability_spec"] == cap_dir / "spec.md"
+        assert bundle["story_spec"] == cap_dir / "stories" / "DAP09A-1234" / "spec.md"
+        assert bundle["clarifications"] == cap_dir / "clarifications.md"
+
+    def test_happy_path_no_clarifications(self, tmp_path):
+        cap_dir = _make_capability_dir(tmp_path, "my-cap", "DAP09A-5678")
+        with patch.object(h, "log_decision") as mock_log:
+            bundle = h.read_bpa_specs_bundle(cap_dir, "DAP09A-5678")
+
+        assert bundle["clarifications"] is None
+        mock_log.assert_called_once_with(
+            "speckit_no_clarifications", capability="my-cap", story_id="DAP09A-5678"
+        )
+
+    def test_missing_story_spec_raises(self, tmp_path):
+        cap_dir = tmp_path / "cap"
+        cap_dir.mkdir()
+        (cap_dir / "constitution.md").write_text("x")
+        (cap_dir / "spec.md").write_text("x")
+        # story dir absent
+
+        with pytest.raises(RuntimeError, match="stories/DAP09A-999/spec.md"):
+            h.read_bpa_specs_bundle(cap_dir, "DAP09A-999")
+
+    def test_missing_constitution_raises(self, tmp_path):
+        cap_dir = tmp_path / "cap"
+        cap_dir.mkdir()
+        (cap_dir / "spec.md").write_text("x")
+        story_dir = cap_dir / "stories" / "DAP09A-1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "spec.md").write_text("x")
+
+        with pytest.raises(RuntimeError, match="constitution.md"):
+            h.read_bpa_specs_bundle(cap_dir, "DAP09A-1")
+
+
+class TestSpecBranch:
+    def test_format(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert h.spec_branch(cfg, "DAP09A-1234", "my-feature") == \
+            "usr/at/DAP09A-1234-spec-my-feature"
+
+    def test_custom_prefix(self, tmp_path):
+        cfg = _make_cfg(tmp_path, branch_prefix="feat")
+        assert h.spec_branch(cfg, "123", "fix-bug") == "feat/123-spec-fix-bug"
+
+
+class TestLoadSpeckitPrompt:
+    def test_renders_placeholders(self, tmp_path):
+        prompt_dir = tmp_path / "prompts"
+        prompt_dir.mkdir()
+        (prompt_dir / "plan.md").write_text(
+            "Issue {issue_number}: {issue_title}\nBody: {issue_body}"
+        )
+        cfg = _make_cfg(tmp_path)
+        cfg.speckit_prompt_dir = prompt_dir
+
+        result = h.load_speckit_prompt(
+            cfg, template_name="plan",
+            issue_number=42, issue_title="My Story", issue_body="details",
+        )
+        assert result == "Issue 42: My Story\nBody: details"
+
+    def test_missing_template_raises(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        cfg.speckit_prompt_dir = tmp_path / "nonexistent"
+
+        with pytest.raises(FileNotFoundError):
+            h.load_speckit_prompt(cfg, template_name="plan", issue_number=1)
+
+    def test_unknown_placeholder_raises_key_error(self, tmp_path):
+        prompt_dir = tmp_path / "prompts"
+        prompt_dir.mkdir()
+        (prompt_dir / "plan.md").write_text("Hello {unknown_key}")
+        cfg = _make_cfg(tmp_path)
+        cfg.speckit_prompt_dir = prompt_dir
+
+        with pytest.raises(KeyError, match="unknown_key"):
+            h.load_speckit_prompt(cfg, template_name="plan")
+
+
+class TestRunSpeckitPlan:
+    """run_speckit_plan — returns True/False, calls correct helpers."""
+
+    def test_returns_false_when_no_capability(self, tmp_path):
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        entry = {"jira_key": "DAP09A-1", "epic_name": "", "epic_key": ""}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "resolve_capability_folder", return_value=None) as mock_resolve, \
+             patch.object(h, "log_decision"):
+            result = h.run_speckit_plan(cfg, entry, worktree, 1, "title", "body")
+
+        assert result is False
+        mock_resolve.assert_called_once()
+
+    def test_returns_true_on_success(self, tmp_path):
+        specs = tmp_path / "specs"
+        cap_dir = _make_capability_dir(specs, "my-cap", "DAP09A-99")
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        entry = {"jira_key": "DAP09A-99", "epic_name": "my cap", "epic_key": ""}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # Create plan.md so the existence check passes
+        (worktree / "plan.md").write_text("# plan")
+
+        with patch.object(h, "pin_capability_sha", return_value="abc123"), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "run_skill"), \
+             patch.object(h, "log_decision"):
+            result = h.run_speckit_plan(cfg, entry, worktree, 99, "title", "body")
+
+        assert result is True
+
+    def test_raises_when_plan_md_missing(self, tmp_path):
+        specs = tmp_path / "specs"
+        cap_dir = _make_capability_dir(specs, "my-cap", "DAP09A-77")
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        entry = {"jira_key": "DAP09A-77", "epic_name": "my cap", "epic_key": ""}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # plan.md NOT created — run_skill is a no-op
+
+        with patch.object(h, "pin_capability_sha", return_value="sha"), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "run_skill"), \
+             patch.object(h, "log_decision"), \
+             pytest.raises(RuntimeError, match="plan.md"):
+            h.run_speckit_plan(cfg, entry, worktree, 77, "title", "body")
+
+    def test_hard_fail_raises_speckit_skip_error(self, tmp_path):
+        """Missing artifacts → SpeckitSkipError (not generic RuntimeError)."""
+        specs = tmp_path / "specs"
+        cap_dir = specs / "my-cap"
+        cap_dir.mkdir(parents=True)
+        (cap_dir / "constitution.md").write_text("x")
+        (cap_dir / "spec.md").write_text("x")
+        # story dir missing
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        entry = {"jira_key": "DAP09A-5", "epic_name": "my cap", "epic_key": "", "repo": "owner/repo"}
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "log_decision"), \
+             patch.object(h, "gh_ensure_label_exists") as mock_ensure, \
+             patch.object(h, "gh_issue_add_label") as mock_add, \
+             patch.object(h, "gh_issue_comment") as mock_comment, \
+             pytest.raises(h.SpeckitSkipError):
+            h.run_speckit_plan(cfg, entry, worktree, 5, "title", "body")
+
+        # Label and comment must have been applied before the raise
+        mock_ensure.assert_called_once_with("owner/repo", "testuser:speckit-missing-spec", color="e11d48")
+        mock_add.assert_called_once_with("owner/repo", 5, "testuser:speckit-missing-spec")
+        mock_comment.assert_called_once()
+        assert "speckit-missing-spec" in mock_comment.call_args[0][2]
+
+
+class TestProcessIssueFork:
+    """process_issue forks to speckit or legacy based on cfg.speckit_enabled."""
+
+    def _minimal_issue(self, number=10):
+        return {
+            "number": number,
+            "title": f"[DAP09A-{number}] Test issue",
+            "author": {"login": "someone"},
+            "labels": [],
+            "body": "body text",
+        }
+
+    def test_speckit_disabled_uses_legacy(self, tmp_path):
+        """speckit_enabled=False → run_skill called with proposal_skill_path."""
+        cfg = _make_cfg(tmp_path)
+        cfg.speckit_enabled = False
+        state = {}
+        issue = self._minimal_issue()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "run_skill") as mock_run_skill, \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=5), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        # run_skill called with proposal_skill_path
+        mock_run_skill.assert_called_once()
+        args = mock_run_skill.call_args[0]
+        assert args[1] == cfg.proposal_skill_path
+        key = "owner/repo!10"
+        assert state.get(key, {}).get("status") == "proposal_open"
+
+    def test_speckit_enabled_uses_speckit_plan(self, tmp_path):
+        """speckit_enabled=True → run_speckit_plan called; specifying/spec_open states used."""
+        specs = tmp_path / "specs"
+        _make_capability_dir(specs, "my-cap", "DAP09A-10")
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        state = {}
+        issue = self._minimal_issue()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "extract_jira_key", return_value="DAP09A-10"), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "_fetch_jira_frontmatter", return_value=("", [], {})), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "run_speckit_plan", return_value=True) as mock_speckit, \
+             patch.object(h, "run_skill") as mock_legacy, \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=7), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        mock_speckit.assert_called_once()
+        mock_legacy.assert_not_called()
+        key = "owner/repo!10"
+        assert state.get(key, {}).get("used_speckit") is True
+        # Speckit issues must use spec_open, not proposal_open
+        assert state.get(key, {}).get("status") == "spec_open"
+
+    def test_speckit_enabled_initial_status_is_specifying(self, tmp_path):
+        """speckit_enabled=True → initial status is 'specifying' (not 'in_progress')."""
+        cfg = _make_speckit_cfg(tmp_path)
+        state = {}
+        issue = self._minimal_issue()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured_statuses = []
+
+        def fake_save(s):
+            for v in s.values():
+                if v.get("status"):
+                    captured_statuses.append(v["status"])
+
+        with patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "run_speckit_plan", return_value=True), \
+             patch.object(h, "run_skill"), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=7), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state", side_effect=fake_save):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        assert "specifying" in captured_statuses, \
+            f"Expected 'specifying' to be written; got: {captured_statuses}"
+
+    def test_speckit_missing_spec_no_double_comment(self, tmp_path):
+        """SpeckitSkipError → no crash comment posted; state set to failed."""
+        cfg = _make_speckit_cfg(tmp_path)
+        state = {}
+        issue = self._minimal_issue()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "run_speckit_plan",
+                          side_effect=h.SpeckitSkipError("missing story spec")), \
+             patch.object(h, "gh_issue_comment") as mock_comment, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        mock_comment.assert_not_called()
+        key = "owner/repo!10"
+        assert state.get(key, {}).get("status") == "failed"
+
+    def test_speckit_enabled_no_capability_falls_back(self, tmp_path):
+        """speckit_enabled=True but no capability → legacy proposal_skill_path used."""
+        specs = tmp_path / "specs"
+        specs.mkdir()
+        cfg = _make_speckit_cfg(tmp_path, capability_specs_path=specs)
+        state = {}
+        issue = self._minimal_issue()
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "label_jira_issue"), \
+             patch.object(h, "try_claim_issue", return_value=True), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "notify_sound"), \
+             patch.object(h, "notify_toast"), \
+             patch.object(h, "run_speckit_plan", return_value=False) as mock_speckit, \
+             patch.object(h, "run_skill") as mock_legacy, \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=8), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.process_issue(cfg, state, "owner/repo", issue)
+
+        mock_legacy.assert_called_once()
+        args = mock_legacy.call_args[0]
+        assert args[1] == cfg.proposal_skill_path
+        key = "owner/repo!10"
+        assert state.get(key, {}).get("used_speckit") is False
+
+
+class TestCheckProposalMergedFork:
+    """check_proposal_merged forks to speckit implement or legacy based on used_speckit."""
+
+    def _entry(self, used_speckit: bool):
+        return {
+            "issue_number": 42,
+            "title": "[DAP09A-42] Test",
+            "issue_body": "body",
+            "proposal_pr": 10,
+            "jira_key": "DAP09A-42",
+            "used_speckit": used_speckit,
+        }
+
+    def test_used_speckit_true_calls_run_speckit_implement(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_speckit_cfg(tmp_path)
+        state = {"owner/repo!42": self._entry(True)}
+        entry = self._entry(True)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "collect_pr_feedback"), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "gh_find_merged_proposal", return_value=10), \
+             patch.object(h, "_find_impl_pr", return_value=None), \
+             patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_speckit_implement") as mock_impl, \
+             patch.object(h, "run_skill") as mock_legacy, \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=20), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!42", entry)
+
+        mock_impl.assert_called_once()
+        mock_legacy.assert_not_called()
+
+    def test_used_speckit_false_calls_run_skill(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        state = {"owner/repo!42": self._entry(False)}
+        entry = self._entry(False)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "collect_pr_feedback"), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "gh_find_merged_proposal", return_value=10), \
+             patch.object(h, "_find_impl_pr", return_value=None), \
+             patch.object(h, "extract_jira_key", return_value=None), \
+             patch.object(h, "gh_repo_default_branch", return_value="main"), \
+             patch.object(h, "setup_new_branch_worktree", return_value=worktree), \
+             patch.object(h, "run_speckit_implement") as mock_impl, \
+             patch.object(h, "run_skill") as mock_legacy, \
+             patch.object(h, "commit_skill_output", return_value=True), \
+             patch.object(h, "skill_has_commits", return_value=True), \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_create_branch_and_pr", return_value=20), \
+             patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!42", entry)
+
+        mock_impl.assert_not_called()
+        mock_legacy.assert_called_once()
+        args = mock_legacy.call_args[0]
+        assert args[1] == cfg.impl_skill_path
+
+
+# ---------------------------------------------------------------------------
+# TestRunSpeckitImplement
+# ---------------------------------------------------------------------------
+
+class TestRunSpeckitImplement:
+    """Tests for run_speckit_implement directly (N7)."""
+
+    def _make_entry(self):
+        return {
+            "issue_number": 7,
+            "repo": "owner/repo",
+            "title": "My story",
+            "jira_key": "PROJ-7",
+            "epic_key": "EPIC-1",
+            "epic_name": "My Epic",
+            "status": "implementing",
+        }
+
+    def test_calls_run_skill_with_tmp_file(self, tmp_path):
+        """run_skill is called; tmp file is cleaned up afterward."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "plan.md").write_text("# Plan")
+        (worktree / "tasks.md").write_text("# Tasks")
+
+        captured_paths = []
+
+        def fake_run_skill(c, skill_path, context, wt):
+            captured_paths.append(Path(skill_path))
+            # Confirm the tmp file still exists during the call
+            assert Path(skill_path).exists(), "tmp skill file should exist during run_skill"
+
+        with patch.object(h, "load_speckit_prompt", return_value="implement prompt") as mock_load, \
+             patch.object(h, "build_issue_context", return_value="ctx") as mock_ctx, \
+             patch.object(h, "run_skill", side_effect=fake_run_skill):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        mock_load.assert_called_once()
+        call_kwargs = mock_load.call_args
+        assert call_kwargs[1]["template_name"] == "implement"
+        mock_ctx.assert_called_once()
+        # Tmp file cleaned up after call
+        assert len(captured_paths) == 1
+        assert not captured_paths[0].exists(), "tmp skill file should be deleted after run_skill"
+
+    def test_clarifications_absent_uses_placeholder(self, tmp_path):
+        """When clarifications.md absent, path passed to template is '(not present)'."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        (worktree / "spec-refs").mkdir(parents=True)
+        worktree.mkdir(exist_ok=True)
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["clarifications_path"] == "(not present)"
+
+    def test_clarifications_present_uses_real_path(self, tmp_path):
+        """When clarifications.md exists, path passed to template is the actual path."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        spec_refs = worktree / "spec-refs"
+        spec_refs.mkdir(parents=True)
+        clarif = spec_refs / "clarifications.md"
+        clarif.write_text("Q: ...")
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["clarifications_path"] == str(clarif)
+
+    def test_tmp_file_cleaned_up_on_run_skill_error(self, tmp_path):
+        """Tmp file is deleted even if run_skill raises."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+
+        captured_path = []
+
+        def exploding_run_skill(c, skill_path, context, wt):
+            captured_path.append(Path(skill_path))
+            raise RuntimeError("boom")
+
+        with patch.object(h, "load_speckit_prompt", return_value="prompt"), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill", side_effect=exploding_run_skill):
+            with pytest.raises(RuntimeError, match="boom"):
+                h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert len(captured_path) == 1
+        assert not captured_path[0].exists(), "tmp file should be cleaned up even after error"
+
+    def test_tasks_absent_uses_placeholder(self, tmp_path):
+        """When tasks.md is absent, tasks_path passed to template is '(not present)'."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # No tasks.md created
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["tasks_path"] == "(not present)"
+
+    def test_tasks_present_uses_real_path(self, tmp_path):
+        """When tasks.md exists, tasks_path passed to template is the actual path."""
+        cfg = _make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        tasks = worktree / "tasks.md"
+        tasks.write_text("- [ ] Task 1")
+
+        received_kwargs = {}
+
+        def fake_load_prompt(c, *, template_name, **kwargs):
+            received_kwargs.update(kwargs)
+            return "prompt"
+
+        with patch.object(h, "load_speckit_prompt", side_effect=fake_load_prompt), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"):
+            h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
+
+        assert received_kwargs["tasks_path"] == str(tasks)

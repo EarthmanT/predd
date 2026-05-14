@@ -490,6 +490,17 @@ class Config:
         # Moonlight — respond to review comments on hunter-created PRs
         self.moonlight_enabled: bool = data.get("moonlight_enabled", True)
         self.max_moonlight_turns: int = data.get("max_moonlight_turns", 2)
+        # Spec Kit — hunter reads BPA-Specs artifacts, runs plan + implement
+        self.speckit_enabled: bool = data.get("speckit_enabled", False)
+        self.speckit_prompt_dir: Path = Path(data.get("speckit_prompt_dir",
+            str(Path(__file__).parent / "prompts" / "speckit"))).expanduser()
+        self.capability_specs_path: Path | None = (
+            Path(data["capability_specs_path"]).expanduser()
+            if "capability_specs_path" in data else None
+        )
+        self.speckit_epic_map: dict[str, str] = data.get("speckit_epic_map", {})
+        self.speckit_skip_clarify: bool = data.get("speckit_skip_clarify", False)
+        self.speckit_run_analyze: bool = data.get("speckit_run_analyze", False)
 
     @property
     def repos(self) -> list[str]:
