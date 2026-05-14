@@ -1179,7 +1179,7 @@ HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":aw
 
 def _parse_csv_row(row: dict) -> dict:
     """Normalise a CSV row to lowercase keys."""
-    return {k.lower().strip(): v.strip() for k, v in row.items()}
+    return {(k or "").lower().strip(): (v or "").strip() for k, v in row.items()}
 
 
 def _parse_capability(description: str) -> str | None:
