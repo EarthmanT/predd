@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
 PORT = 8081
+DEFAULT_REPO = "earthmant/predd-demo"  # overridden by --repo CLI arg
 
 # ---------------------------------------------------------------------------
 # Fake data
@@ -55,7 +56,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Story"},
             "status": {"name": "To Do"},
-            "labels": ["fusion-e/ai-bp-toolkit"],
+            "labels": ["predd-demo"],
             "customfield_10014": "DEMO-1",   # epic link
             "customfield_10020": [SPRINT],   # sprint
         },
@@ -79,7 +80,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Bug"},
             "status": {"name": "To Do"},
-            "labels": ["fusion-e/ai-bp-toolkit"],
+            "labels": ["predd-demo"],
             "customfield_10014": "DEMO-1",
             "customfield_10020": [SPRINT],
         },
@@ -101,7 +102,7 @@ ISSUES = [
             ),
             "issuetype": {"name": "Story"},
             "status": {"name": "To Do"},
-            "labels": ["fusion-e/ai-bp-toolkit"],
+            "labels": ["predd-demo"],
             "customfield_10014": "DEMO-1",
             "customfield_10020": [SPRINT],
         },
@@ -171,12 +172,22 @@ class MockJiraHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = PORT
+    repo = DEFAULT_REPO
+
     if "--port" in sys.argv:
         idx = sys.argv.index("--port")
         port = int(sys.argv[idx + 1])
+    if "--repo" in sys.argv:
+        idx = sys.argv.index("--repo")
+        repo = sys.argv[idx + 1]
+
+    # Patch the label in all issues to match the target repo slug
+    for issue in ISSUES:
+        issue["fields"]["labels"] = [repo]
 
     server = HTTPServer(("localhost", port), MockJiraHandler)
     print(f"Mock Jira running at http://localhost:{port}")
+    print(f"Routing issues to repo: {repo}")
     print(f"Serving {len(ISSUES)} issues: {', '.join(ISSUES_BY_KEY)}")
     print("Press Ctrl-C to stop.")
     try:

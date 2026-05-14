@@ -1,11 +1,11 @@
 # predd demo
 
-Show the full predd + hunter loop in ~20 minutes using a mock Jira server against your real repo.
+Show the full predd + hunter loop in ~20 minutes using a mock Jira server and a throwaway GitHub repo.
 
 ## What the demo shows
 
-1. Hunter ingests issues from Jira (mock server)
-2. Hunter creates GitHub issues in your real repo automatically
+1. Hunter ingests issues from mock Jira
+2. Hunter creates GitHub issues in the demo repo automatically
 3. Hunter claims an issue, writes a proposal PR
 4. You merge the proposal
 5. Hunter implements it, self-reviews, marks ready
@@ -13,32 +13,38 @@ Show the full predd + hunter loop in ~20 minutes using a mock Jira server agains
 
 ## Setup (one-time)
 
-**1. Start the mock Jira server**
+**1. Create the throwaway repo + push starter code**
 
 ```bash
-python demo/mock_jira.py &
+bash demo/setup_demo_repo.sh
 ```
 
-Runs on `http://localhost:8081`. Serves 3 synthetic issues against `fusion-e/ai-bp-toolkit`.
+Creates `{you}/predd-demo` on GitHub with a small intentionally-incomplete Python API. Prints the config snippet to add.
 
-**2. Update `~/.config/predd/config.toml`**
+**2. Start the mock Jira server**
 
-Change the Jira settings temporarily:
+```bash
+python demo/mock_jira.py --repo {you}/predd-demo
+```
 
+Runs on `http://localhost:8081`. Serves 3 synthetic issues routed to `predd-demo`.
+
+**3. Add the config block printed by setup_demo_repo.sh to `~/.config/predd/config.toml`**
+
+Also update top-level Jira settings:
 ```toml
 jira_base_url = "http://localhost:8081"
-jira_api_enabled = true
 jira_projects = ["DEMO"]
 jira_sprint_filter = "active"
 ```
 
-**3. Restart**
+**4. Restart**
 
 ```bash
 ./start.sh
 ```
 
-**4. Watch**
+**5. Watch**
 
 ```bash
 tail -f ~/.config/predd/hunter-log.txt
@@ -48,34 +54,28 @@ tail -f ~/.config/predd/hunter-log.txt
 
 | Time | What happens |
 |------|-------------|
-| 0:00 | Services start, hunter polls |
-| ~1:30 | Jira ingest runs — 3 GitHub issues created |
+| 0:00 | Services start |
+| ~1:30 | Jira ingest — 3 GitHub issues created in predd-demo |
 | ~3:00 | Hunter claims first issue, starts proposal skill |
 | ~8:00 | Proposal PR opens as draft |
 | You | Review and merge the proposal PR |
-| ~2min | Hunter detects merge, starts implementation |
-| ~10min | Impl PR opens, hunter self-reviews, marks ready |
-| You | Merge the impl PR |
-| ~1:30 | Hunter closes the GitHub issue |
+| ~2min | Hunter starts implementation |
+| ~10min | Impl PR opens, self-reviewed, marked ready |
+| You | Merge impl PR |
+| ~1:30 | Hunter closes the issue |
 
 ## Demo issues
 
-| Key | Summary |
-|-----|---------|
-| DEMO-10 | Add `/health` endpoint to the API |
-| DEMO-11 | Fix off-by-one error in `paginate()` |
-| DEMO-12 | Add unit tests for the `/items` endpoint |
-
-Edit `demo/mock_jira.py` to change the issues to something more relevant to what you want to show.
+| Key | Summary | What the AI builds |
+|-----|---------|-------------------|
+| DEMO-10 | Add `/health` endpoint | New Flask route returning `{"status":"ok","version":"..."}` |
+| DEMO-11 | Fix off-by-one in `paginate()` | One-line fix + new test |
+| DEMO-12 | Add tests for `/items` | 3 new test cases |
 
 ## Cleanup
 
 ```bash
-# Stop mock Jira
-pkill -f mock_jira.py
-
-# Restore real Jira config
-# Edit ~/.config/predd/config.toml — restore jira_base_url and jira_projects
-
+bash demo/teardown_demo_repo.sh
+# Restore real jira_base_url / jira_projects in config.toml
 ./start.sh
 ```
