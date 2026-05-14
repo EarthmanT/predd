@@ -1175,7 +1175,7 @@ def check_impl_merged(
 # Resume and rollback
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATES = {"merged", "awaiting_verification", "submitted", "failed"}
+TERMINAL_STATES = {"merged", "awaiting_verification", "submitted"}
 HUNTER_LABEL_PREFIXES = (":in-progress", ":proposal-open", ":implementing", ":awaiting-verification")
 
 
@@ -1704,6 +1704,11 @@ def resume_in_flight_issues(cfg: Config, state: dict) -> None:
             impl_pr = entry.get("impl_pr")
             if not impl_pr:
                 rollback_issue(cfg, state, key, "ready_for_review with no impl_pr")
+
+        elif status == "failed":
+            # Failed issues retry up to max_resume_retries times before rollback
+            logger.info("Retrying failed issue %s (attempt %d/%d)", key, resume_attempts + 1, cfg.max_resume_retries)
+            update_issue_state(state, key, resume_attempts=resume_attempts + 1)
 
 
 def scan_orphaned_labels(cfg: Config, state: dict, repos: list[str]) -> None:
