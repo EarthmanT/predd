@@ -186,6 +186,21 @@ def issue_identifier(issue_number: int, title: str) -> str:
     return extract_jira_key(title) or str(issue_number)
 
 
+def _pr_title(pr_type: str, issue_title: str) -> str:
+    """Format a PR title.
+
+    pr_type: "Proposal" or "Impl"
+    issue_title: raw GitHub issue title, may contain leading [JIRA-ID]
+
+    Output: "[JIRA-ID] Proposal/Impl - clean title"  or  "Proposal/Impl - clean title"
+    """
+    jira_key = extract_jira_key(issue_title)
+    clean = JIRA_KEY_RE.sub("", issue_title).strip(" -")
+    if jira_key:
+        return f"[{jira_key}] {pr_type} - {clean}"
+    return f"{pr_type} - {clean}"
+
+
 def label_jira_issue(repo: str, issue_number: int, title: str) -> None:
     """Apply 'jira' label to an issue if its title contains a Jira key."""
     jira_key = extract_jira_key(title)
@@ -909,7 +924,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             repo=repo,
             base=base_branch,
             branch=branch,
-            title=f"Proposal: {title}",
+            title=_pr_title("Proposal", title),
             body=pr_body,
             draft=True,
             worktree=worktree,
@@ -1114,7 +1129,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             repo=repo,
             base=base_branch,
             branch=branch,
-            title=f"Implement: {title}",
+            title=_pr_title("Impl", title),
             body=pr_body,
             draft=True,
             worktree=worktree,
@@ -1919,9 +1934,9 @@ def _issue_has_hunter_labels(issue: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 _PROPOSAL_TITLE_RE = re.compile(
-    r"^(proposal|propose|sdd|design|rfc|spec)[:\s]", re.IGNORECASE)
+    r"^(\[[A-Z][A-Z0-9]+-\d+\]\s*)?(proposal|propose|sdd|design|rfc|spec)[:\s\-]", re.IGNORECASE)
 _IMPL_TITLE_RE = re.compile(
-    r"^(impl|implement|feat|fix|chore)[:\s]", re.IGNORECASE)
+    r"^(\[[A-Z][A-Z0-9]+-\d+\]\s*)?(impl|implement|feat|fix|chore)[:\s\-]", re.IGNORECASE)
 
 
 def _is_obviously_proposal(pr: dict) -> bool:

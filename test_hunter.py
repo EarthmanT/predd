@@ -204,6 +204,37 @@ class TestMaxNewIssuesPerCycle:
 
 
 # ---------------------------------------------------------------------------
+# TestPrTitle
+# ---------------------------------------------------------------------------
+
+class TestPrTitle:
+    def test_with_jira_key(self):
+        assert h._pr_title("Proposal", "[DAP09A-123] Fix the login bug") == \
+            "[DAP09A-123] Proposal - Fix the login bug"
+
+    def test_impl_with_jira_key(self):
+        assert h._pr_title("Impl", "[DAP09A-999] Some feature") == \
+            "[DAP09A-999] Impl - Some feature"
+
+    def test_without_jira_key(self):
+        assert h._pr_title("Proposal", "Fix the login bug") == \
+            "Proposal - Fix the login bug"
+
+    def test_strips_jira_prefix_no_duplication(self):
+        result = h._pr_title("Impl", "[DAP09A-123] Some feature")
+        assert result == "[DAP09A-123] Impl - Some feature"
+        assert "[DAP09A-123] [DAP09A-123]" not in result
+
+    def test_is_obviously_proposal_new_format(self):
+        pr = {"title": "[DAP09A-123] Proposal - Fix something", "headRefName": "main", "files": []}
+        assert h._is_obviously_proposal(pr)
+
+    def test_is_obviously_implementation_new_format(self):
+        pr = {"title": "[DAP09A-123] Impl - Fix something", "headRefName": "usr/at/DAP09A-123-impl-fix-something", "files": []}
+        assert h._is_obviously_implementation(pr)
+
+
+# ---------------------------------------------------------------------------
 # TestAutoLabelPrs (SPEC 1)
 # ---------------------------------------------------------------------------
 
