@@ -857,6 +857,7 @@ class TestCheckProposalMerged:
              patch.object(h, "gh_create_branch_and_pr", return_value=99), \
              patch.object(h, "gh_ensure_label_exists"), \
              patch.object(h, "gh_issue_add_label"), \
+             patch.object(h, "gh_issue_remove_label"), \
              patch.object(h, "gh_pr_reviews", return_value=[]), \
              patch.object(h, "gh_pr_inline_comments", return_value=[]), \
              patch.object(h, "gh_pr_issue_comments", return_value=[]), \
@@ -907,7 +908,8 @@ class TestCheckProposalMerged:
         state = {}
         entry = self._entry()
 
-        with patch.object(h, "gh_pr_is_merged", side_effect=RuntimeError("network")):
+        with patch.object(h, "gh_pr_is_merged", side_effect=RuntimeError("network")), \
+             patch.object(h, "gh_issue_remove_label"):
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
         assert state == {}
@@ -918,7 +920,8 @@ class TestCheckProposalMerged:
         state = {}
         entry = {"issue_number": 3, "repo": "owner/repo", "title": "X", "status": "proposal_open"}
 
-        with patch.object(h, "gh_pr_is_merged") as mock_merged:
+        with patch.object(h, "gh_pr_is_merged") as mock_merged, \
+             patch.object(h, "gh_issue_remove_label"):
             h.check_proposal_merged(cfg, state, "owner/repo", "owner/repo!3", entry)
 
         mock_merged.assert_not_called()
