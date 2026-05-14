@@ -62,9 +62,28 @@ Add `predd_auto_post = true` (default) so users can opt back into manual approva
 predd_auto_post = true   # set false to revert to draft-and-approve workflow
 ```
 
+## Skill Verification
+
+Before running the review skill, validate that the skill file contains instructions for
+posting inline comments. Check that the skill body contains at least one of these patterns:
+
+- `gh pr review` (direct CLI call)
+- `inline` (reference to inline comments)
+- `file:line` or `line comment` (line-level feedback)
+
+If none are present, log a warning:
+```
+WARNING: Review skill at {path} may not post inline comments.
+         Add 'gh pr review --comment --body "..." -F file:line' instructions to the skill.
+```
+
+Do not block execution — warn only. The skill may use its own approach.
+
 ## Testing
 
 - Test that review is posted immediately after skill completes
 - Test verdict extraction maps correctly to gh pr review flags
 - Test failure fallback (post comment when review fails)
 - Test `predd_auto_post = false` still saves draft
+- Test skill validation warns when inline comment keywords are missing
+- Test skill validation passes when skill contains expected keywords

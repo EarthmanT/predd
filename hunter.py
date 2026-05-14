@@ -776,7 +776,7 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="proposal")
             raise RuntimeError("Proposal skill produced no commits — not creating empty PR")
 
-        pr_body = f"Proposal for issue #{issue_number}"
+        pr_body = f"Proposal for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->"
         gh_ensure_label_exists(repo, "sdd-proposal", color="0075ca")
         pr_number = gh_create_branch_and_pr(
             repo=repo,
@@ -980,7 +980,7 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             log_decision("skill_no_commits", repo=repo, issue=issue_number, skill="impl")
             raise RuntimeError("Impl skill produced no commits — not creating empty PR")
 
-        pr_body = f"Implementation for issue #{issue_number}"
+        pr_body = f"Implementation for issue #{issue_number}\n\n<!-- hunter:issue-{issue_number} -->\n<!-- hunter:impl-{issue_number} -->"
         gh_ensure_label_exists(repo, "sdd-implementation", color="e4e669")
         pr_number = gh_create_branch_and_pr(
             repo=repo,

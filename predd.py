@@ -362,6 +362,7 @@ class Config:
         self.fix_interval: int = data.get("fix_interval", 1200)
         self.analyze_days: int = data.get("analyze_days", 7)
         self.analyze_model: str = data.get("analyze_model", "claude-opus-4-7")
+        self.predd_auto_post: bool = data.get("predd_auto_post", True)
         self.comment_on_failures: bool = data.get("comment_on_failures", True)
         self.predd_failure_label: str = data.get("predd_failure_label", "{github_user}:predd-failed")
         self.failure_cleanup_days: int = data.get("failure_cleanup_days", 7)
@@ -413,6 +414,7 @@ class Config:
             "fix_interval": self.fix_interval,
             "analyze_days": self.analyze_days,
             "analyze_model": self.analyze_model,
+            "predd_auto_post": self.predd_auto_post,
             "comment_on_failures": self.comment_on_failures,
             "predd_failure_label": self.predd_failure_label,
             "failure_cleanup_days": self.failure_cleanup_days,
@@ -798,10 +800,19 @@ _DEVIN_STRIP_ENV = {
 }
 
 
+_INLINE_COMMENT_KEYWORDS = ["gh pr review", "inline", "file:line", "line comment", "start-line"]
+
 def _load_skill(cfg: Config, pr_number: int) -> str:
     if not cfg.skill_path.exists():
         raise FileNotFoundError(f"Skill not found: {cfg.skill_path}")
-    return cfg.skill_path.read_text().replace("$ARGUMENTS", str(pr_number))
+    skill_body = cfg.skill_path.read_text()
+    if not any(kw in skill_body.lower() for kw in _INLINE_COMMENT_KEYWORDS):
+        logger.warning(
+            "Review skill at %s may not post inline comments. "
+            "Consider adding 'gh pr review' or inline comment instructions.",
+            cfg.skill_path,
+        )
+    return skill_body.replace("$ARGUMENTS", str(pr_number))
 
 
 # Active subprocess handle — set while a review is running so the shutdown
@@ -929,16 +940,33 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
             update_pr_state(state, key, status="failed")
             return
 
-        # Skill posts directly to GitHub; save output for reference
+        # Save output for reference
         summary_path = worktree / "review-summary.md"
         summary_path.write_text(review_text)
 
-        # Extract verdict from review output for decision log
-        verdict = "UNKNOWN"
-        for v in ("APPROVE", "REQUEST_CHANGES", "COMMENT"):
+        # Extract verdict from review output
+        verdict = "COMMENT"
+        for v in ("APPROVE", "REQUEST_CHANGES"):
             if v in review_text.upper():
                 verdict = v
                 break
+
+        if cfg.predd_auto_post:
+            verdict_to_type = {
+                "APPROVE": "approve",
+                "REQUEST_CHANGES": "request-changes",
+                "COMMENT": "comment",
+            }
+            review_type = verdict_to_type[verdict]
+            try:
+                gh_pr_review(repo, pr_number, review_type, summary_path)
+                logger.info("Auto-posted %s review for %s", verdict, key)
+            except Exception as post_err:
+                logger.warning("Failed to post review for %s, falling back to comment: %s", key, post_err)
+                try:
+                    gh_pr_comment(repo, pr_number, review_text)
+                except Exception:
+                    pass
 
         update_pr_state(state, key,
                         status="submitted",
@@ -948,8 +976,8 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
 
         log_decision("pr_review_posted", repo=repo, pr=pr_number, sha=head_sha, verdict=verdict)
         notify_sound(cfg.sound_review_ready)
-        notify_toast("Review posted", f"{key} — run `predd show {pr_number}`")
-        logger.info("Review posted for %s", key)
+        notify_toast("Review posted", f"{key} — {verdict}")
+        logger.info("Review complete for %s (verdict: %s)", key, verdict)
 
     except Exception as e:
         logger.error("Failed processing %s: %s", key, e, exc_info=True)
