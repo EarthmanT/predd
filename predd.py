@@ -1333,6 +1333,38 @@ def generate_status_html() -> str:
             text-decoration: none;
         }}
         .activity-text a:hover {{ text-decoration: underline; }}
+        .activity-event {{
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }}
+        .activity-green {{ background: rgba(16, 185, 129, 0.1); color: var(--green); }}
+        .activity-red {{ background: rgba(239, 68, 68, 0.1); color: var(--red); }}
+        .activity-blue {{ background: rgba(59, 130, 246, 0.1); color: var(--primary); }}
+        .activity-yellow {{ background: rgba(245, 158, 11, 0.1); color: var(--yellow); }}
+        .activity-gray {{ background: rgba(107, 114, 128, 0.1); color: var(--fg-soft); }}
+        .status-failed {{
+            color: var(--red);
+            font-weight: 600;
+        }}
+        .status-submitted {{
+            color: var(--green);
+            font-weight: 600;
+        }}
+        .status-implementing {{
+            color: var(--yellow);
+            font-weight: 600;
+        }}
+        .status-proposal_open {{
+            color: var(--yellow);
+            font-weight: 600;
+        }}
+        .status-in_progress {{
+            color: var(--primary);
+            font-weight: 600;
+        }}
         @media (max-width: 640px) {{
             .cards {{ grid-template-columns: repeat(2, 1fr); }}
             .modal-content {{ width: 95%; }}
@@ -1458,6 +1490,18 @@ function renderActivity() {{
         for (const d of decisions) {{
             const time = new Date(d.ts).toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit'}});
             let text = '';
+            let color = 'gray';
+
+            // Determine color based on event type
+            if (d.event.includes('failed') || d.event.includes('Failed')) {{
+                color = 'red';
+            }} else if (d.event.includes('posted') || d.event.includes('merged') || d.event.includes('closed')) {{
+                color = 'green';
+            }} else if (d.event.includes('started') || d.event.includes('pickup') || d.event.includes('created')) {{
+                color = 'blue';
+            }} else if (d.event.includes('skip')) {{
+                color = 'yellow';
+            }}
 
             if (d.pr) {{
                 const reason = d.reason ? ` - ${{d.reason}}` : '';
@@ -1468,7 +1512,7 @@ function renderActivity() {{
                 text = d.event;
             }}
 
-            html += `<div class="activity-item"><span class="activity-time">${{time}}</span> <span class="activity-text">${{text}}</span></div>`;
+            html += `<div class="activity-item"><span class="activity-time">${{time}}</span> <span class="activity-event activity-${{color}}">${{text}}</span></div>`;
         }}
     }}
 
