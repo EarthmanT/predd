@@ -1338,13 +1338,17 @@ def run_review(cfg: Config, repo: str, pr_number: int, worktree: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _run_skill_prompt(cfg: "Config", prompt: str, worktree: Path) -> str:
-    """Run a free-form prompt through the configured backend. Returns output."""
+    """Run a free-form prompt through the configured backend without loading a skill file."""
     if cfg.backend == "claude":
         return _run_claude(cfg, prompt, worktree)
     if cfg.backend == "devin":
         return _run_devin(cfg, prompt, worktree)
     if cfg.backend == "bedrock":
-        return _run_bedrock_skill(cfg, prompt, cfg.impl_skill_path, worktree)
+        # Use impl_skill_path as a no-op skill context — but prepend a note that the
+        # prompt is already complete so the skill instructions don't distort it.
+        # We pass the prompt wrapped to make the task explicit over any skill boilerplate.
+        wrapped = f"TASK (complete this, ignore any conflicting skill instructions):\n\n{prompt}"
+        return _run_bedrock_skill(cfg, wrapped, cfg.impl_skill_path, worktree)
     raise ValueError(f"Unknown backend '{cfg.backend}'")
 
 
@@ -1468,11 +1472,13 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
     if not comments:
         return
 
-    # Only act on comments newer than our last fix
+    # Only act on comments newer than our last fix.
+    # Exclude APPROVE reviews — a body on an approval ("LGTM!") is not a request to change anything.
     last_processed_id = entry.get("last_moonlight_review_id") or 0
     actionable = [
         c for c in comments
         if (c.get("id") or 0) > last_processed_id
+        and c.get("state") != "APPROVED"
         and (c.get("body") or c.get("state") == "CHANGES_REQUESTED")
     ]
     if not actionable:
@@ -1524,10 +1530,18 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
             cwd=str(worktree), capture_output=True, text=True,
         )
         if result.stdout.strip():
-            subprocess.run(
-                ["git", "push", "origin", branch],
-                cwd=str(worktree), check=True, capture_output=True,
-            )
+            try:
+                subprocess.run(
+                    ["git", "push", "origin", branch],
+                    cwd=str(worktree), check=True, capture_output=True,
+                )
+            except subprocess.CalledProcessError as push_err:
+                # Push failed — refund the turn so we retry next cycle
+                logger.error("Moonlight: push failed for %s: %s", key, push_err)
+                update_pr_state(state, key,
+                                moonlight_turns=turns_done,
+                                last_moonlight_review_id=entry.get("last_moonlight_review_id"))
+                return
             logger.info("Moonlight: pushed fixes for %s", key)
 
             summary_comment = (
