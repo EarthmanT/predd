@@ -2,8 +2,8 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "click",
-#   "anthropic[bedrock]",
+#   "click>=8.0",
+#   "anthropic[bedrock]>=0.42.0",
 # ]
 # ///
 
