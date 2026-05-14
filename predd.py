@@ -161,6 +161,7 @@ auto_review_draft = false
 # require_jira_conformance = true
 # API integration: uncomment jira_api_enabled (token via JIRA_API_TOKEN env var)
 # jira_api_enabled = false
+# jira_projects = ["DAP09A"]  # Jira projects to ingest (defaults to DAP09A)
 # Jira issue types to skip during ingest (case-insensitive)
 skip_jira_issue_types = ["sub-task", "subtask", "sub task"]
 
@@ -347,6 +348,7 @@ class Config:
         )
         self.jira_base_url: str = data.get("jira_base_url", "https://jira.cec.lab.emc.com")
         self.jira_api_enabled: bool = data.get("jira_api_enabled", False)
+        self.jira_projects: list[str] = data.get("jira_projects", ["DAP09A"])
         self.require_jira_conformance: bool = data.get("require_jira_conformance", True)
         self.max_new_issues_per_cycle: int = data.get("max_new_issues_per_cycle", 1)
         self.orphan_scan_interval: int = data.get("orphan_scan_interval", 10)
@@ -397,6 +399,7 @@ class Config:
             "jira_csv_dir": str(self.jira_csv_dir) if self.jira_csv_dir else None,
             "jira_base_url": self.jira_base_url,
             "jira_api_enabled": self.jira_api_enabled,
+            "jira_projects": self.jira_projects,
             "require_jira_conformance": self.require_jira_conformance,
             "max_new_issues_per_cycle": self.max_new_issues_per_cycle,
             "orphan_scan_interval": self.orphan_scan_interval,

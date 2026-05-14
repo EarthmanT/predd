@@ -1417,11 +1417,15 @@ def ingest_jira_api(cfg: Config, repos: list[str]) -> None:
 
     logger.info("Jira API ingest: starting")
 
-    try:
-        # Query: project = configured projects AND sprint in openSprints()
-        # This gets all issues in open sprints (matches CSV ingest behavior)
-        jql = "sprint in openSprints()"
+    # Build JQL to filter by configured projects and open sprints
+    if not cfg.jira_projects:
+        logger.warning("Jira API ingest: no projects configured (jira_projects), skipping")
+        return
 
+    projects_str = ", ".join(cfg.jira_projects)
+    jql = f"project in ({projects_str}) AND sprint in openSprints()"
+
+    try:
         issues = client.search(
             jql,
             fields=[

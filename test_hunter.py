@@ -3023,9 +3023,27 @@ class TestJiraClient:
 class TestIngestJiraApi:
     """Tests for ingest_jira_api function."""
 
+    def _cfg_with_api(self, tmp_path):
+        """Create config with Jira API enabled."""
+        cfg = _make_cfg(tmp_path)
+        cfg.jira_api_enabled = True
+        cfg.jira_projects = ["DAP09A"]
+        cfg.jira_base_url = "https://jira.example.com"
+        return cfg
+
+    def test_skips_when_no_projects(self, tmp_path):
+        """Test skips ingest when jira_projects is empty."""
+        cfg = _make_cfg(tmp_path)
+        cfg.jira_api_enabled = True
+        cfg.jira_projects = []
+        with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
+             patch.object(h, "gh_issue_exists") as mock_exists:
+            h.ingest_jira_api(cfg, ["owner/repo"])
+        mock_exists.assert_not_called()
+
     def test_skips_when_api_disabled(self, tmp_path):
         """Test skips ingest when jira_api_enabled is False."""
-        cfg = _make_cfg(tmp_path)
+        cfg = self._cfg_with_api(tmp_path)
         cfg.jira_api_enabled = False
         with patch.dict(os.environ, {"JIRA_API_TOKEN": "token123"}), \
              patch.object(h, "gh_issue_exists") as mock_exists:
@@ -3034,8 +3052,7 @@ class TestIngestJiraApi:
 
     def test_skips_when_no_token(self, tmp_path):
         """Test skips ingest when JIRA_API_TOKEN not set."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
         env = {k: v for k, v in os.environ.items() if k != "JIRA_API_TOKEN"}
         with patch.dict(os.environ, env, clear=True), \
              patch.object(h, "gh_issue_exists") as mock_exists:
@@ -3044,8 +3061,7 @@ class TestIngestJiraApi:
 
     def test_falls_back_when_validate_fails(self, tmp_path):
         """Test falls back to CSV when API validation fails."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
         with patch.dict(os.environ, {"JIRA_API_TOKEN": "badtoken"}), \
              patch.object(_predd.JiraClient, "validate", return_value=False), \
              patch.object(h, "gh_issue_exists") as mock_exists:
@@ -3054,9 +3070,7 @@ class TestIngestJiraApi:
 
     def test_creates_conformant_issue(self, tmp_path):
         """Test creates GitHub issue from Jira API response."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
-        cfg.jira_base_url = "https://jira.example.com"
+        cfg = self._cfg_with_api(tmp_path)
 
         api_issue = {
             "key": "DAP-1",
@@ -3085,8 +3099,7 @@ class TestIngestJiraApi:
 
     def test_skips_subtask(self, tmp_path):
         """Test skips sub-task issues."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
         cfg.skip_jira_issue_types = ["sub-task", "subtask"]
 
         api_issue = {
@@ -3108,8 +3121,7 @@ class TestIngestJiraApi:
 
     def test_skips_issue_without_sprint(self, tmp_path):
         """Test skips issues without sprint (hard gate)."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
 
         api_issue = {
             "key": "DAP-3",
@@ -3131,8 +3143,7 @@ class TestIngestJiraApi:
 
     def test_skips_existing_issue(self, tmp_path):
         """Test skips issues that already exist in GitHub."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
 
         api_issue = {
             "key": "DAP-4",
@@ -3154,8 +3165,7 @@ class TestIngestJiraApi:
 
     def test_multiple_repos(self, tmp_path):
         """Test creates issues in all configured repos."""
-        cfg = _make_cfg(tmp_path)
-        cfg.jira_api_enabled = True
+        cfg = self._cfg_with_api(tmp_path)
 
         api_issue = {
             "key": "DAP-5",
