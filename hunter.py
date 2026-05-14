@@ -1194,21 +1194,52 @@ def _parse_capability(description: str) -> str | None:
     return None
 
 
+EPIC_COLUMNS = (
+    "epic link",
+    "epic name",
+    "custom field (epic link)",
+    "custom field (epic name)",
+    "parent",
+    "parent key",
+)
+
+SPRINT_COLUMNS = (
+    "sprint",
+    "custom field (sprint)",
+)
+
+
+def _find_epic(row: dict) -> str:
+    """Find Epic value from the first non-empty column in EPIC_COLUMNS."""
+    for col in EPIC_COLUMNS:
+        val = row.get(col, "")
+        if val:
+            return val
+    return ""
+
+
+def _find_sprint(row: dict) -> str:
+    """Find Sprint value from the first non-empty column in SPRINT_COLUMNS."""
+    for col in SPRINT_COLUMNS:
+        val = row.get(col, "")
+        if val:
+            return val
+    return ""
+
+
 def _build_issue_body(row: dict, jira_base_url: str) -> tuple[str, list[str]]:
     """Build the GH issue body and return (body, missing_fields)."""
     jira_key = row.get("issue key", "")
     summary = row.get("summary", "")
     issue_type = row.get("issue type", "")
-    epic = row.get("epic link", "") or row.get("epic name", "")
-    sprint = row.get("sprint", "")
+    epic = _find_epic(row)
+    sprint = _find_sprint(row)
     description = row.get("description", "")
     capability = _parse_capability(description)
 
     missing = []
     if not epic:
         missing.append("Epic not set")
-    if not sprint:
-        missing.append("Sprint not set")
     if not capability:
         missing.append("No `capability: <id> <name>` line in description")
 
@@ -1290,6 +1321,9 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
             logger.warning("CSV ingest: failed to read %s: %s", csv_file, e)
             continue
 
+        if rows:
+            logger.info("CSV ingest: %s columns: %s", csv_file.name, sorted(rows[0].keys()))
+
         for row in rows:
             jira_key = row.get("issue key", "").strip()
             summary = row.get("summary", "").strip()
@@ -1308,6 +1342,16 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
                     "CSV ingest: skipping %s (type=%s) per skip_jira_issue_types",
                     jira_key, issue_type,
                 )
+                continue
+
+            sprint = _find_sprint(row).strip()
+            if not sprint:
+                log_decision(
+                    "csv_issue_skip",
+                    jira_key=jira_key,
+                    reason="no_sprint",
+                )
+                logger.info("CSV ingest: skipping %s — no sprint assigned", jira_key)
                 continue
 
             title = f"[{jira_key}] {summary}"

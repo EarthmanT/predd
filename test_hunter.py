@@ -2401,13 +2401,14 @@ class TestBuildIssueBody:
         assert "42 — payments" in body
         assert missing == []
 
-    def test_missing_epic_sprint_capability(self):
+    def test_missing_epic_and_capability(self):
         row = self._row(epic_link="", sprint="", description="no cap here")
         row.pop("epic link", None)
         row["epic link"] = ""
         row["sprint"] = ""
         body, missing = h._build_issue_body(row, "https://jira.example.com")
-        assert len(missing) == 3
+        # Sprint is no longer in missing (hard gate in ingest), only Epic + Capability
+        assert len(missing) == 2
 
     def test_epic_key_is_hyperlinked(self):
         body, _ = h._build_issue_body(self._row(), "https://jira.example.com")
@@ -2425,11 +2426,11 @@ class TestBuildIssueBody:
         assert "Do the thing" in body
 
     def test_warning_block_on_missing(self):
-        row = self._row(sprint="")
-        row["sprint"] = ""
+        row = self._row(epic_link="")
+        row["epic link"] = ""
         body, missing = h._build_issue_body(row, "https://jira.example.com")
         assert "⚠️" in body
-        assert "Sprint not set" in body
+        assert "Epic not set" in body
 
 
 class TestGhIssueExists:
@@ -2532,9 +2533,10 @@ class TestIngestJiraCsv:
     def test_non_conformant_not_assigned_when_require_conformance(self, tmp_path):
         cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
         cfg.require_jira_conformance = True
+        # Has Sprint (passes hard gate) but missing Epic and capability (non-conformant)
         self._write_csv(csv_dir, "sprint.csv", [{
             "Issue Key": "DAP-2", "Summary": "Missing fields", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "no cap",
+            "Status": "Open", "Epic Link": "", "Sprint": "Sprint-1", "Description": "no cap",
         }])
         with patch.object(h, "gh_issue_exists", return_value=False), \
              patch.object(h, "gh_issue_create", return_value=11) as mock_create, \
@@ -2545,9 +2547,10 @@ class TestIngestJiraCsv:
 
     def test_needs_jira_info_label_added_for_non_conformant(self, tmp_path):
         cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        # Has Sprint (passes hard gate) but missing Epic and capability (non-conformant)
         self._write_csv(csv_dir, "sprint.csv", [{
             "Issue Key": "DAP-3", "Summary": "Bad", "Issue Type": "Story",
-            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
+            "Status": "Open", "Epic Link": "", "Sprint": "Sprint-1", "Description": "",
         }])
         with patch.object(h, "gh_issue_exists", return_value=False), \
              patch.object(h, "gh_issue_create", return_value=12), \
@@ -2786,6 +2789,81 @@ class TestJiraLabeling:
 # ---------------------------------------------------------------------------
 # TestBranchNamingJiraKey
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TestEpicSprintConformance
+# ---------------------------------------------------------------------------
+
+class TestEpicSprintConformance:
+    """Tests for _find_epic, _find_sprint, and Sprint hard gate."""
+
+    def test_find_epic_uses_epic_link(self):
+        row = {"epic link": "DAP-100", "epic name": "", "parent": ""}
+        assert h._find_epic(row) == "DAP-100"
+
+    def test_find_epic_falls_back_to_parent(self):
+        row = {"epic link": "", "epic name": "", "parent": "DAP-200"}
+        assert h._find_epic(row) == "DAP-200"
+
+    def test_find_epic_returns_empty_when_all_missing(self):
+        row = {"epic link": "", "epic name": ""}
+        assert h._find_epic(row) == ""
+
+    def test_csv_ingest_skips_row_without_sprint(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        csv_dir = tmp_path / "jira"
+        csv_dir.mkdir()
+        cfg.jira_csv_dir = csv_dir
+        cfg.jira_base_url = "https://jira.example.com"
+        cfg.require_jira_conformance = True
+
+        import csv as _csv
+        path = csv_dir / "test.csv"
+        with open(path, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=[
+                "Issue Key", "Summary", "Issue Type", "Status",
+                "Epic Link", "Sprint", "Description",
+            ])
+            writer.writeheader()
+            writer.writerow({
+                "Issue Key": "DAP-20", "Summary": "No sprint", "Issue Type": "Story",
+                "Status": "Open", "Epic Link": "DAP-100", "Sprint": "",
+                "Description": "capability: 1 feat",
+            })
+
+        with patch.object(h, "gh_issue_exists") as mock_exists:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_exists.assert_not_called()
+
+    def test_csv_ingest_creates_row_with_sprint(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        csv_dir = tmp_path / "jira"
+        csv_dir.mkdir()
+        cfg.jira_csv_dir = csv_dir
+        cfg.jira_base_url = "https://jira.example.com"
+        cfg.require_jira_conformance = True
+
+        import csv as _csv
+        path = csv_dir / "test.csv"
+        with open(path, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=[
+                "Issue Key", "Summary", "Issue Type", "Status",
+                "Epic Link", "Sprint", "Description",
+            ])
+            writer.writeheader()
+            writer.writerow({
+                "Issue Key": "DAP-21", "Summary": "Has sprint", "Issue Type": "Story",
+                "Status": "Open", "Epic Link": "DAP-100", "Sprint": "Sprint-1",
+                "Description": "capability: 1 feat",
+            })
+
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=30) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"):
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_create.assert_called_once()
+
 
 class TestBranchNamingJiraKey:
     """Tests for issue_identifier and Jira-key-aware branch naming."""
