@@ -2557,6 +2557,59 @@ class TestIngestJiraCsv:
         label_calls = [str(c) for c in mock_label.call_args_list]
         assert any("needs-jira-info" in c for c in label_calls)
 
+    def test_csv_ingest_skips_subtask(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-10", "Summary": "Child task", "Issue Type": "Sub-task",
+            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
+        }])
+        with patch.object(h, "gh_issue_exists") as mock_exists:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_exists.assert_not_called()
+
+    def test_csv_ingest_skips_subtask_case_insensitive(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-11", "Summary": "Child", "Issue Type": "SUB-TASK",
+            "Status": "Open", "Epic Link": "", "Sprint": "", "Description": "",
+        }])
+        with patch.object(h, "gh_issue_exists") as mock_exists:
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_exists.assert_not_called()
+
+    def test_csv_ingest_creates_story(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        self._write_csv(csv_dir, "sprint.csv", [{
+            "Issue Key": "DAP-12", "Summary": "A story", "Issue Type": "Story",
+            "Status": "Open", "Epic Link": "DAP-100",
+            "Sprint": "Sprint-1", "Description": "capability: 1 feat",
+        }])
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=20) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"):
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        mock_create.assert_called_once()
+
+    def test_csv_ingest_respects_custom_skip_list(self, tmp_path):
+        cfg, csv_dir = self._make_cfg_with_csv(tmp_path)
+        cfg.skip_jira_issue_types = ["sub-task", "epic"]
+        self._write_csv(csv_dir, "sprint.csv", [
+            {"Issue Key": "DAP-13", "Summary": "An epic", "Issue Type": "Epic",
+             "Status": "Open", "Epic Link": "", "Sprint": "", "Description": ""},
+            {"Issue Key": "DAP-14", "Summary": "A story", "Issue Type": "Story",
+             "Status": "Open", "Epic Link": "DAP-100",
+             "Sprint": "Sprint-1", "Description": "capability: 1 feat"},
+        ])
+        with patch.object(h, "gh_issue_exists", return_value=False), \
+             patch.object(h, "gh_issue_create", return_value=30) as mock_create, \
+             patch.object(h, "gh_ensure_label_exists"), \
+             patch.object(h, "gh_issue_add_label"):
+            h.ingest_jira_csv(cfg, ["owner/repo"])
+        # Only Story should be created, Epic should be skipped
+        mock_create.assert_called_once()
+        assert "[DAP-14]" in mock_create.call_args[1].get("title", mock_create.call_args[0][1])
+
 
 # ---------------------------------------------------------------------------
 # TestCollectPrFeedback

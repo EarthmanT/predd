@@ -156,6 +156,8 @@ auto_review_draft = false
 # jira_csv_dir = "./jira"
 # jira_base_url = "https://jira.cec.lab.emc.com"
 # require_jira_conformance = true
+# Jira issue types to skip during CSV ingest (case-insensitive)
+skip_jira_issue_types = ["sub-task", "subtask", "sub task"]
 
 # Max new issues to pick up per repo per poll cycle
 max_new_issues_per_cycle = 1
@@ -281,6 +283,10 @@ class Config:
         self.aws_region: str = data.get("aws_region", "us-east-1")
         self.bedrock_model: str = data.get("bedrock_model", "eu.anthropic.claude-3-7-sonnet-20250219-v1:0")
         self.analyze_hour: int = data.get("analyze_hour", 9)
+        self.skip_jira_issue_types: list[str] = data.get(
+            "skip_jira_issue_types",
+            ["sub-task", "subtask", "sub task"],
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -325,6 +331,7 @@ class Config:
             "aws_region": self.aws_region,
             "bedrock_model": self.bedrock_model,
             "analyze_hour": self.analyze_hour,
+            "skip_jira_issue_types": self.skip_jira_issue_types,
         }
 
 

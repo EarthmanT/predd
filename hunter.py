@@ -1296,6 +1296,20 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
             if not jira_key or not summary:
                 continue
 
+            issue_type = row.get("issue type", "").strip().lower()
+            if issue_type in {t.lower() for t in cfg.skip_jira_issue_types}:
+                log_decision(
+                    "csv_issue_skip",
+                    jira_key=jira_key,
+                    reason="excluded_type",
+                    issue_type=issue_type,
+                )
+                logger.info(
+                    "CSV ingest: skipping %s (type=%s) per skip_jira_issue_types",
+                    jira_key, issue_type,
+                )
+                continue
+
             title = f"[{jira_key}] {summary}"
             body, missing = _build_issue_body(row, cfg.jira_base_url)
             conformant = len(missing) == 0
