@@ -2658,3 +2658,70 @@ class TestCollectPrFeedback:
         with patch.object(h, "gh_pr_reviews", side_effect=Exception("network")):
             h.collect_pr_feedback(cfg, state, "owner/repo", "owner/repo!1", 42, "proposal_feedback")
         # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# TestJiraLabeling
+# ---------------------------------------------------------------------------
+
+class TestJiraLabeling:
+    """Tests for extract_jira_key, label_jira_issue, and _sweep_jira_labels."""
+
+    def test_extract_jira_key_standard(self):
+        assert h.extract_jira_key("[DAP09A-1184] Some feature") == "DAP09A-1184"
+
+    def test_extract_jira_key_short_project(self):
+        assert h.extract_jira_key("[BPA-42] Fix thing") == "BPA-42"
+
+    def test_extract_jira_key_two_letter(self):
+        assert h.extract_jira_key("[AI-7] AI improvement") == "AI-7"
+
+    def test_extract_jira_key_no_match(self):
+        assert h.extract_jira_key("Just a regular title") is None
+
+    def test_extract_jira_key_empty(self):
+        assert h.extract_jira_key("") is None
+
+    def test_extract_jira_key_none(self):
+        assert h.extract_jira_key(None) is None
+
+    def test_extract_jira_key_lowercase_rejected(self):
+        assert h.extract_jira_key("[abc-123] lowercase") is None
+
+    def test_extract_jira_key_no_brackets(self):
+        assert h.extract_jira_key("DAP09A-1184 no brackets") is None
+
+    def test_label_jira_issue_applies_label(self):
+        with patch.object(h, "gh_ensure_label_exists") as mock_ensure, \
+             patch.object(h, "gh_issue_add_label") as mock_add, \
+             patch.object(h, "log_decision"):
+            h.label_jira_issue("owner/repo", 42, "[BPA-99] do the thing")
+
+        mock_ensure.assert_called_once_with("owner/repo", "jira", color="0052CC")
+        mock_add.assert_called_once_with("owner/repo", 42, "jira")
+
+    def test_label_jira_issue_skips_no_key(self):
+        with patch.object(h, "gh_ensure_label_exists") as mock_ensure:
+            h.label_jira_issue("owner/repo", 42, "No jira key here")
+
+        mock_ensure.assert_not_called()
+
+    def test_label_jira_issue_handles_error(self):
+        with patch.object(h, "gh_ensure_label_exists", side_effect=Exception("fail")):
+            h.label_jira_issue("owner/repo", 42, "[BPA-99] do the thing")
+        # Should not raise
+
+    def test_sweep_skips_already_labeled(self):
+        issues_json = json.dumps([
+            {"number": 1, "title": "[BPA-1] Already labeled", "labels": [{"name": "jira"}]},
+            {"number": 2, "title": "[BPA-2] Needs label", "labels": []},
+            {"number": 3, "title": "No jira key", "labels": []},
+        ])
+        fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout=issues_json, stderr="")
+
+        with patch.object(h, "gh_run", return_value=fake_result), \
+             patch.object(h, "label_jira_issue") as mock_label:
+            h._sweep_jira_labels(MagicMock(), ["owner/repo"])
+
+        # Only issue #2 should be labeled (has key, not already labeled)
+        mock_label.assert_called_once_with("owner/repo", 2, "[BPA-2] Needs label")

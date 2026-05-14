@@ -170,6 +170,53 @@ HUNTER_PID_FILE = CONFIG_DIR / "hunter-pid"
 HUNTER_LOG_FILE = CONFIG_DIR / "hunter-log.txt"
 HUNTER_DECISION_LOG = CONFIG_DIR / "hunter-decisions.jsonl"
 
+JIRA_KEY_RE = re.compile(r"\[([A-Z][A-Z0-9]+-\d+)\]")
+
+
+def extract_jira_key(title: str) -> str | None:
+    """Extract Jira key from issue title, e.g. '[DAP09A-1184] foo' -> 'DAP09A-1184'."""
+    m = JIRA_KEY_RE.search(title or "")
+    return m.group(1) if m else None
+
+
+def label_jira_issue(repo: str, issue_number: int, title: str) -> None:
+    """Apply 'jira' label to an issue if its title contains a Jira key."""
+    jira_key = extract_jira_key(title)
+    if not jira_key:
+        return
+    try:
+        gh_ensure_label_exists(repo, "jira", color="0052CC")
+        gh_issue_add_label(repo, issue_number, "jira")
+        log_decision("jira_label_applied", repo=repo, issue=issue_number, jira_key=jira_key)
+    except Exception as e:
+        logger.warning("Could not apply jira label to %s#%d: %s", repo, issue_number, e)
+
+
+def _sweep_jira_labels(cfg: Config, repos: list[str]) -> None:
+    """One-shot startup sweep: label open issues with Jira keys in their titles."""
+    for repo in repos:
+        try:
+            result = gh_run([
+                "issue", "list", "--repo", repo,
+                "--state", "open", "--limit", "100",
+                "--json", "number,title,labels",
+            ])
+            issues = json.loads(result.stdout)
+        except Exception as e:
+            logger.warning("Jira label sweep: failed to list issues for %s: %s", repo, e)
+            continue
+
+        for issue in issues:
+            title = issue.get("title", "")
+            if not extract_jira_key(title):
+                continue
+            label_names = [lbl["name"] for lbl in issue.get("labels", [])]
+            if "jira" in label_names:
+                continue
+            label_jira_issue(repo, issue["number"], title)
+
+    logger.info("Jira label sweep complete")
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -671,6 +718,9 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     key = f"{repo}!{issue_number}"
 
     logger.info("Picking up issue %s: %s", key, title)
+
+    # Apply jira label if title contains a Jira key
+    label_jira_issue(repo, issue_number, title)
 
     if not try_claim_issue(cfg, repo, issue_number):
         logger.info("Could not claim issue %s — skipping", key)
@@ -1259,6 +1309,7 @@ def ingest_jira_csv(cfg: Config, repos: list[str]) -> None:
                         continue
 
                     log_decision("csv_issue_created", repo=repo, jira_key=jira_key, issue=issue_number, conformant=conformant)
+                    label_jira_issue(repo, issue_number, title)
                     logger.info("CSV ingest: created issue #%d for %s in %s%s",
                                 issue_number, jira_key, repo,
                                 " (non-conformant, not assigned)" if not conformant else "")
@@ -1612,6 +1663,8 @@ def start(once: bool):
     # Scan for orphaned labels from crashed previous runs
     state = load_hunter_state()
     scan_orphaned_labels(cfg, state, hunter_repos)
+    # One-shot sweep: label existing issues with Jira keys
+    _sweep_jira_labels(cfg, hunter_repos)
 
     try:
         while not _stop.is_set():
