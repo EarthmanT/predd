@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -824,6 +825,191 @@ def run_skill(cfg: Config, skill_path: Path, arguments: str, worktree: Path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Spec Kit (Phase I)
+# ---------------------------------------------------------------------------
+
+
+def spec_branch(cfg: Config, issue_id: str, title_slug: str) -> str:
+    """Branch name for speckit proposals: {branch_prefix}/{issue_id}-spec-{slug}."""
+    return f"{cfg.branch_prefix}/{issue_id}-spec-{title_slug}"
+
+
+def resolve_capability_folder(cfg: Config, epic_name: str, epic_key: str) -> "Path | None":
+    """Return the capability folder path for the given epic, or None if not found."""
+    if not cfg.capability_specs_path:
+        return None
+    # Slug match on epic name
+    if epic_name:
+        slug = re.sub(r"[^a-z0-9]+", "-", epic_name.lower()).strip("-")
+        folder = cfg.capability_specs_path / slug
+        if folder.exists():
+            return folder
+    # Map fallback via speckit_epic_map[epic_key]
+    if epic_key and epic_key in cfg.speckit_epic_map:
+        folder = cfg.capability_specs_path / cfg.speckit_epic_map[epic_key]
+        if folder.exists():
+            return folder
+    log_decision("speckit_no_capability", epic_name=epic_name, epic_key=epic_key)
+    logger.info("speckit: no capability folder for epic %r (%s) — legacy fallback",
+                epic_name, epic_key)
+    return None
+
+
+def read_bpa_specs_bundle(capability_dir: Path, story_id: str) -> dict:
+    """Read BPA-Specs artifacts for a story. Hard fails if required files missing."""
+    story_dir = capability_dir / "stories" / story_id
+    constitution = capability_dir / "constitution.md"
+    capability_spec = capability_dir / "spec.md"
+    story_spec = story_dir / "spec.md"
+    clarifications = capability_dir / "clarifications.md"
+
+    missing = []
+    if not constitution.exists():
+        missing.append("constitution.md")
+    if not capability_spec.exists():
+        missing.append("spec.md")
+    if not story_spec.exists():
+        missing.append(f"stories/{story_id}/spec.md")
+    if missing:
+        raise RuntimeError(
+            f"Missing required speckit artifacts in {capability_dir}: {', '.join(missing)}"
+        )
+
+    result = {
+        "constitution": constitution,
+        "capability_spec": capability_spec,
+        "story_spec": story_spec,
+        "clarifications": clarifications if clarifications.exists() else None,
+    }
+    if not clarifications.exists():
+        log_decision("speckit_no_clarifications",
+                     capability=str(capability_dir.name), story_id=story_id)
+        logger.info("speckit: no clarifications.md for %s — proceeding without",
+                    capability_dir.name)
+    return result
+
+
+def pin_capability_sha(cfg: Config) -> str:
+    """Return the HEAD SHA of the capability_specs_path repo."""
+    result = subprocess.run(
+        ["git", "-C", str(cfg.capability_specs_path), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def copy_spec_refs(bundle: dict, worktree: Path) -> Path:
+    """Copy BPA-Specs bundle files into worktree/spec-refs/. Returns spec-refs path."""
+    spec_refs = worktree / "spec-refs"
+    spec_refs.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bundle["constitution"], spec_refs / "constitution.md")
+    shutil.copy2(bundle["capability_spec"], spec_refs / "capability-spec.md")
+    shutil.copy2(bundle["story_spec"], spec_refs / "story-spec.md")
+    if bundle.get("clarifications"):
+        shutil.copy2(bundle["clarifications"], spec_refs / "clarifications.md")
+    return spec_refs
+
+
+def load_speckit_prompt(cfg: Config, template_name: str, **kwargs) -> str:
+    """Read a speckit prompt template and render it with kwargs."""
+    template_path = cfg.speckit_prompt_dir / f"{template_name}.md"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Speckit prompt template not found: {template_path}")
+    return template_path.read_text().format(**kwargs)
+
+
+def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
+                     issue_number: int, title: str, issue_body: str) -> bool:
+    """Run the speckit plan phase. Returns True if speckit ran, False to fall back to legacy."""
+    jira_key = entry.get("jira_key", "")
+    epic_name = entry.get("epic_name", "")
+    epic_key = entry.get("epic_key", "")
+
+    capability_dir = resolve_capability_folder(cfg, epic_name, epic_key)
+    if capability_dir is None:
+        return False
+
+    story_id = jira_key or str(issue_number)
+    bundle = read_bpa_specs_bundle(capability_dir, story_id)
+    sha = pin_capability_sha(cfg)
+
+    spec_refs = copy_spec_refs(bundle, worktree)
+    commit_skill_output(worktree, f"speckit: copy spec-refs for issue #{issue_number}")
+
+    clarifications_path = (
+        str(spec_refs / "clarifications.md")
+        if bundle.get("clarifications") else "(not present)"
+    )
+    prompt = load_speckit_prompt(
+        cfg, template_name="plan",
+        issue_number=issue_number,
+        issue_title=title,
+        issue_body=issue_body or "(no description)",
+        constitution_path=str(spec_refs / "constitution.md"),
+        capability_spec_path=str(spec_refs / "capability-spec.md"),
+        story_spec_path=str(spec_refs / "story-spec.md"),
+        clarifications_path=clarifications_path,
+        spec_refs_dir=str(spec_refs),
+        capability_specs_sha=sha,
+        capability=str(capability_dir.name),
+        story_id=story_id,
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, prefix="speckit-plan-"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(prompt)
+
+    context = build_issue_context(issue_number, title, issue_body, entry)
+    try:
+        run_skill(cfg, tmp_path, context, worktree)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not (worktree / "plan.md").exists():
+        raise RuntimeError("speckit plan skill did not produce plan.md")
+
+    log_decision("plan_completed", issue=issue_number, story_id=story_id,
+                 capability=str(capability_dir.name), sha=sha)
+    return True
+
+
+def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
+                          issue_number: int, title: str, issue_body: str) -> None:
+    """Run the speckit implement phase using spec-refs/ + plan.md from the merged proposal."""
+    spec_refs = worktree / "spec-refs"
+    plan_path = worktree / "plan.md"
+    tasks_path = worktree / "tasks.md"
+
+    prompt = load_speckit_prompt(
+        cfg, template_name="implement",
+        issue_number=issue_number,
+        issue_title=title,
+        issue_body=issue_body or "(no description)",
+        spec_refs_dir=str(spec_refs),
+        constitution_path=str(spec_refs / "constitution.md"),
+        capability_spec_path=str(spec_refs / "capability-spec.md"),
+        story_spec_path=str(spec_refs / "story-spec.md"),
+        clarifications_path=str(spec_refs / "clarifications.md"),
+        plan_path=str(plan_path),
+        tasks_path=str(tasks_path),
+    )
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", delete=False, prefix="speckit-impl-"
+    ) as f:
+        tmp_path = Path(f.name)
+        f.write(prompt)
+
+    context = build_issue_context(issue_number, title, issue_body, entry)
+    try:
+        run_skill(cfg, tmp_path, context, worktree)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Core processing functions
 # ---------------------------------------------------------------------------
 
@@ -842,8 +1028,20 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
     # Jira conformance check (if Jira API is configured)
     jira_key = extract_jira_key(title)
     jira_frontmatter = ""
+    _epic_key = ""
+    _epic_name = ""
     if jira_key:
-        jira_frontmatter, missing_fields = _fetch_jira_frontmatter(cfg, jira_key)
+        jira_frontmatter, missing_fields, _issue_data = _fetch_jira_frontmatter(cfg, jira_key)
+        # Extract epic info for speckit capability resolution
+        _fields = _issue_data.get("fields") or {}
+        _epic_key = _fields.get("customfield_10014") or ""
+        if not _epic_key:
+            _parent = _fields.get("parent") or {}
+            _epic_key = _parent.get("key", "")
+        if _epic_key:
+            _parent = _fields.get("parent") or {}
+            if _parent.get("key") == _epic_key:
+                _epic_name = (_parent.get("fields") or {}).get("summary", "")
         if missing_fields and cfg.require_jira_conformance:
             needs_label = f"{cfg.github_user}:needs-jira-info"
             missing_lines = "\n".join(f"- No {f.lower()} assigned" if f != "Capability"
@@ -877,7 +1075,10 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
         logger.error("Failed to get default branch for %s: %s", repo, e)
         return
 
-    branch = proposal_branch(cfg, issue_number, title)
+    if cfg.speckit_enabled:
+        branch = spec_branch(cfg, issue_identifier(issue_number, title), issue_slug(title))
+    else:
+        branch = proposal_branch(cfg, issue_number, title)
     worktree = cfg.worktree_base / f"{repo_slug(repo)}-{branch.replace('/', '-')}"
 
     issue_body = issue.get("body") or ""
@@ -893,6 +1094,9 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
                        proposal_branch=branch,
                        proposal_worktree=str(worktree),
                        jira_frontmatter=jira_frontmatter,
+                       jira_key=jira_key or "",
+                       epic_key=_epic_key,
+                       epic_name=_epic_name,
                        resume_attempts=0,
                        first_seen=_now_iso())
 
@@ -908,7 +1112,12 @@ def process_issue(cfg: Config, state: dict, repo: str, issue: dict) -> None:
             state.get(key, {}).get("issue_body", ""),
             state.get(key, {}),
         )
-        run_skill(cfg, cfg.proposal_skill_path, context, worktree)
+        used_speckit = cfg.speckit_enabled and run_speckit_plan(
+            cfg, state.get(key, {}), worktree, issue_number, title, issue_body,
+        )
+        if not used_speckit:
+            run_skill(cfg, cfg.proposal_skill_path, context, worktree)
+        update_issue_state(state, key, used_speckit=used_speckit)
         commit_skill_output(worktree, f"proposal: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
@@ -1123,7 +1332,11 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             entry.get("issue_body", ""),
             entry,
         )
-        run_skill(cfg, cfg.impl_skill_path, context, worktree)
+        if entry.get("used_speckit"):
+            run_speckit_implement(cfg, entry, worktree, issue_number, title,
+                                  entry.get("issue_body", ""))
+        else:
+            run_skill(cfg, cfg.impl_skill_path, context, worktree)
         commit_skill_output(worktree, f"impl: issue #{issue_number} — {title[:60]}")
 
         if not skill_has_commits(worktree):
@@ -1462,24 +1675,24 @@ def _check_jira_conformance(issue_data: dict) -> list[str]:
     return missing
 
 
-def _fetch_jira_frontmatter(cfg: "Config", jira_key: str) -> tuple[str, list[str]]:
-    """Fetch Jira issue and build frontmatter. Returns (frontmatter, missing_fields).
+def _fetch_jira_frontmatter(cfg: "Config", jira_key: str) -> tuple[str, list[str], dict]:
+    """Fetch Jira issue and build frontmatter. Returns (frontmatter, missing_fields, issue_data).
 
-    Returns ("", []) if Jira API is not configured or unavailable.
+    Returns ("", [], {}) if Jira API is not configured or unavailable.
     """
     token = os.environ.get("JIRA_API_TOKEN")
     if not token or not cfg.jira_api_enabled:
-        return "", []
+        return "", [], {}
 
     try:
         client = JiraClient(cfg.jira_base_url, token)
         issue_data = client.get_issue(jira_key)
         missing = _check_jira_conformance(issue_data)
         frontmatter = _build_jira_frontmatter(issue_data, cfg.jira_base_url)
-        return frontmatter, missing
+        return frontmatter, missing, issue_data
     except Exception as e:
         logger.warning("Could not fetch Jira data for %s: %s", jira_key, e)
-        return "", []
+        return "", [], {}
 
 
 EPIC_COLUMNS = (

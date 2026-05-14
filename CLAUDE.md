@@ -227,6 +227,33 @@ Hunter removes all its labels and closes the issue when the impl PR merges. It d
 
 ---
 
+## Spec Kit integration (Phase I)
+
+When `speckit_enabled = true`, hunter uses BPA-Specs artifacts instead of the legacy `proposal_skill_path` / `impl_skill_path` for issues that have a matching capability folder.
+
+**Config fields** (all in `predd.py` `Config`):
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `speckit_enabled` | `false` | Master switch |
+| `speckit_prompt_dir` | `<repo>/prompts/speckit` | Directory with `plan.md` and `implement.md` templates |
+| `capability_specs_path` | `None` | Path to BPA-Specs repo's specs folder |
+| `speckit_epic_map` | `{}` | `{epic_key: folder_slug}` override for slug mismatches |
+
+**BPA-Specs folder contract**: `<capability_specs_path>/<capability-slug>/` with `constitution.md`, `spec.md`, optional `clarifications.md`, and `stories/<jira-key>/spec.md`.
+
+**Proposal phase**: hunter resolves capability folder from Jira epic, copies artifacts to `spec-refs/` in the branch, then runs `prompts/speckit/plan.md` template via the existing backend. `plan.md` is written to the repo root. `used_speckit: true` is stored in hunter state.
+
+**Impl phase**: after proposal merges, hunter reads `spec-refs/` + `plan.md` from the merged branch and runs `prompts/speckit/implement.md`. `used_speckit` in state controls the fork.
+
+**Fallback**: no capability folder → `log_decision("speckit_no_capability")` → legacy `proposal_skill_path` used, `used_speckit: false`.
+
+**Branch naming**: `spec_branch()` → `{branch_prefix}/{issue_id}-spec-{slug}` (vs `{issue_id}-proposal-{slug}` legacy).
+
+**Key functions** in `hunter.py`: `spec_branch`, `resolve_capability_folder`, `read_bpa_specs_bundle`, `pin_capability_sha`, `copy_spec_refs`, `load_speckit_prompt`, `run_speckit_plan`, `run_speckit_implement`.
+
+---
+
 ## Hunter issue state machine
 
 ```
@@ -341,6 +368,7 @@ Target: 80%+ coverage. Tests use `unittest.mock` — no real GitHub calls.
 | `skip-closed-issues.md` | Stop tracking issues closed manually |
 | `trigger-mode.md` | `trigger = "ready"` vs `"requested"` |
 | `worktree-resume-fix.md` | Double-prune before worktree add |
+| `migrate-to-speckit.md` Phase I | Hunter reads BPA-Specs, runs speckit plan + implement |
 
 ### Pending (spec/changes/)
 
@@ -348,6 +376,7 @@ Target: 80%+ coverage. Tests use `unittest.mock` — no real GitHub calls.
 |------|---------|
 | `analyze-command.md` | `predd analyze` / `hunter analyze` command to read logs and produce improvement specs |
 | `hunter-jira-frontmatter.md` | Add Jira metadata frontmatter block to proposal/impl PR bodies |
+| `migrate-to-speckit.md` Phase II | predd analyze+tasks review of proposal PRs; re-plan loop |
 | `obsidian-observe.md` | Hourly: read GitHub activity, write one Obsidian note per active PR/issue |
 | `obsidian-analyze.md` | Daily: read 7 days of observations, produce analysis note + spec files |
 | `obsidian-daemon.md` | Third daemon running observe hourly and analyze daily |
