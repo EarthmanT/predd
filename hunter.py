@@ -56,21 +56,19 @@ gh_run = _predd.gh_run
 
 # Failure comment templates for hunter
 _HUNTER_NO_COMMITS_COMMENT = """\
-⚠️ Hunter could not create a PR for this issue.
+⚠️ Hunter ran the `{skill}` skill for this issue but the AI produced no commits.
 
-The AI skill ran but produced no git commits. This usually means:
-- The issue description is too vague for the AI to understand what to build
-- The issue requires context not present in the description
-- The skill prompt needs improvement for this type of work
+**What this means:** The AI couldn't determine what to build from the current issue description.
 
-**Issue:** {repo}#{issue_number}
-**Skill:** {skill}
-**Error:** Skill produced no commits — not creating empty PR
+**To unblock this issue, add one or more of the following to the description:**
 
-Please either:
-1. Add more details to the issue description
-2. Create the PR manually
-3. Improve the skill prompt at ~/.windsurf/skills/{skill}/SKILL.md
+- **File/directory references** — which files or modules should be changed? (e.g. `skills/my_skill/`, `blueprint_assist/handlers.py`)
+- **Concrete acceptance criteria** — what should work after this is implemented?
+- **Node type / API references** — if this involves specific types or APIs, name them explicitly (e.g. `dell.nodes.Compute`, not generic names)
+- **Pointer to related code** — link a file, class, or function that is the starting point
+- **What NOT to do** — constraints or anti-patterns the AI should avoid
+
+Once the description is updated, hunter will retry automatically on the next cycle.
 """
 
 _HUNTER_PUSH_FAILURE_COMMENT = """\
@@ -1150,8 +1148,38 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
         log_decision("impl_created", repo=repo, issue=issue_number, pr=pr_number)
         logger.info("Impl PR #%d created for issue %s", pr_number, key)
 
+    except RuntimeError as e:
+        logger.error("Failed starting implementation for %s: %s", key, e, exc_info=True)
+        if cfg.comment_on_failures:
+            try:
+                if "no commits" in str(e).lower():
+                    comment = _HUNTER_NO_COMMITS_COMMENT.format(
+                        repo=repo, issue_number=issue_number, skill="impl"
+                    )
+                else:
+                    comment = _HUNTER_CRASH_COMMENT.format(
+                        repo=repo, issue_number=issue_number, skill="impl",
+                        error=str(e), worktree_path=worktree
+                    )
+                gh_issue_comment(repo, issue_number, comment)
+                gh_issue_add_label(repo, issue_number, f"{cfg.github_user}:hunter-failed")
+                log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason=str(e)[:100])
+            except Exception as comment_err:
+                logger.error("Failed to post failure comment for %s: %s", key, comment_err)
+        update_issue_state(state, key, status="failed")
     except Exception as e:
         logger.error("Failed starting implementation for %s: %s", key, e, exc_info=True)
+        if cfg.comment_on_failures:
+            try:
+                comment = _HUNTER_CRASH_COMMENT.format(
+                    repo=repo, issue_number=issue_number, skill="impl",
+                    error=str(e), worktree_path=worktree
+                )
+                gh_issue_comment(repo, issue_number, comment)
+                gh_issue_add_label(repo, issue_number, f"{cfg.github_user}:hunter-failed")
+                log_decision("issue_failure_commented", repo=repo, issue=issue_number, reason="crash", error=str(e)[:100])
+            except Exception as comment_err:
+                logger.error("Failed to post failure comment for %s: %s", key, comment_err)
         update_issue_state(state, key, status="failed")
 
 
