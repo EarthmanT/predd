@@ -1,11 +1,10 @@
 # predd
 
-Two background daemons that automate GitHub work:
+Three background daemons that automate GitHub work:
 
 - **predd** — watches your repos and posts AI code reviews on every open PR
 - **hunter** — picks up GitHub issues assigned to you, writes a proposal, implements it, self-reviews, and closes the issue when the PR merges
-
-A third daemon (**obsidian**) is planned but not yet active.
+- **obsidian** — reads decision logs and GitHub activity, writes observation notes, and produces improvement specs on a schedule
 
 ---
 
