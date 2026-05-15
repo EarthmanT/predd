@@ -1364,11 +1364,7 @@ def _make_speckit_cfg_predd(tmp_path: Path) -> pw.Config:
         "speckit_run_analyze": True,
         "speckit_prompt_dir": str(prompt_dir),
     }
-    import tomllib as _tomllib
-    import io as _io
-    # Build via raw dict using Config directly
-    cfg = pw.Config.__new__(pw.Config)
-    cfg.__init__(data)
+    cfg = pw.Config(data)
     return cfg
 
 
@@ -1549,8 +1545,6 @@ class TestProcessPrSpeckitFork:
             "labels": [{"name": "sdd-implementation"}],
             "body": "some body",
         })
-        review_response = MagicMock()
-        review_response.stdout = ""
 
         with patch.object(pw, "gh_run", side_effect=[pr_detail_response]) as mock_gh, \
              patch.object(pw, "setup_worktree", return_value=tmp_path / "wt"), \

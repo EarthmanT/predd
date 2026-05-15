@@ -1606,20 +1606,27 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
 # Spec Kit Phase II — analyze + tasks review of speckit proposal PRs
 # ---------------------------------------------------------------------------
 
-def _load_speckit_template(cfg: "Config", template_name: str, **kwargs: object) -> str:
-    """Load and render a speckit prompt template from cfg.speckit_prompt_dir."""
+def load_speckit_prompt(cfg: "Config", template_name: str, **kwargs: object) -> str:
+    """Read a speckit prompt template and render it with kwargs."""
     path = cfg.speckit_prompt_dir / f"{template_name}.md"
-    return path.read_text().format(**kwargs)
+    if not path.exists():
+        raise FileNotFoundError(f"Speckit prompt template not found: {path}")
+    try:
+        return path.read_text().format(**kwargs)
+    except KeyError as e:
+        raise KeyError(
+            f"Speckit template {path.name!r} references placeholder {e} "
+            f"that was not supplied. Check the template for typos or unescaped braces."
+        ) from e
 
 
 def _parse_issue_number_from_pr_body(body: str) -> int | None:
     """Extract GitHub issue number from a PR body containing <!-- hunter:issue-N -->."""
-    import re as _re
-    m = _re.search(r"<!--\s*hunter:issue-(\d+)\s*-->", body or "")
+    m = re.search(r"<!--\s*hunter:issue-(\d+)\s*-->", body or "")
     if m:
         return int(m.group(1))
     # Fallback: plain "issue #N" text
-    m = _re.search(r"issue\s+#(\d+)", body or "", _re.IGNORECASE)
+    m = re.search(r"issue\s+#(\d+)", body or "", re.IGNORECASE)
     return int(m.group(1)) if m else None
 
 
@@ -1642,7 +1649,7 @@ def run_speckit_review(
     clarif_path = spec_refs / "clarifications.md"
     clarifications_path = str(clarif_path) if clarif_path.exists() else "(not present)"
 
-    analyze_prompt = _load_speckit_template(
+    analyze_prompt = load_speckit_prompt(
         cfg, "analyze",
         plan_path=str(plan_path),
         spec_refs_dir=str(spec_refs),
@@ -1657,14 +1664,13 @@ def run_speckit_review(
                   if analysis.strip() else "")
     approved = first_line.startswith("APPROVE")
 
-    import tempfile as _tempfile
-    with _tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
         review_body_path = Path(f.name)
         f.write(analysis)
 
     try:
         if approved:
-            tasks_prompt = _load_speckit_template(
+            tasks_prompt = load_speckit_prompt(
                 cfg, "tasks",
                 plan_path=str(plan_path),
                 spec_refs_dir=str(spec_refs),

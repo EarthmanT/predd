@@ -4681,7 +4681,7 @@ class TestRunSpeckitImplement:
 
 
 def _entry_spec_open(issue_number: int = 20, analyze_fix_loops: int = 0,
-                     proposal_pr: int | None = 5) -> dict:
+                     proposal_pr: int | None = None) -> dict:
     return {
         "issue_number": issue_number,
         "title": f"[DAP09A-{issue_number}] Test",

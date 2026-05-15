@@ -54,6 +54,8 @@ _run_bedrock_skill = _predd._run_bedrock_skill
 gh_issue_comment = _predd.gh_issue_comment
 gh_issue_add_label = _predd.gh_issue_add_label
 gh_run = _predd.gh_run
+gh_ensure_label_exists = _predd.gh_ensure_label_exists
+load_speckit_prompt = _predd.load_speckit_prompt
 
 # ---------------------------------------------------------------------------
 # Jira API circuit-breaker state
@@ -471,9 +473,6 @@ def gh_issue_view(repo: str, issue_number: int) -> dict:
 def gh_issue_comment(repo: str, issue_number: int, body: str) -> None:
     gh_run(["issue", "comment", str(issue_number), "--repo", repo, "--body", body])
 
-
-def gh_ensure_label_exists(repo: str, label: str, color: str = "0075ca") -> None:
-    gh_run(["label", "create", label, "--repo", repo, "--color", color, "--force"])
 
 
 def gh_find_merged_proposal(repo: str, issue_number: int, title: str) -> int | None:
@@ -1033,24 +1032,6 @@ def copy_spec_refs(bundle: dict, worktree: Path) -> Path:
         shutil.copy2(bundle["clarifications"], spec_refs / "clarifications.md")
     return spec_refs
 
-
-def load_speckit_prompt(cfg: Config, template_name: str, **kwargs) -> str:
-    """Read a speckit prompt template and render it with kwargs.
-
-    Uses str.format() with named placeholders — literal braces in templates must
-    be escaped as {{ and }} (standard Python format string rules).
-    """
-    template_path = cfg.speckit_prompt_dir / f"{template_name}.md"
-    if not template_path.exists():
-        raise FileNotFoundError(f"Speckit prompt template not found: {template_path}")
-    text = template_path.read_text()
-    try:
-        return text.format(**kwargs)
-    except KeyError as e:
-        raise KeyError(
-            f"Speckit template {template_path.name!r} references placeholder {e} "
-            f"that was not supplied. Check the template for typos or unescaped braces."
-        ) from e
 
 
 def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
