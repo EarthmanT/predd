@@ -68,6 +68,33 @@ Instrument at those three entry points. No need to touch individual call sites.
 - Log format for existing events
 - Decision log schema for other events
 
+## 24-hour summary log
+
+At the start of each daemon poll cycle, if 24 hours have elapsed since the last summary, write a summary line to the log:
+
+```
+INFO llm_daily_summary period=24h calls=47 input_chars=612400 output_chars=84200 backends=bedrock:45,claude:2
+```
+
+Also write a `llm_daily_summary` decision log entry:
+
+```json
+{
+  "ts": "...",
+  "event": "llm_daily_summary",
+  "period_hours": 24,
+  "calls": 47,
+  "input_chars": 612400,
+  "output_chars": 84200,
+  "by_context": {
+    "pr_review": {"calls": 32, "input_chars": 410000, "output_chars": 61000},
+    "proposal": {"calls": 8, "input_chars": 120000, "output_chars": 15000}
+  }
+}
+```
+
+Aggregate from the `llm_call` entries in the decision log for the prior 24 hours. Written by both predd and hunter (each to their own decision log).
+
 ## Tests
 
 - `_run_bedrock_skill` call → `llm_call` decision log entry with correct input/output chars and duration
