@@ -4,6 +4,7 @@
 # dependencies = [
 #   "click",
 #   "anthropic[bedrock]>=0.42.0",
+#   "pyyaml>=6.0",
 # ]
 # ///
 
@@ -23,6 +24,7 @@ import time
 from pathlib import Path
 
 import click
+import yaml
 
 # ---------------------------------------------------------------------------
 # Import shared pieces from predd
@@ -56,6 +58,7 @@ gh_issue_add_label = _predd.gh_issue_add_label
 gh_run = _predd.gh_run
 gh_ensure_label_exists = _predd.gh_ensure_label_exists
 load_speckit_prompt = _predd.load_speckit_prompt
+_run_skill_prompt = _predd._run_skill_prompt
 
 # ---------------------------------------------------------------------------
 # Jira API circuit-breaker state
@@ -1034,19 +1037,101 @@ def copy_spec_refs(bundle: dict, worktree: Path) -> Path:
 
 
 
+def _write_spec_refs_from_blocks(
+    worktree: Path,
+    constitution: str,
+    capability_spec: str,
+    story_spec: str,
+) -> Path:
+    """Write embedded speckit blocks directly into worktree/spec-refs/. Returns path."""
+    spec_refs = worktree / "spec-refs"
+    spec_refs.mkdir(parents=True, exist_ok=True)
+    (spec_refs / "constitution.md").write_text(constitution)
+    (spec_refs / "capability-spec.md").write_text(capability_spec)
+    (spec_refs / "story-spec.md").write_text(story_spec)
+    return spec_refs
+
+
 def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
                      issue_number: int, title: str, issue_body: str) -> bool:
-    """Run the speckit plan phase. Returns True if speckit ran, False to fall back to legacy."""
+    """Run the speckit plan phase. Returns True if speckit ran, False to fall back to legacy.
+
+    Reads spec-kit artifacts from embedded <!-- speckit:* --> blocks in the issue body
+    when present. Falls back to reading from capability_specs_path on disk if blocks
+    are missing.
+    """
     jira_key = entry.get("jira_key", "")
     epic_name = entry.get("epic_name", "")
     epic_key = entry.get("epic_key", "")
+    story_id = jira_key or str(issue_number)
+    repo = entry.get("repo", "")
+
+    # --- Try embedded blocks first ---
+    embedded_constitution = _extract_speckit_block(issue_body or "", "constitution")
+    embedded_cap_spec = _extract_speckit_block(issue_body or "", "capability-spec")
+    embedded_story_spec = _extract_speckit_block(issue_body or "", "story-spec")
+
+    if embedded_constitution and embedded_cap_spec and embedded_story_spec:
+        logger.info("speckit: using embedded speckit blocks from issue #%d body", issue_number)
+        log_decision("speckit_from_issue_body", issue=issue_number, story_id=story_id)
+
+        spec_refs = _write_spec_refs_from_blocks(
+            worktree, embedded_constitution, embedded_cap_spec, embedded_story_spec
+        )
+        commit_skill_output(worktree, f"speckit: copy spec-refs for issue #{issue_number}")
+
+        # Best-effort: get capability name and SHA from disk (for plan.md frontmatter)
+        capability_dir = resolve_capability_folder(cfg, epic_name, epic_key)
+        capability_name = str(capability_dir.name) if capability_dir else (epic_name or story_id)
+        try:
+            sha = pin_capability_sha(cfg) if capability_dir else "embedded"
+        except RuntimeError:
+            sha = "embedded"
+
+        prompt = load_speckit_prompt(
+            cfg, template_name="plan",
+            issue_number=issue_number,
+            issue_title=title,
+            issue_body=issue_body or "(no description)",
+            constitution_path=str(spec_refs / "constitution.md"),
+            capability_spec_path=str(spec_refs / "capability-spec.md"),
+            story_spec_path=str(spec_refs / "story-spec.md"),
+            clarifications_path="(not present)",
+            spec_refs_dir=str(spec_refs),
+            capability_specs_sha=sha,
+            capability=capability_name,
+            story_id=story_id,
+        )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, prefix="speckit-plan-"
+        ) as f:
+            tmp_path = Path(f.name)
+            f.write(prompt)
+
+        context = build_issue_context(issue_number, title, issue_body, entry)
+        try:
+            run_skill(cfg, tmp_path, context, worktree)
+            if not (worktree / "plan.md").exists():
+                raise RuntimeError("speckit plan skill did not produce plan.md")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        log_decision("plan_completed", issue=issue_number, story_id=story_id,
+                     capability=capability_name, sha=sha, source="issue_body")
+        return True
+
+    # --- Fall back to disk ---
+    if embedded_constitution or embedded_cap_spec or embedded_story_spec:
+        logger.warning(
+            "speckit: issue #%d has some but not all embedded blocks — falling back to disk",
+            issue_number,
+        )
 
     capability_dir = resolve_capability_folder(cfg, epic_name, epic_key)
     if capability_dir is None:
         return False
 
-    story_id = jira_key or str(issue_number)
-    repo = entry.get("repo", "")
     try:
         bundle = read_bpa_specs_bundle(capability_dir, story_id)
     except RuntimeError as e:
@@ -1147,6 +1232,419 @@ def run_speckit_implement(cfg: Config, entry: dict, worktree: Path,
         run_skill(cfg, tmp_path, context, worktree)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Spec Kit — intake (capability + stories from company format)
+# ---------------------------------------------------------------------------
+
+_SPECKIT_BLOCK_RE = re.compile(
+    r"<!-- speckit:(?P<name>[a-z-]+)\n(?P<content>.*?)\n-->",
+    re.DOTALL,
+)
+
+
+def _extract_speckit_block(body: str, name: str) -> str | None:
+    """Extract content of a named speckit HTML-comment block from an issue body."""
+    m = re.search(
+        rf"<!-- speckit:{re.escape(name)}\n(.*?)\n-->",
+        body or "",
+        re.DOTALL,
+    )
+    return m.group(1) if m else None
+
+
+def _embed_speckit_blocks(
+    body: str,
+    constitution: str,
+    capability_spec: str,
+    story_spec: str,
+) -> str:
+    """Replace or append speckit HTML-comment blocks in an issue body.
+
+    Pure function — no I/O. Idempotent: existing blocks are replaced, not appended.
+    """
+    blocks = {
+        "constitution": constitution,
+        "capability-spec": capability_spec,
+        "story-spec": story_spec,
+    }
+    replaced: set[str] = set()
+
+    def _replacer(m: re.Match) -> str:
+        name = m.group("name")
+        if name in blocks:
+            replaced.add(name)
+            return f"<!-- speckit:{name}\n{blocks[name]}\n-->"
+        return m.group(0)
+
+    result = _SPECKIT_BLOCK_RE.sub(_replacer, body)
+
+    # Append any blocks that were not already present
+    appended: list[str] = []
+    for name in ("constitution", "capability-spec", "story-spec"):
+        if name not in replaced:
+            appended.append(f"<!-- speckit:{name}\n{blocks[name]}\n-->")
+
+    if appended:
+        sep = "\n\n" if result.strip() else ""
+        result = result.rstrip() + sep + "\n\n".join(appended)
+
+    return result
+
+
+def _read_capability_source(source_dir: Path) -> dict:
+    """Read company-format capability folder. Returns a structured dict.
+
+    Keys: slug, capability_id, title, business_requirement, hld,
+          business_spec, notes, slices.
+    slices: list of dicts with slice_md, jira_epic, jira_stories,
+            impacted_repos, status, slice_id.
+    """
+    cap_yaml_path = source_dir / "capability.yaml"
+    if not cap_yaml_path.exists():
+        raise FileNotFoundError(f"capability.yaml not found in {source_dir}")
+
+    with cap_yaml_path.open() as f:
+        cap_data = yaml.safe_load(f) or {}
+
+    slug = cap_data.get("slug", source_dir.name)
+    capability_id = cap_data.get("id", "")
+    title = cap_data.get("title", slug)
+
+    def _read_optional(filename: str) -> str:
+        p = source_dir / filename
+        return p.read_text() if p.exists() else ""
+
+    business_requirement = _read_optional("business_requirement.md")
+    hld = _read_optional("hld.md")
+    business_spec = _read_optional("business_spec.md")
+    notes = _read_optional("notes.md")
+
+    slices = []
+    slices_dir = source_dir / "slices"
+    if slices_dir.exists():
+        for slice_dir in sorted(slices_dir.iterdir()):
+            if not slice_dir.is_dir():
+                continue
+            slice_yaml_path = slice_dir / "slice.yaml"
+            slice_md_path = slice_dir / "slice.md"
+            slice_yaml: dict = {}
+            if slice_yaml_path.exists():
+                with slice_yaml_path.open() as f:
+                    slice_yaml = yaml.safe_load(f) or {}
+            slice_md = slice_md_path.read_text() if slice_md_path.exists() else ""
+            jira_stories = slice_yaml.get("jira_stories", []) or []
+            slices.append({
+                "slice_id": slice_dir.name,
+                "slice_md": slice_md,
+                "jira_epic": slice_yaml.get("jira_epic", ""),
+                "jira_stories": jira_stories,
+                "impacted_repos": slice_yaml.get("impacted_repos", []) or [],
+                "status": slice_yaml.get("status", ""),
+            })
+
+    return {
+        "slug": slug,
+        "capability_id": capability_id,
+        "title": title,
+        "business_requirement": business_requirement,
+        "hld": hld,
+        "business_spec": business_spec,
+        "notes": notes,
+        "slices": slices,
+    }
+
+
+def _run_intake_prompt(cfg: Config, prompt: str) -> str:
+    """Run a plain-text prompt through the configured backend, returning text output."""
+    with tempfile.TemporaryDirectory(prefix="hunter-intake-") as tmpdir:
+        return _run_skill_prompt(cfg, prompt, Path(tmpdir))
+
+
+def intake_capability(cfg: Config, source_dir: Path) -> None:
+    """Read a company-format capability folder and write spec-kit constitution.md + spec.md."""
+    if not cfg.capability_specs_path:
+        raise click.ClickException(
+            "capability_specs_path is not set in config. "
+            "Add it to ~/.config/predd/config.toml."
+        )
+
+    source = _read_capability_source(source_dir)
+    slug = source["slug"]
+    title = source["title"]
+    out_dir = cfg.capability_specs_path / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Capability: {slug}")
+    click.echo(f"Output dir: {out_dir}")
+
+    # --- constitution.md ---
+    click.echo("Writing constitution.md...", nl=False)
+    constitution_prompt = load_speckit_prompt(
+        cfg, "intake-constitution",
+        slug=slug,
+        title=title,
+        business_requirement=source["business_requirement"] or "(not provided)",
+        hld=source["hld"] or "(not provided)",
+        business_spec=source["business_spec"] or "(not provided)",
+        notes=source["notes"] or "(not provided)",
+    )
+    constitution_text = _run_intake_prompt(cfg, constitution_prompt)
+    (out_dir / "constitution.md").write_text(constitution_text)
+    click.echo(" done")
+
+    # --- spec.md ---
+    click.echo("Writing spec.md...", nl=False)
+    spec_prompt = load_speckit_prompt(
+        cfg, "intake-spec",
+        slug=slug,
+        title=title,
+        business_requirement=source["business_requirement"] or "(not provided)",
+        hld=source["hld"] or "(not provided)",
+        business_spec=source["business_spec"] or "(not provided)",
+        notes=source["notes"] or "(not provided)",
+    )
+    spec_text = _run_intake_prompt(cfg, spec_prompt)
+    (out_dir / "spec.md").write_text(spec_text)
+    click.echo(" done")
+
+    # --- Summary ---
+    all_story_keys: list[tuple[str, str]] = []  # (jira_key, slice_id)
+    for sl in source["slices"]:
+        for key in sl["jira_stories"]:
+            all_story_keys.append((key, sl["slice_id"]))
+
+    if all_story_keys:
+        click.echo("")
+        click.echo("Stories found in slices (run intake-stories to generate):")
+        for jira_key, slice_id in all_story_keys:
+            click.echo(f"  {jira_key:<14}  ({slice_id})")
+    else:
+        click.echo("")
+        click.echo("No story keys found in slices.")
+
+
+def _find_github_issue_for_jira_key(
+    cfg: Config, repos: list[str], jira_key: str
+) -> tuple[str, int] | None:
+    """Search repos for an open GitHub issue whose title contains the Jira key.
+
+    Returns (repo, issue_number) or None if not found.
+    """
+    for repo in repos:
+        try:
+            result = gh_run([
+                "issue", "list", "--repo", repo,
+                "--state", "open", "--limit", "200",
+                "--json", "number,title",
+            ], check=False)
+            if result.returncode != 0:
+                continue
+            issues = json.loads(result.stdout)
+        except Exception as e:
+            logger.warning("intake-stories: could not list issues for %s: %s", repo, e)
+            continue
+
+        for issue in issues:
+            title = issue.get("title", "")
+            if jira_key in title:
+                return (repo, issue["number"])
+
+    return None
+
+
+def _fetch_jira_story(cfg: Config, jira_key: str) -> dict | None:
+    """Fetch a single Jira story. Returns None on 404; raises on other errors."""
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not token:
+        raise RuntimeError("JIRA_API_TOKEN environment variable is not set")
+    client = JiraClient(cfg.jira_base_url, token)
+    try:
+        return client.get_issue(jira_key)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "404" in err_str or "not found" in err_str:
+            return None
+        raise
+
+
+def _parse_slice_sections(slice_md: str) -> dict[str, str]:
+    """Extract named sections from a slice.md file.
+
+    Looks for headers like '## Goal', '## Scope', '## Out of Scope',
+    '## Done When', '## Trace Links'. Returns dict with lowercase-underscore keys.
+    """
+    sections: dict[str, str] = {}
+    current_key: str | None = None
+    current_lines: list[str] = []
+
+    _header_map = {
+        "goal": "goal",
+        "scope": "scope",
+        "out of scope": "out_of_scope",
+        "done when": "done_when",
+        "trace links": "trace_links",
+        "inputs": "inputs",
+    }
+
+    for line in slice_md.splitlines():
+        m = re.match(r"^#{1,3}\s+(.+)$", line)
+        if m:
+            if current_key is not None:
+                sections[current_key] = "\n".join(current_lines).strip()
+            heading = m.group(1).strip().lower()
+            current_key = _header_map.get(heading)
+            current_lines = []
+        elif current_key is not None:
+            current_lines.append(line)
+
+    if current_key is not None:
+        sections[current_key] = "\n".join(current_lines).strip()
+
+    return sections
+
+
+def _extract_jira_story_fields(issue_data: dict) -> dict[str, str]:
+    """Extract summary, description, and acceptance criteria from a Jira issue dict."""
+    fields = issue_data.get("fields") or {}
+    summary = fields.get("summary", "").strip()
+    description = fields.get("description", "") or ""
+    # ACs are often in a custom field or embedded in description
+    # Try common field names; fall back to empty string
+    acceptance_criteria = (
+        fields.get("customfield_10016", "")
+        or fields.get("customfield_10014", "")
+        or fields.get("acceptance_criteria", "")
+        or ""
+    )
+    return {
+        "summary": summary,
+        "description": str(description).strip(),
+        "acceptance_criteria": str(acceptance_criteria).strip(),
+    }
+
+
+def _is_thin_story(jira_fields: dict[str, str]) -> bool:
+    """Return True if the story has <50-word description or no acceptance criteria."""
+    description = jira_fields.get("description", "")
+    ac = jira_fields.get("acceptance_criteria", "")
+    word_count = len(description.split())
+    return word_count < 50 or not ac.strip()
+
+
+def intake_stories(cfg: Config, source_dir: Path) -> None:
+    """For each slice, generate story spec files and embed them into GitHub issues."""
+    if not cfg.capability_specs_path:
+        raise click.ClickException(
+            "capability_specs_path is not set in config. "
+            "Add it to ~/.config/predd/config.toml."
+        )
+    if not cfg.jira_api_enabled:
+        raise click.ClickException(
+            "jira_api_enabled = false in config. "
+            "Set jira_api_enabled = true and configure jira_base_url."
+        )
+
+    source = _read_capability_source(source_dir)
+    slug = source["slug"]
+    cap_dir = cfg.capability_specs_path / slug
+
+    constitution_path = cap_dir / "constitution.md"
+    capability_spec_path = cap_dir / "spec.md"
+    if not constitution_path.exists() or not capability_spec_path.exists():
+        raise click.ClickException(
+            f"constitution.md or spec.md not found in {cap_dir}. "
+            "Run `hunter intake-capability` first."
+        )
+
+    constitution_text = constitution_path.read_text()
+    capability_spec_text = capability_spec_path.read_text()
+
+    hunter_repos = cfg.repos_for("hunter")
+
+    for sl in source["slices"]:
+        slice_id = sl["slice_id"]
+        jira_stories = sl["jira_stories"]
+        click.echo(f"Slice {slice_id}: {len(jira_stories)} stor{'y' if len(jira_stories) == 1 else 'ies'}")
+
+        sections = _parse_slice_sections(sl["slice_md"])
+        impacted_repos_str = ", ".join(sl["impacted_repos"]) if sl["impacted_repos"] else "(none)"
+
+        for jira_key in jira_stories:
+            click.echo(f"  {jira_key:<14} ", nl=False)
+
+            # Fetch from Jira
+            try:
+                issue_data = _fetch_jira_story(cfg, jira_key)
+            except Exception as e:
+                click.echo(f"⚠ Jira fetch failed: {e}")
+                continue
+
+            if issue_data is None:
+                click.echo("⚠ 404 in Jira — skipping")
+                continue
+
+            jira_fields = _extract_jira_story_fields(issue_data)
+            thin = _is_thin_story(jira_fields)
+
+            # Build story spec via LLM
+            story_prompt = load_speckit_prompt(
+                cfg, "intake-story",
+                slice_goal=sections.get("goal", "(not found)"),
+                slice_scope=sections.get("scope", "(not found)"),
+                slice_out_of_scope=sections.get("out_of_scope", "(not found)"),
+                slice_done_when=sections.get("done_when", "(not found)"),
+                slice_trace_links=sections.get("trace_links", "(not found)"),
+                impacted_repos=impacted_repos_str,
+                jira_summary=jira_fields["summary"],
+                jira_description=jira_fields["description"] or "(no description)",
+                jira_acceptance_criteria=jira_fields["acceptance_criteria"] or "(none)",
+            )
+            story_text = _run_intake_prompt(cfg, story_prompt)
+
+            if thin:
+                warning_header = (
+                    "> ⚠️ Thin story: no acceptance criteria found in Jira. "
+                    'Slice "Done When" used as fallback.\n\n'
+                )
+                story_text = warning_header + story_text
+
+            # Write to disk
+            story_dir = cap_dir / "stories" / jira_key
+            story_dir.mkdir(parents=True, exist_ok=True)
+            (story_dir / "spec.md").write_text(story_text)
+            thin_marker = " (⚠ thin story)" if thin else ""
+            click.echo(f"Writing stories/{jira_key}/spec.md... done{thin_marker}")
+
+            # Embed into GitHub issue
+            gh_result = _find_github_issue_for_jira_key(cfg, hunter_repos, jira_key)
+            if gh_result is None:
+                click.echo(
+                    f"             ⚠ No GitHub issue found for {jira_key} — skipping embed"
+                )
+                continue
+
+            repo, issue_number = gh_result
+            click.echo(f"             Updating GitHub issue {repo}#{issue_number}...", nl=False)
+            try:
+                issue_view = gh_run([
+                    "issue", "view", str(issue_number),
+                    "--repo", repo,
+                    "--json", "body",
+                ])
+                current_body = json.loads(issue_view.stdout).get("body") or ""
+                new_body = _embed_speckit_blocks(
+                    current_body, constitution_text, capability_spec_text, story_text
+                )
+                gh_run([
+                    "issue", "edit", str(issue_number),
+                    "--repo", repo,
+                    "--body", new_body,
+                ])
+                click.echo(" done")
+            except Exception as e:
+                click.echo(f" failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2935,6 +3433,34 @@ def init_cmd(force: bool, ui: bool):
         click.echo("Web UI not yet implemented.")
         return
     _predd.run_config_wizard(force=force)
+
+
+@cli.command(name="intake-capability")
+@click.argument("source_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def cmd_intake_capability(source_dir: Path):
+    """Generate spec-kit constitution.md + spec.md from a company-format capability folder."""
+    setup_logging()
+    cfg = load_config()
+    if not cfg.speckit_enabled:
+        raise click.ClickException(
+            "speckit_enabled = false in config. "
+            "Set speckit_enabled = true to use intake commands."
+        )
+    intake_capability(cfg, source_dir)
+
+
+@cli.command(name="intake-stories")
+@click.argument("source_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def cmd_intake_stories(source_dir: Path):
+    """Generate per-story spec.md files and embed them into GitHub issues."""
+    setup_logging()
+    cfg = load_config()
+    if not cfg.speckit_enabled:
+        raise click.ClickException(
+            "speckit_enabled = false in config. "
+            "Set speckit_enabled = true to use intake commands."
+        )
+    intake_stories(cfg, source_dir)
 
 
 if __name__ == "__main__":
