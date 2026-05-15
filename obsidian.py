@@ -659,9 +659,23 @@ For each pattern:
 - Suggest a concrete fix (skill improvement, prompt change, or code change)
 
 If you identify a fix that should be implemented as a code/config change,
-write it as a spec file using this format and place it in spec/changes/:
-  - Filename: kebab-case description
-  - Contents: follow the spec format in spec/changes/ (see existing examples)
+write it as a spec file using EXACTLY this fenced block format — this is required for automated extraction:
+
+```spec:kebab-case-description.md
+# Title
+
+## Problem
+...
+
+## What to fix
+...
+
+## Tests
+...
+```
+
+You may include multiple spec blocks. Each must start with ```spec: followed immediately by the filename.
+Do not use any other format for specs — prose descriptions outside these blocks will not be saved.
 
 Be direct. Prioritize by impact. Skip patterns with only 1 occurrence.
 """
