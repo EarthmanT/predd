@@ -389,7 +389,7 @@ Target: 80%+ coverage. Tests use `unittest.mock` — no real GitHub calls.
 
 - **hunter-jira-frontmatter.md**: Jira API frontmatter on PRs not implemented. CSV ingestion exists but does not add frontmatter to PR bodies.
 - **teams-approval-gate.md**: MCP Teams approval server not implemented.
-- **obsidian-*.md**: `predd observe` and `predd analyze` are implemented. A standalone `obsidian` daemon is wired in `start.sh` but runs via predd's CLI — there is no separate `obsidian.py` binary.
+- **obsidian-*.md**: Fully implemented. `obsidian.py` is a standalone daemon with its own `start` command, wired into `start.sh` as a systemd service. `predd observe` and `predd analyze` also expose the same functionality via the predd CLI.
 - **`analyze` command**: not yet implemented in either CLI.
 - **Resume logic for `in_progress`**: still searches by `hunter:issue-N` body marker (the old pattern) when checking for an existing proposal PR after a crash. This is a known inconsistency since the primary discovery path now uses `sdd-proposal` label.
 - **Self-review fix prompt**: hardcoded string `"Fix the review findings on PR #{impl_pr}. Original issue: #{issue_number}"` — does not pass the actual review output to the fix skill.
