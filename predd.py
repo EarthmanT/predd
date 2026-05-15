@@ -1660,8 +1660,9 @@ def run_speckit_review(
     )
 
     analysis = _run_skill_prompt(cfg, analyze_prompt, worktree)
-    first_line = (analysis.strip().splitlines()[0].strip().upper()
-                  if analysis.strip() else "")
+    if not analysis or not analysis.strip():
+        raise RuntimeError("Speckit analyze prompt produced no output")
+    first_line = analysis.strip().splitlines()[0].strip().upper()
     approved = first_line.startswith("APPROVE")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -1676,6 +1677,8 @@ def run_speckit_review(
                 spec_refs_dir=str(spec_refs),
             )
             tasks_text = _run_skill_prompt(cfg, tasks_prompt, worktree)
+            if not tasks_text or not tasks_text.strip():
+                raise RuntimeError("Speckit tasks prompt produced no output")
             tasks_path = worktree / "tasks.md"
             tasks_path.write_text(tasks_text)
 

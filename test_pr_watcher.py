@@ -1501,6 +1501,37 @@ class TestRunSpeckitReview:
 
         assert str(clarif) in captured_prompts[0]
 
+    def test_empty_analysis_raises(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+
+        with patch.object(pw, "_run_skill_prompt", return_value="   \n\n"), \
+             patch.object(pw, "log_decision"):
+            with pytest.raises(RuntimeError, match="no output"):
+                pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+    def test_empty_tasks_raises(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+
+        with patch.object(pw, "_run_skill_prompt",
+                          side_effect=["APPROVE\nAll good.", ""]), \
+             patch.object(pw, "log_decision"), \
+             patch("subprocess.run"):
+            with pytest.raises(RuntimeError, match="no output"):
+                pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+    def test_whitespace_only_tasks_raises(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+
+        with patch.object(pw, "_run_skill_prompt",
+                          side_effect=["APPROVE\nAll good.", "   \n\t\n"]), \
+             patch.object(pw, "log_decision"), \
+             patch("subprocess.run"):
+            with pytest.raises(RuntimeError, match="no output"):
+                pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
 
 class TestProcessPrSpeckitFork:
     """process_pr calls run_speckit_review for sdd-proposal PRs when speckit_run_analyze=True."""
