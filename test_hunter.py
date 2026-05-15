@@ -4673,3 +4673,127 @@ class TestRunSpeckitImplement:
             h.run_speckit_implement(cfg, self._make_entry(), worktree, 7, "My story", "body")
 
         assert received_kwargs["tasks_path"] == str(tasks)
+
+
+# ---------------------------------------------------------------------------
+# TestSpeckitReplanLoop — Phase II re-plan loop in check_proposal_merged
+# ---------------------------------------------------------------------------
+
+
+def _entry_spec_open(issue_number: int = 20, analyze_fix_loops: int = 0,
+                     proposal_pr: int | None = 5) -> dict:
+    return {
+        "issue_number": issue_number,
+        "title": f"[DAP09A-{issue_number}] Test",
+        "issue_body": "body",
+        "proposal_pr": proposal_pr,
+        "used_speckit": True,
+        "analyze_fix_loops": analyze_fix_loops,
+    }
+
+
+class TestSpeckitReplanLoop:
+    """check_proposal_merged re-plan loop when needs-replan label is present."""
+
+    def test_needs_replan_under_limit_resets_to_new(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_speckit_cfg(tmp_path)
+        key = "owner/repo!20"
+        entry = _entry_spec_open(issue_number=20, analyze_fix_loops=0, proposal_pr=5)
+        state = {key: entry}
+
+        issue_with_label = {"labels": [{"name": "needs-replan"}]}
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_issue_view", return_value=issue_with_label), \
+             patch.object(h, "gh_run", return_value=MagicMock(returncode=0)), \
+             patch.object(h, "gh_issue_remove_label") as mock_remove, \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", key, entry)
+
+        assert state[key]["status"] == "new"
+        assert state[key]["analyze_fix_loops"] == 1
+        assert state[key].get("proposal_pr") is None
+        mock_remove.assert_any_call("owner/repo", 20, "needs-replan")
+
+    def test_needs_replan_at_limit_marks_failed(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_speckit_cfg(tmp_path)
+        cfg.max_analyze_fix_loops = 2
+        key = "owner/repo!21"
+        entry = _entry_spec_open(issue_number=21, analyze_fix_loops=2)
+        state = {key: entry}
+
+        issue_with_label = {"labels": [{"name": "needs-replan"}]}
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_issue_view", return_value=issue_with_label), \
+             patch.object(h, "gh_issue_comment") as mock_comment, \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", key, entry)
+
+        assert state[key]["status"] == "failed"
+        mock_comment.assert_called_once()
+        assert "exhausted" in mock_comment.call_args[0][2].lower()
+
+    def test_no_needs_replan_proceeds_normally(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_speckit_cfg(tmp_path)
+        key = "owner/repo!22"
+        entry = _entry_spec_open(issue_number=22, analyze_fix_loops=0)
+        state = {key: entry}
+
+        issue_no_label = {"labels": []}
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_issue_view", return_value=issue_no_label), \
+             patch.object(h, "collect_pr_feedback"), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "gh_find_merged_proposal", return_value=None), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", key, entry)
+
+        # Status unchanged — no merged PR, no replan
+        assert state[key].get("status") != "new" and state[key].get("status") != "failed"
+
+    def test_non_speckit_entry_skips_replan_check(self, tmp_path):
+        monkeypatch_state_file(tmp_path)
+        cfg = _make_cfg(tmp_path)
+        key = "owner/repo!23"
+        entry = {
+            "issue_number": 23,
+            "title": "Legacy issue",
+            "issue_body": "body",
+            "proposal_pr": 9,
+            "used_speckit": False,
+        }
+        state = {key: entry}
+
+        with patch.object(h, "gh_issue_is_closed", return_value=False), \
+             patch.object(h, "gh_issue_view") as mock_view, \
+             patch.object(h, "collect_pr_feedback"), \
+             patch.object(h, "load_hunter_state", return_value=state), \
+             patch.object(h, "gh_find_merged_proposal", return_value=None), \
+             patch.object(h, "log_decision"), \
+             patch.object(h, "save_hunter_state"):
+            h.check_proposal_merged(cfg, state, "owner/repo", key, entry)
+
+        # gh_issue_view should NOT be called for non-speckit entries
+        mock_view.assert_not_called()
+
+    def test_max_analyze_fix_loops_config_loaded(self, tmp_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "max_analyze_fix_loops": 5,
+        }
+        cfg = h.Config(data)
+        assert cfg.max_analyze_fix_loops == 5
+
+    def test_max_analyze_fix_loops_default(self, tmp_path):
+        cfg = _make_cfg(tmp_path)
+        assert cfg.max_analyze_fix_loops == 2

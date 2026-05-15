@@ -501,6 +501,7 @@ class Config:
         self.speckit_epic_map: dict[str, str] = data.get("speckit_epic_map", {})
         self.speckit_skip_clarify: bool = data.get("speckit_skip_clarify", False)
         self.speckit_run_analyze: bool = data.get("speckit_run_analyze", False)
+        self.max_analyze_fix_loops: int = data.get("max_analyze_fix_loops", 2)
 
     @property
     def repos(self) -> list[str]:
@@ -1099,6 +1100,10 @@ def gh_issue_add_label(repo: str, issue_number: int, label: str) -> None:
     except Exception:
         pass  # Label already exists or other issue, don't crash
 
+
+def gh_ensure_label_exists(repo: str, label: str, color: str = "0075ca") -> None:
+    gh_run(["label", "create", label, "--repo", repo, "--color", color, "--force"])
+
 # ---------------------------------------------------------------------------
 # Worktree helpers
 # ---------------------------------------------------------------------------
@@ -1598,6 +1603,104 @@ def moonlight_fix_pr(cfg: "Config", state: dict, repo: str, pr: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Spec Kit Phase II — analyze + tasks review of speckit proposal PRs
+# ---------------------------------------------------------------------------
+
+def _load_speckit_template(cfg: "Config", template_name: str, **kwargs: object) -> str:
+    """Load and render a speckit prompt template from cfg.speckit_prompt_dir."""
+    path = cfg.speckit_prompt_dir / f"{template_name}.md"
+    return path.read_text().format(**kwargs)
+
+
+def _parse_issue_number_from_pr_body(body: str) -> int | None:
+    """Extract GitHub issue number from a PR body containing <!-- hunter:issue-N -->."""
+    import re as _re
+    m = _re.search(r"<!--\s*hunter:issue-(\d+)\s*-->", body or "")
+    if m:
+        return int(m.group(1))
+    # Fallback: plain "issue #N" text
+    m = _re.search(r"issue\s+#(\d+)", body or "", _re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def run_speckit_review(
+    cfg: "Config",
+    repo: str,
+    pr_number: int,
+    head_ref: str,
+    pr_body: str,
+    worktree: Path,
+) -> None:
+    """Phase II: analyze plan vs spec, produce tasks.md on APPROVE, request-changes on INCONSISTENT."""
+    plan_path = worktree / "plan.md"
+    spec_refs = worktree / "spec-refs"
+    if not plan_path.exists():
+        raise RuntimeError(f"plan.md not found in {worktree} — cannot run speckit review")
+    if not spec_refs.exists():
+        raise RuntimeError(f"spec-refs/ not found in {worktree} — cannot run speckit review")
+
+    clarif_path = spec_refs / "clarifications.md"
+    clarifications_path = str(clarif_path) if clarif_path.exists() else "(not present)"
+
+    analyze_prompt = _load_speckit_template(
+        cfg, "analyze",
+        plan_path=str(plan_path),
+        spec_refs_dir=str(spec_refs),
+        constitution_path=str(spec_refs / "constitution.md"),
+        capability_spec_path=str(spec_refs / "capability-spec.md"),
+        story_spec_path=str(spec_refs / "story-spec.md"),
+        clarifications_path=clarifications_path,
+    )
+
+    analysis = _run_skill_prompt(cfg, analyze_prompt, worktree)
+    first_line = (analysis.strip().splitlines()[0].strip().upper()
+                  if analysis.strip() else "")
+    approved = first_line.startswith("APPROVE")
+
+    import tempfile as _tempfile
+    with _tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        review_body_path = Path(f.name)
+        f.write(analysis)
+
+    try:
+        if approved:
+            tasks_prompt = _load_speckit_template(
+                cfg, "tasks",
+                plan_path=str(plan_path),
+                spec_refs_dir=str(spec_refs),
+            )
+            tasks_text = _run_skill_prompt(cfg, tasks_prompt, worktree)
+            tasks_path = worktree / "tasks.md"
+            tasks_path.write_text(tasks_text)
+
+            subprocess.run(["git", "add", "tasks.md"],
+                           cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m",
+                            f"feat(speckit): add tasks.md for PR #{pr_number}"],
+                           cwd=worktree, check=True, capture_output=True)
+            subprocess.run(["git", "push", "origin", f"HEAD:{head_ref}"],
+                           cwd=worktree, check=True, capture_output=True)
+
+            gh_pr_review(repo, pr_number, "approve", review_body_path)
+            log_decision("analyze_approved", repo=repo, pr=pr_number)
+            logger.info("Speckit review APPROVED for PR #%d — tasks.md committed", pr_number)
+        else:
+            gh_pr_review(repo, pr_number, "request-changes", review_body_path)
+            log_decision("analyze_inconsistent", repo=repo, pr=pr_number)
+            logger.info("Speckit review INCONSISTENT for PR #%d — requested changes", pr_number)
+
+            issue_number = _parse_issue_number_from_pr_body(pr_body)
+            if issue_number:
+                label = "needs-replan"
+                gh_ensure_label_exists(repo, label, color="b60205")
+                gh_issue_add_label(repo, issue_number, label)
+                log_decision("needs_replan_labeled", repo=repo, pr=pr_number,
+                             issue=issue_number)
+    finally:
+        review_body_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # PR processing
 # ---------------------------------------------------------------------------
 
@@ -1645,6 +1748,29 @@ def process_pr(cfg: Config, state: dict, repo: str, pr: dict) -> None:
 
         worktree = setup_worktree(cfg, repo, pr_number, head_sha, head_ref)
         logger.info("Worktree at %s", worktree)
+
+        # Speckit Phase II: if enabled and run_analyze is on, check if this is a
+        # speckit proposal PR and run analyze+tasks instead of the generic review.
+        if cfg.speckit_enabled and cfg.speckit_run_analyze:
+            try:
+                pr_detail = json.loads(gh_run([
+                    "pr", "view", str(pr_number), "--repo", repo,
+                    "--json", "labels,body",
+                ]).stdout)
+                pr_labels = {lb["name"] for lb in pr_detail.get("labels", [])}
+                if "sdd-proposal" in pr_labels:
+                    pr_body = pr_detail.get("body") or ""
+                    run_speckit_review(cfg, repo, pr_number, head_ref, pr_body, worktree)
+                    update_pr_state(state, key, status="submitted",
+                                   worktree=str(worktree),
+                                   review_completed=_now_iso())
+                    notify_sound(cfg.sound_review_ready)
+                    notify_toast("Speckit review posted", key)
+                    logger.info("Speckit review complete for %s", key)
+                    return
+            except Exception as speckit_err:
+                logger.warning("Speckit review failed for %s: %s — falling back to generic review",
+                               key, speckit_err)
 
         review_text = run_review(cfg, repo, pr_number, worktree)
 

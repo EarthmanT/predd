@@ -1183,6 +1183,7 @@ def _clean_hunter_labels(repo: str, issue_number: int, cfg) -> None:
         f"{cfg.github_user}:speckit-missing-spec",
         f"{cfg.github_user}:hunter-failed",
         "needs-jira-info",
+        "needs-replan",
     ]
     for label in labels_to_remove:
         try:
@@ -1483,6 +1484,51 @@ def check_proposal_merged(cfg: Config, state: dict, repo: str, key: str, entry: 
             return
     except Exception:
         pass  # if we can't check, proceed normally
+
+    # Speckit Phase II re-plan loop: if predd flagged the plan as inconsistent,
+    # close the proposal PR and reset the issue for re-planning.
+    if entry.get("used_speckit"):
+        try:
+            issue_detail = gh_issue_view(repo, issue_number)
+            issue_labels = {lb["name"] for lb in issue_detail.get("labels", [])}
+        except Exception:
+            issue_labels = set()
+
+        if "needs-replan" in issue_labels:
+            loops = entry.get("analyze_fix_loops", 0)
+            if loops >= cfg.max_analyze_fix_loops:
+                logger.warning("%s: analyze fix loops exhausted (%d/%d) — marking failed",
+                               key, loops, cfg.max_analyze_fix_loops)
+                log_decision("analyze_loops_exhausted", repo=repo, issue=issue_number,
+                             loops=loops)
+                try:
+                    gh_issue_comment(repo, issue_number,
+                        f"Hunter: speckit analyze fix loop exhausted after {loops} attempt(s). "
+                        f"Manual review required. Set `analyze_fix_loops` to 0 in state to retry.")
+                except Exception:
+                    pass
+                update_issue_state(state, key, status="failed")
+                return
+
+            proposal_pr = entry.get("proposal_pr")
+            logger.info("%s: needs-replan detected (loop %d/%d) — closing proposal PR and resetting",
+                        key, loops + 1, cfg.max_analyze_fix_loops)
+            if proposal_pr:
+                try:
+                    gh_run(["pr", "close", str(proposal_pr), "--repo", repo], check=False)
+                except Exception:
+                    pass
+            try:
+                gh_issue_remove_label(repo, issue_number, "needs-replan")
+            except Exception:
+                pass
+            log_decision("replan_reset", repo=repo, issue=issue_number,
+                         loop=loops + 1, pr=proposal_pr)
+            update_issue_state(state, key,
+                               status="new",
+                               proposal_pr=None,
+                               analyze_fix_loops=loops + 1)
+            return
 
     # Collect feedback on the proposal PR while waiting for merge
     proposal_pr = entry.get("proposal_pr")

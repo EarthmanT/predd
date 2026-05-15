@@ -1338,3 +1338,276 @@ class TestPreflightDiffCheck:
         ]
         assert len(size_check_calls) == 0
         mock_worktree.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestSpeckitPhaseII (predd side) — run_speckit_review + process_pr fork
+# ---------------------------------------------------------------------------
+
+def _make_speckit_cfg_predd(tmp_path: Path) -> pw.Config:
+    prompt_dir = tmp_path / "prompts" / "speckit"
+    prompt_dir.mkdir(parents=True)
+    (prompt_dir / "analyze.md").write_text(
+        "analyze {plan_path} {spec_refs_dir} {constitution_path} "
+        "{capability_spec_path} {story_spec_path} {clarifications_path}"
+    )
+    (prompt_dir / "tasks.md").write_text(
+        "tasks {plan_path} {spec_refs_dir}"
+    )
+    data = {
+        "repos": ["owner/repo"],
+        "worktree_base": str(tmp_path / "worktrees"),
+        "github_user": "testuser",
+        "backend": "claude",
+        "model": "claude-opus-4-6",
+        "speckit_enabled": True,
+        "speckit_run_analyze": True,
+        "speckit_prompt_dir": str(prompt_dir),
+    }
+    import tomllib as _tomllib
+    import io as _io
+    # Build via raw dict using Config directly
+    cfg = pw.Config.__new__(pw.Config)
+    cfg.__init__(data)
+    return cfg
+
+
+def _make_speckit_worktree(tmp_path: Path) -> Path:
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "plan.md").write_text("# Plan\n- do something")
+    spec_refs = wt / "spec-refs"
+    spec_refs.mkdir()
+    (spec_refs / "constitution.md").write_text("# Constitution")
+    (spec_refs / "capability-spec.md").write_text("# Capability")
+    (spec_refs / "story-spec.md").write_text("# Story")
+    return wt
+
+
+class TestRunSpeckitReview:
+    """run_speckit_review — approve path, inconsistent path."""
+
+    def test_approve_path_commits_tasks_and_posts_approve(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+
+        with patch.object(pw, "_run_skill_prompt",
+                          side_effect=["APPROVE\nLooks good.", "## Tasks\n- task 1"]) as mock_run, \
+             patch.object(pw, "gh_pr_review") as mock_review, \
+             patch.object(pw, "log_decision"), \
+             patch("subprocess.run") as mock_sub:
+            pw.run_speckit_review(cfg, "owner/repo", 42, "feat/my-branch",
+                                  "<!-- hunter:issue-10 -->", worktree)
+
+        mock_review.assert_called_once()
+        review_args = mock_review.call_args[0]
+        assert review_args[2] == "approve"
+        # tasks.md should have been written
+        assert (worktree / "tasks.md").exists()
+        assert (worktree / "tasks.md").read_text() == "## Tasks\n- task 1"
+        # git add + commit + push called
+        sub_cmds = [" ".join(str(a) for a in c[0][0]) for c in mock_sub.call_args_list]
+        assert any("git add tasks.md" in c for c in sub_cmds)
+        assert any("git commit" in c for c in sub_cmds)
+        assert any("git push" in c and "HEAD:feat/my-branch" in c for c in sub_cmds)
+
+    def test_inconsistent_path_posts_request_changes_and_labels_issue(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+        pr_body = "Implementation for issue #7\n<!-- hunter:issue-7 -->"
+
+        with patch.object(pw, "_run_skill_prompt",
+                          return_value="INCONSISTENT: missing acceptance criteria") as mock_run, \
+             patch.object(pw, "gh_pr_review") as mock_review, \
+             patch.object(pw, "gh_ensure_label_exists") as mock_ensure, \
+             patch.object(pw, "gh_issue_add_label") as mock_label, \
+             patch.object(pw, "log_decision"):
+            pw.run_speckit_review(cfg, "owner/repo", 42, "feat/my-branch",
+                                  pr_body, worktree)
+
+        mock_review.assert_called_once()
+        assert mock_review.call_args[0][2] == "request-changes"
+        mock_ensure.assert_called_once_with("owner/repo", "needs-replan", color="b60205")
+        mock_label.assert_called_once_with("owner/repo", 7, "needs-replan")
+
+    def test_inconsistent_no_issue_number_skips_label(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+
+        with patch.object(pw, "_run_skill_prompt",
+                          return_value="INCONSISTENT: something wrong"), \
+             patch.object(pw, "gh_pr_review"), \
+             patch.object(pw, "gh_issue_add_label") as mock_label, \
+             patch.object(pw, "gh_ensure_label_exists") as mock_ensure, \
+             patch.object(pw, "log_decision"):
+            pw.run_speckit_review(cfg, "owner/repo", 42, "feat/my-branch",
+                                  "no issue marker here", worktree)
+
+        mock_label.assert_not_called()
+        mock_ensure.assert_not_called()
+
+    def test_missing_plan_raises(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "spec-refs").mkdir()
+        # plan.md absent
+
+        with pytest.raises(RuntimeError, match="plan.md"):
+            pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+    def test_missing_spec_refs_raises(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / "plan.md").write_text("plan")
+        # spec-refs/ absent
+
+        with pytest.raises(RuntimeError, match="spec-refs"):
+            pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+    def test_clarifications_absent_uses_placeholder(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+        # no clarifications.md in spec-refs
+
+        captured_prompts = []
+
+        def fake_run(c, prompt, wt):
+            captured_prompts.append(prompt)
+            return "APPROVE\nok"
+
+        with patch.object(pw, "_run_skill_prompt", side_effect=fake_run), \
+             patch.object(pw, "gh_pr_review"), \
+             patch.object(pw, "log_decision"), \
+             patch("subprocess.run"):
+            pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+        assert "(not present)" in captured_prompts[0]
+
+    def test_clarifications_present_uses_real_path(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+        worktree = _make_speckit_worktree(tmp_path)
+        clarif = worktree / "spec-refs" / "clarifications.md"
+        clarif.write_text("Q: ...")
+
+        captured_prompts = []
+
+        def fake_run(c, prompt, wt):
+            captured_prompts.append(prompt)
+            return "APPROVE\nok"
+
+        with patch.object(pw, "_run_skill_prompt", side_effect=fake_run), \
+             patch.object(pw, "gh_pr_review"), \
+             patch.object(pw, "log_decision"), \
+             patch("subprocess.run"):
+            pw.run_speckit_review(cfg, "owner/repo", 1, "branch", "", worktree)
+
+        assert str(clarif) in captured_prompts[0]
+
+
+class TestProcessPrSpeckitFork:
+    """process_pr calls run_speckit_review for sdd-proposal PRs when speckit_run_analyze=True."""
+
+    def _pr(self):
+        return {
+            "number": 5,
+            "headRefOid": "abc123",
+            "headRefName": "feat/my-plan",
+            "title": "Plan: my feature",
+            "author": {"login": "someone"},
+        }
+
+    def test_speckit_proposal_pr_calls_run_speckit_review(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+
+        pr_detail_response = MagicMock()
+        pr_detail_response.stdout = json.dumps({
+            "labels": [{"name": "sdd-proposal"}],
+            "body": "<!-- hunter:issue-10 -->",
+        })
+
+        with patch.object(pw, "gh_run", return_value=pr_detail_response), \
+             patch.object(pw, "setup_worktree", return_value=tmp_path / "wt"), \
+             patch.object(pw, "run_speckit_review") as mock_speckit, \
+             patch.object(pw, "run_review") as mock_review, \
+             patch.object(pw, "update_pr_state"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"):
+            pw.process_pr(cfg, {}, "owner/repo", self._pr())
+
+        mock_speckit.assert_called_once()
+        mock_review.assert_not_called()
+
+    def test_non_proposal_pr_calls_run_review(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+
+        pr_detail_response = MagicMock()
+        pr_detail_response.stdout = json.dumps({
+            "labels": [{"name": "sdd-implementation"}],
+            "body": "some body",
+        })
+        review_response = MagicMock()
+        review_response.stdout = ""
+
+        with patch.object(pw, "gh_run", side_effect=[pr_detail_response]) as mock_gh, \
+             patch.object(pw, "setup_worktree", return_value=tmp_path / "wt"), \
+             patch.object(pw, "run_speckit_review") as mock_speckit, \
+             patch.object(pw, "run_review", return_value="APPROVE") as mock_review, \
+             patch.object(pw, "update_pr_state"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"), \
+             patch.object(pw, "gh_pr_review"):
+            pw.process_pr(cfg, {}, "owner/repo", self._pr())
+
+        mock_speckit.assert_not_called()
+        mock_review.assert_called_once()
+
+    def test_speckit_review_failure_falls_back_to_run_review(self, tmp_path):
+        cfg = _make_speckit_cfg_predd(tmp_path)
+
+        pr_detail_response = MagicMock()
+        pr_detail_response.stdout = json.dumps({
+            "labels": [{"name": "sdd-proposal"}],
+            "body": "<!-- hunter:issue-10 -->",
+        })
+
+        with patch.object(pw, "gh_run", return_value=pr_detail_response), \
+             patch.object(pw, "setup_worktree", return_value=tmp_path / "wt"), \
+             patch.object(pw, "run_speckit_review",
+                          side_effect=RuntimeError("plan.md not found")), \
+             patch.object(pw, "run_review", return_value="COMMENT general") as mock_review, \
+             patch.object(pw, "update_pr_state"), \
+             patch.object(pw, "notify_sound"), \
+             patch.object(pw, "notify_toast"), \
+             patch.object(pw, "save_state"), \
+             patch.object(pw, "log_decision"), \
+             patch.object(pw, "gh_pr_review"):
+            pw.process_pr(cfg, {}, "owner/repo", self._pr())
+
+        mock_review.assert_called_once()
+
+
+class TestParseIssueNumberFromPrBody:
+    def test_hunter_marker(self):
+        assert pw._parse_issue_number_from_pr_body("<!-- hunter:issue-42 -->") == 42
+
+    def test_hunter_marker_with_spaces(self):
+        assert pw._parse_issue_number_from_pr_body("<!-- hunter:issue-7 -->") == 7
+
+    def test_fallback_issue_text(self):
+        assert pw._parse_issue_number_from_pr_body("Implementation for issue #99") == 99
+
+    def test_hunter_marker_preferred_over_text(self):
+        body = "issue #5\n<!-- hunter:issue-15 -->"
+        assert pw._parse_issue_number_from_pr_body(body) == 15
+
+    def test_returns_none_when_no_marker(self):
+        assert pw._parse_issue_number_from_pr_body("nothing here") is None
+
+    def test_returns_none_for_empty(self):
+        assert pw._parse_issue_number_from_pr_body("") is None
