@@ -4797,3 +4797,523 @@ class TestSpeckitReplanLoop:
     def test_max_analyze_fix_loops_default(self, tmp_path):
         cfg = _make_cfg(tmp_path)
         assert cfg.max_analyze_fix_loops == 2
+
+
+# ---------------------------------------------------------------------------
+# TestEmbedSpeckitBlocks
+# ---------------------------------------------------------------------------
+
+class TestEmbedSpeckitBlocks:
+    def test_append_to_empty_body(self):
+        result = h._embed_speckit_blocks("", "C", "CS", "SS")
+        assert "<!-- speckit:constitution\nC\n-->" in result
+        assert "<!-- speckit:capability-spec\nCS\n-->" in result
+        assert "<!-- speckit:story-spec\nSS\n-->" in result
+
+    def test_append_to_existing_body(self):
+        body = "Existing issue body content."
+        result = h._embed_speckit_blocks(body, "C", "CS", "SS")
+        assert result.startswith("Existing issue body content.")
+        assert "<!-- speckit:constitution\nC\n-->" in result
+
+    def test_replace_existing_blocks(self):
+        body = (
+            "Some body\n\n"
+            "<!-- speckit:constitution\nOLD_C\n-->\n\n"
+            "<!-- speckit:capability-spec\nOLD_CS\n-->\n\n"
+            "<!-- speckit:story-spec\nOLD_SS\n-->"
+        )
+        result = h._embed_speckit_blocks(body, "NEW_C", "NEW_CS", "NEW_SS")
+        assert "NEW_C" in result
+        assert "NEW_CS" in result
+        assert "NEW_SS" in result
+        assert "OLD_C" not in result
+        assert "OLD_CS" not in result
+        assert "OLD_SS" not in result
+
+    def test_idempotent_replace(self):
+        body = "<!-- speckit:constitution\nC\n-->\n<!-- speckit:capability-spec\nCS\n-->\n<!-- speckit:story-spec\nSS\n-->"
+        result1 = h._embed_speckit_blocks(body, "C", "CS", "SS")
+        result2 = h._embed_speckit_blocks(result1, "C", "CS", "SS")
+        assert result1 == result2
+
+    def test_partial_replace_appends_missing(self):
+        body = "<!-- speckit:constitution\nC\n-->"
+        result = h._embed_speckit_blocks(body, "C2", "CS", "SS")
+        assert "<!-- speckit:constitution\nC2\n-->" in result
+        assert "<!-- speckit:capability-spec\nCS\n-->" in result
+        assert "<!-- speckit:story-spec\nSS\n-->" in result
+        # Should not have old value
+        assert "C\n-->" not in result or "C2" in result
+
+
+# ---------------------------------------------------------------------------
+# TestReadCapabilitySource
+# ---------------------------------------------------------------------------
+
+class TestReadCapabilitySource:
+    def _make_source(self, tmp_path: Path, **overrides) -> Path:
+        src = tmp_path / "cap-dir"
+        src.mkdir()
+        cap_yaml = {"id": "CAP-001", "slug": "my-capability", "title": "My Capability"}
+        cap_yaml.update(overrides.get("cap_yaml", {}))
+        import yaml as _yaml
+        (src / "capability.yaml").write_text(_yaml.dump(cap_yaml))
+        if "business_requirement" not in overrides.get("skip", []):
+            (src / "business_requirement.md").write_text("BR-001: Do the thing.")
+        if "hld" not in overrides.get("skip", []):
+            (src / "hld.md").write_text("ER-001: Some ER.")
+        if "business_spec" not in overrides.get("skip", []):
+            (src / "business_spec.md").write_text("AC-001: Acceptance.")
+        if "notes" not in overrides.get("skip", []):
+            (src / "notes.md").write_text("Term: foo means bar.")
+        return src
+
+    def test_reads_all_fields(self, tmp_path):
+        src = self._make_source(tmp_path)
+        result = h._read_capability_source(src)
+        assert result["slug"] == "my-capability"
+        assert result["capability_id"] == "CAP-001"
+        assert result["title"] == "My Capability"
+        assert "BR-001" in result["business_requirement"]
+        assert "ER-001" in result["hld"]
+        assert "AC-001" in result["business_spec"]
+        assert "foo means bar" in result["notes"]
+        assert result["slices"] == []
+
+    def test_missing_optional_files_return_empty(self, tmp_path):
+        src = self._make_source(tmp_path, skip=["hld", "notes"])
+        result = h._read_capability_source(src)
+        assert result["hld"] == ""
+        assert result["notes"] == ""
+        assert result["business_requirement"] != ""
+
+    def test_reads_slices(self, tmp_path):
+        import yaml as _yaml
+        src = self._make_source(tmp_path)
+        slices_dir = src / "slices" / "s1-foo"
+        slices_dir.mkdir(parents=True)
+        (slices_dir / "slice.md").write_text("## Goal\nDo stuff\n## Scope\nAll things")
+        (slices_dir / "slice.yaml").write_text(
+            _yaml.dump({
+                "jira_epic": "EPIC-1",
+                "jira_stories": ["PROJ-100", "PROJ-101"],
+                "impacted_repos": ["owner/repo"],
+                "status": "active",
+            })
+        )
+        result = h._read_capability_source(src)
+        assert len(result["slices"]) == 1
+        sl = result["slices"][0]
+        assert sl["slice_id"] == "s1-foo"
+        assert sl["jira_stories"] == ["PROJ-100", "PROJ-101"]
+        assert sl["jira_epic"] == "EPIC-1"
+        assert sl["impacted_repos"] == ["owner/repo"]
+        assert "Do stuff" in sl["slice_md"]
+
+    def test_missing_capability_yaml_raises(self, tmp_path):
+        src = tmp_path / "empty"
+        src.mkdir()
+        with pytest.raises(FileNotFoundError):
+            h._read_capability_source(src)
+
+    def test_slug_defaults_to_dirname(self, tmp_path):
+        import yaml as _yaml
+        src = tmp_path / "fallback-slug"
+        src.mkdir()
+        (src / "capability.yaml").write_text(_yaml.dump({"title": "T"}))
+        result = h._read_capability_source(src)
+        assert result["slug"] == "fallback-slug"
+
+
+# ---------------------------------------------------------------------------
+# TestIntakeCapability
+# ---------------------------------------------------------------------------
+
+class TestIntakeCapability:
+    def _make_cfg(self, tmp_path, cap_specs_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path / "wt"),
+            "github_user": "u",
+            "backend": "claude",
+            "model": "claude-opus-4-7",
+            "skill_path": str(tmp_path / "sk.md"),
+            "proposal_skill_path": str(tmp_path / "p.md"),
+            "impl_skill_path": str(tmp_path / "i.md"),
+            "speckit_enabled": True,
+            "speckit_prompt_dir": str(
+                Path(__file__).parent / "prompts" / "speckit"
+            ),
+            "capability_specs_path": str(cap_specs_path),
+        }
+        return h.Config(data)
+
+    def test_writes_two_files(self, tmp_path):
+        import yaml as _yaml
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+
+        src = tmp_path / "source"
+        src.mkdir()
+        (src / "capability.yaml").write_text(_yaml.dump({"slug": "my-cap", "title": "My Cap", "id": "C1"}))
+        (src / "business_requirement.md").write_text("BR-001: Req.")
+        (src / "hld.md").write_text("ER-001: ER.")
+        (src / "business_spec.md").write_text("AC-001: AC.")
+        (src / "notes.md").write_text("Term: x is y.")
+
+        with patch.object(h, "_run_intake_prompt", side_effect=["constitution text", "spec text"]) as mock_run:
+            h.intake_capability(cfg, src)
+
+        assert mock_run.call_count == 2
+        assert (cap_specs / "my-cap" / "constitution.md").read_text() == "constitution text"
+        assert (cap_specs / "my-cap" / "spec.md").read_text() == "spec text"
+
+    def test_raises_if_no_capability_specs_path(self, tmp_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "speckit_enabled": True,
+            "speckit_prompt_dir": str(tmp_path),
+        }
+        cfg = h.Config(data)
+        import yaml as _yaml
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "capability.yaml").write_text(_yaml.dump({"slug": "x"}))
+        with pytest.raises(Exception, match="capability_specs_path"):
+            h.intake_capability(cfg, src)
+
+    def test_prints_story_keys(self, tmp_path, capsys):
+        import yaml as _yaml
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+
+        src = tmp_path / "source"
+        src.mkdir()
+        (src / "capability.yaml").write_text(_yaml.dump({"slug": "cap", "title": "Cap", "id": "C"}))
+        for f in ("business_requirement.md", "hld.md", "business_spec.md", "notes.md"):
+            (src / f).write_text("content")
+        slices_dir = src / "slices" / "s1"
+        slices_dir.mkdir(parents=True)
+        (slices_dir / "slice.md").write_text("")
+        (slices_dir / "slice.yaml").write_text(
+            _yaml.dump({"jira_stories": ["PROJ-999"], "jira_epic": "E"})
+        )
+
+        with patch.object(h, "_run_intake_prompt", return_value="text"):
+            h.intake_capability(cfg, src)
+
+        out = capsys.readouterr().out
+        assert "PROJ-999" in out
+
+
+# ---------------------------------------------------------------------------
+# TestIntakeStories
+# ---------------------------------------------------------------------------
+
+class TestIntakeStories:
+    def _make_cfg(self, tmp_path, cap_specs_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path / "wt"),
+            "github_user": "u",
+            "backend": "claude",
+            "model": "claude-opus-4-7",
+            "skill_path": str(tmp_path / "sk.md"),
+            "proposal_skill_path": str(tmp_path / "p.md"),
+            "impl_skill_path": str(tmp_path / "i.md"),
+            "speckit_enabled": True,
+            "speckit_prompt_dir": str(
+                Path(__file__).parent / "prompts" / "speckit"
+            ),
+            "capability_specs_path": str(cap_specs_path),
+            "jira_api_enabled": True,
+            "jira_base_url": "https://jira.example.com",
+        }
+        return h.Config(data)
+
+    def _make_source(self, tmp_path, cap_specs_path):
+        import yaml as _yaml
+        src = tmp_path / "source"
+        src.mkdir()
+        (src / "capability.yaml").write_text(_yaml.dump({"slug": "cap", "title": "Cap", "id": "C1"}))
+        for f in ("business_requirement.md", "hld.md", "business_spec.md", "notes.md"):
+            (src / f).write_text("content")
+        slices_dir = src / "slices" / "s1"
+        slices_dir.mkdir(parents=True)
+        (slices_dir / "slice.md").write_text(
+            "## Goal\nDo something\n## Scope\nAll\n## Out of Scope\nNothing\n"
+            "## Done When\nIt works\n## Trace Links\nBR-001"
+        )
+        (slices_dir / "slice.yaml").write_text(
+            _yaml.dump({
+                "jira_stories": ["PROJ-100"],
+                "jira_epic": "EPIC-1",
+                "impacted_repos": ["owner/repo"],
+            })
+        )
+        # Pre-create constitution.md and spec.md in cap_specs_path
+        cap_dir = cap_specs_path / "cap"
+        cap_dir.mkdir(parents=True)
+        (cap_dir / "constitution.md").write_text("# Constitution")
+        (cap_dir / "spec.md").write_text("# Spec")
+        return src
+
+    def test_writes_story_spec(self, tmp_path):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        jira_data = {"fields": {"summary": "Do the thing", "description": "A " * 60, "customfield_10016": "AC: works"}}
+        with patch.object(h, "_fetch_jira_story", return_value=jira_data), \
+             patch.object(h, "_run_intake_prompt", return_value="story spec text"), \
+             patch.object(h, "_find_github_issue_for_jira_key", return_value=None):
+            h.intake_stories(cfg, src)
+
+        story_spec = cap_specs / "cap" / "stories" / "PROJ-100" / "spec.md"
+        assert story_spec.exists()
+        assert "story spec text" in story_spec.read_text()
+
+    def test_thin_story_adds_warning(self, tmp_path):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        # Short description = thin story
+        jira_data = {"fields": {"summary": "Short", "description": "only five words here", "customfield_10016": ""}}
+        with patch.object(h, "_fetch_jira_story", return_value=jira_data), \
+             patch.object(h, "_run_intake_prompt", return_value="content"), \
+             patch.object(h, "_find_github_issue_for_jira_key", return_value=None):
+            h.intake_stories(cfg, src)
+
+        story_spec = cap_specs / "cap" / "stories" / "PROJ-100" / "spec.md"
+        assert "⚠️ Thin story" in story_spec.read_text()
+
+    def test_404_story_skipped(self, tmp_path, capsys):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        with patch.object(h, "_fetch_jira_story", return_value=None), \
+             patch.object(h, "_run_intake_prompt", return_value="text"):
+            h.intake_stories(cfg, src)  # should not raise
+
+        story_spec = cap_specs / "cap" / "stories" / "PROJ-100" / "spec.md"
+        assert not story_spec.exists()
+        out = capsys.readouterr().out
+        assert "404" in out or "skipping" in out.lower()
+
+    def test_non_404_jira_error_is_caught_and_reported(self, tmp_path, capsys):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        with patch.object(h, "_fetch_jira_story", side_effect=RuntimeError("connection refused")), \
+             patch.object(h, "_run_intake_prompt", return_value="text"):
+            h.intake_stories(cfg, src)  # should not propagate — caught in intake_stories loop
+
+        story_spec = cap_specs / "cap" / "stories" / "PROJ-100" / "spec.md"
+        assert not story_spec.exists()
+        out = capsys.readouterr().out
+        assert "failed" in out.lower() or "error" in out.lower() or "connection refused" in out
+
+    def test_embeds_into_github_issue(self, tmp_path):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        jira_data = {"fields": {"summary": "S", "description": "A " * 60, "customfield_10016": "AC"}}
+        mock_view_result = MagicMock()
+        mock_view_result.stdout = json.dumps({"body": "Existing body"})
+
+        edit_bodies: list[str] = []
+
+        def _capture_gh_run(args, **kwargs):
+            # Capture the --body value from issue edit calls
+            if "edit" in args and "--body" in args:
+                edit_bodies.append(args[args.index("--body") + 1])
+            return mock_view_result
+
+        with patch.object(h, "_fetch_jira_story", return_value=jira_data), \
+             patch.object(h, "_run_intake_prompt", return_value="story text"), \
+             patch.object(h, "_find_github_issue_for_jira_key", return_value=("owner/repo", 42)), \
+             patch.object(h, "gh_run", side_effect=_capture_gh_run):
+            h.intake_stories(cfg, src)
+
+        assert len(edit_bodies) == 1
+        new_body = edit_bodies[0]
+        assert "speckit:constitution" in new_body
+        assert "speckit:capability-spec" in new_body
+        assert "speckit:story-spec" in new_body
+
+    def test_no_github_issue_continues(self, tmp_path, capsys):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        jira_data = {"fields": {"summary": "S", "description": "A " * 60, "customfield_10016": "AC"}}
+        with patch.object(h, "_fetch_jira_story", return_value=jira_data), \
+             patch.object(h, "_run_intake_prompt", return_value="text"), \
+             patch.object(h, "_find_github_issue_for_jira_key", return_value=None):
+            h.intake_stories(cfg, src)  # should not raise
+
+        out = capsys.readouterr().out
+        assert "No GitHub issue found" in out or "skipping embed" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# TestRunSpeckitPlanFromIssueBody
+# ---------------------------------------------------------------------------
+
+class TestRunSpeckitPlanFromIssueBody:
+    def _make_cfg(self, tmp_path):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cap_dir = cap_specs / "my-cap"
+        cap_dir.mkdir()
+        (cap_dir / "constitution.md").write_text("# Constitution")
+        (cap_dir / "spec.md").write_text("# Spec")
+        story_dir = cap_dir / "stories" / "PROJ-1"
+        story_dir.mkdir(parents=True)
+        (story_dir / "spec.md").write_text("# Story spec")
+
+        prompts_dir = Path(__file__).parent / "prompts" / "speckit"
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path / "wt"),
+            "github_user": "u",
+            "backend": "claude",
+            "model": "claude-opus-4-7",
+            "skill_path": str(tmp_path / "sk.md"),
+            "proposal_skill_path": str(tmp_path / "p.md"),
+            "impl_skill_path": str(tmp_path / "i.md"),
+            "speckit_enabled": True,
+            "speckit_prompt_dir": str(prompts_dir),
+            "capability_specs_path": str(cap_specs),
+        }
+        return h.Config(data), cap_specs
+
+    def _make_issue_body_with_blocks(self) -> str:
+        return (
+            "Issue description\n\n"
+            "<!-- speckit:constitution\n# Embedded Constitution\n-->\n\n"
+            "<!-- speckit:capability-spec\n# Embedded Cap Spec\n-->\n\n"
+            "<!-- speckit:story-spec\n# Embedded Story Spec\n-->"
+        )
+
+    def test_reads_from_issue_body_blocks(self, tmp_path):
+        cfg, _ = self._make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+        (worktree / "plan.md").write_text("# Plan")  # simulate skill output
+
+        entry = {"jira_key": "PROJ-1", "epic_name": "my-cap", "epic_key": "", "repo": "owner/repo"}
+        issue_body = self._make_issue_body_with_blocks()
+
+        with patch.object(h, "resolve_capability_folder", return_value=None) as mock_rcf, \
+             patch.object(h, "commit_skill_output"), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"), \
+             patch.object(h, "log_decision"):
+            result = h.run_speckit_plan(cfg, entry, worktree, 42, "Test", issue_body)
+
+        assert result is True
+        # spec-refs should have been written from embedded blocks
+        assert (worktree / "spec-refs" / "constitution.md").read_text() == "# Embedded Constitution"
+        assert (worktree / "spec-refs" / "capability-spec.md").read_text() == "# Embedded Cap Spec"
+        assert (worktree / "spec-refs" / "story-spec.md").read_text() == "# Embedded Story Spec"
+
+    def test_falls_back_to_disk_when_blocks_missing(self, tmp_path):
+        cfg, cap_specs = self._make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+        (worktree / "plan.md").write_text("# Plan")
+
+        entry = {"jira_key": "PROJ-1", "epic_name": "my-cap", "epic_key": "", "repo": "owner/repo"}
+        issue_body = "No speckit blocks here"
+
+        cap_dir = cap_specs / "my-cap"
+        with patch.object(h, "resolve_capability_folder", return_value=cap_dir), \
+             patch.object(h, "read_bpa_specs_bundle", return_value={
+                 "constitution": cap_dir / "constitution.md",
+                 "capability_spec": cap_dir / "spec.md",
+                 "story_spec": cap_dir / "stories" / "PROJ-1" / "spec.md",
+                 "clarifications": None,
+             }), \
+             patch.object(h, "pin_capability_sha", return_value="abc123"), \
+             patch.object(h, "copy_spec_refs", return_value=worktree / "spec-refs"), \
+             patch.object(h, "commit_skill_output"), \
+             patch.object(h, "build_issue_context", return_value="ctx"), \
+             patch.object(h, "run_skill"), \
+             patch.object(h, "log_decision"):
+            result = h.run_speckit_plan(cfg, entry, worktree, 42, "Test", issue_body)
+
+        assert result is True
+
+    def test_returns_false_when_no_blocks_and_no_capability_dir(self, tmp_path):
+        cfg, _ = self._make_cfg(tmp_path)
+        worktree = tmp_path / "wt"
+        worktree.mkdir(parents=True)
+
+        entry = {"jira_key": "PROJ-1", "epic_name": "unknown", "epic_key": "", "repo": "owner/repo"}
+
+        with patch.object(h, "resolve_capability_folder", return_value=None):
+            result = h.run_speckit_plan(cfg, entry, worktree, 42, "Test", "no blocks")
+
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# TestFetchJiraStory
+# ---------------------------------------------------------------------------
+
+class TestFetchJiraStory:
+    def _make_cfg(self, tmp_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "jira_api_enabled": True,
+            "jira_base_url": "https://jira.example.com",
+        }
+        return h.Config(data)
+
+    def test_invalid_jira_key_raises_value_error(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        with pytest.raises(ValueError, match="Invalid Jira key"):
+            h._fetch_jira_story(cfg, "not-a-key")
+
+    def test_invalid_jira_key_with_path_traversal_rejected(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        with pytest.raises(ValueError, match="Invalid Jira key"):
+            h._fetch_jira_story(cfg, "../etc/passwd")
+
+    def test_404_returns_none(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        err = Exception("HTTP Error 404")
+        err.code = 404
+        with patch.object(h, "JiraClient") as mock_cls:
+            mock_cls.return_value.get_issue.side_effect = err
+            with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}):
+                result = h._fetch_jira_story(cfg, "PROJ-123")
+        assert result is None
+
+    def test_non_404_error_reraises(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        err = Exception("HTTP Error 500")
+        err.code = 500
+        with patch.object(h, "JiraClient") as mock_cls:
+            mock_cls.return_value.get_issue.side_effect = err
+            with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}):
+                with pytest.raises(Exception, match="500"):
+                    h._fetch_jira_story(cfg, "PROJ-123")
