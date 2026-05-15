@@ -369,6 +369,8 @@ Target: 80%+ coverage. Tests use `unittest.mock` — no real GitHub calls.
 | `trigger-mode.md` | `trigger = "ready"` vs `"requested"` |
 | `worktree-resume-fix.md` | Double-prune before worktree add |
 | `migrate-to-speckit.md` Phase I | Hunter reads BPA-Specs, runs speckit plan + implement |
+| `migrate-to-speckit.md` Phase II | predd analyze+tasks review of proposal PRs; re-plan loop |
+| `hunter-intake-capability.md` | `hunter intake-capability` + `intake-stories` commands; spec-kit blocks embedded in GH issues; `run_speckit_plan` reads from issue body |
 
 ### Pending (spec/changes/)
 
@@ -376,7 +378,6 @@ Target: 80%+ coverage. Tests use `unittest.mock` — no real GitHub calls.
 |------|---------|
 | `analyze-command.md` | `predd analyze` / `hunter analyze` command to read logs and produce improvement specs |
 | `hunter-jira-frontmatter.md` | Add Jira metadata frontmatter block to proposal/impl PR bodies |
-| `migrate-to-speckit.md` Phase II | predd analyze+tasks review of proposal PRs; re-plan loop |
 | `obsidian-observe.md` | Hourly: read GitHub activity, write one Obsidian note per active PR/issue |
 | `obsidian-analyze.md` | Daily: read 7 days of observations, produce analysis note + spec files |
 | `obsidian-daemon.md` | Third daemon running observe hourly and analyze daily |
