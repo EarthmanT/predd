@@ -1080,13 +1080,21 @@ def run_speckit_plan(cfg: Config, entry: dict, worktree: Path,
         )
         commit_skill_output(worktree, f"speckit: copy spec-refs for issue #{issue_number}")
 
-        # Best-effort: get capability name and SHA from disk (for plan.md frontmatter)
-        capability_dir = resolve_capability_folder(cfg, epic_name, epic_key)
-        capability_name = str(capability_dir.name) if capability_dir else (epic_name or story_id)
-        try:
-            sha = pin_capability_sha(cfg) if capability_dir else "embedded"
-        except RuntimeError:
-            sha = "embedded"
+        # Use epic_name as the capability label for plan.md frontmatter.
+        # Avoid calling resolve_capability_folder here — it logs speckit_no_capability
+        # when the folder is absent, which would be spurious noise for the embedded path.
+        capability_name = epic_name or story_id
+        sha = "embedded"
+        if cfg.capability_specs_path and epic_name:
+            candidate = cfg.capability_specs_path / re.sub(
+                r"[^a-z0-9]+", "-", epic_name.lower()
+            ).strip("-")
+            if candidate.exists():
+                capability_name = candidate.name
+                try:
+                    sha = pin_capability_sha(cfg)
+                except RuntimeError:
+                    sha = "embedded"
 
         prompt = load_speckit_prompt(
             cfg, template_name="plan",
@@ -1276,6 +1284,7 @@ def _embed_speckit_blocks(
         if name in blocks:
             replaced.add(name)
             return f"<!-- speckit:{name}\n{blocks[name]}\n-->"
+        # Unknown block names pass through unchanged — intentional, safe.
         return m.group(0)
 
     result = _SPECKIT_BLOCK_RE.sub(_replacer, body)
@@ -1334,7 +1343,8 @@ def _read_capability_source(source_dir: Path) -> dict:
                 with slice_yaml_path.open() as f:
                     slice_yaml = yaml.safe_load(f) or {}
             slice_md = slice_md_path.read_text() if slice_md_path.exists() else ""
-            jira_stories = slice_yaml.get("jira_stories", []) or []
+            raw_stories = slice_yaml.get("jira_stories", []) or []
+            jira_stories = raw_stories if isinstance(raw_stories, list) else []
             slices.append({
                 "slice_id": slice_dir.name,
                 "slice_md": slice_md,
@@ -1358,6 +1368,12 @@ def _read_capability_source(source_dir: Path) -> dict:
 
 def _run_intake_prompt(cfg: Config, prompt: str) -> str:
     """Run a plain-text prompt through the configured backend, returning text output."""
+    if cfg.backend == "bedrock" and not cfg.impl_skill_path.exists():
+        raise click.ClickException(
+            f"impl_skill_path does not exist: {cfg.impl_skill_path}\n"
+            "The bedrock backend requires a skill file. Create it or set "
+            "impl_skill_path in config.toml."
+        )
     with tempfile.TemporaryDirectory(prefix="hunter-intake-") as tmpdir:
         return _run_skill_prompt(cfg, prompt, Path(tmpdir))
 
@@ -1448,14 +1464,23 @@ def _find_github_issue_for_jira_key(
 
         for issue in issues:
             title = issue.get("title", "")
-            if jira_key in title:
+            # Word-boundary match — prevents DAP09A-1 matching DAP09A-10
+            if re.search(rf"\b{re.escape(jira_key)}\b", title):
                 return (repo, issue["number"])
 
     return None
 
 
+_JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+
+
 def _fetch_jira_story(cfg: Config, jira_key: str) -> dict | None:
     """Fetch a single Jira story. Returns None on 404; raises on other errors."""
+    if not _JIRA_KEY_RE.match(jira_key):
+        raise ValueError(
+            f"Invalid Jira key {jira_key!r} — expected format PROJECT-123. "
+            "Check slice.yaml jira_stories values."
+        )
     token = os.environ.get("JIRA_API_TOKEN")
     if not token:
         raise RuntimeError("JIRA_API_TOKEN environment variable is not set")
@@ -1463,8 +1488,7 @@ def _fetch_jira_story(cfg: Config, jira_key: str) -> dict | None:
     try:
         return client.get_issue(jira_key)
     except Exception as e:
-        err_str = str(e).lower()
-        if "404" in err_str or "not found" in err_str:
+        if hasattr(e, "code") and e.code == 404:
             return None
         raise
 
@@ -1637,6 +1661,13 @@ def intake_stories(cfg: Config, source_dir: Path) -> None:
                 new_body = _embed_speckit_blocks(
                     current_body, constitution_text, capability_spec_text, story_text
                 )
+                _GH_ISSUE_BODY_LIMIT = 65536
+                if len(new_body) > _GH_ISSUE_BODY_LIMIT:
+                    click.echo(
+                        f" skipped (body would be {len(new_body)} chars, "
+                        f"GitHub limit is {_GH_ISSUE_BODY_LIMIT})"
+                    )
+                    continue
                 gh_run([
                     "issue", "edit", str(issue_number),
                     "--repo", repo,
@@ -3438,7 +3469,12 @@ def init_cmd(force: bool, ui: bool):
 @cli.command(name="intake-capability")
 @click.argument("source_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 def cmd_intake_capability(source_dir: Path):
-    """Generate spec-kit constitution.md + spec.md from a company-format capability folder."""
+    """Generate spec-kit constitution.md + spec.md from a company-format capability folder.
+
+    Runs the configured LLM backend (claude/bedrock/devin) with
+    --dangerously-skip-permissions. The backend can read local files during
+    this call. Run only with source directories you trust.
+    """
     setup_logging()
     cfg = load_config()
     if not cfg.speckit_enabled:
@@ -3452,7 +3488,12 @@ def cmd_intake_capability(source_dir: Path):
 @cli.command(name="intake-stories")
 @click.argument("source_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
 def cmd_intake_stories(source_dir: Path):
-    """Generate per-story spec.md files and embed them into GitHub issues."""
+    """Generate per-story spec.md files and embed them into GitHub issues.
+
+    Fetches stories from Jira (requires JIRA_API_TOKEN), runs the configured
+    LLM backend with --dangerously-skip-permissions, and updates GitHub issue
+    bodies. Run only with source directories you trust.
+    """
     setup_logging()
     cfg = load_config()
     if not cfg.speckit_enabled:

@@ -5110,6 +5110,21 @@ class TestIntakeStories:
         out = capsys.readouterr().out
         assert "404" in out or "skipping" in out.lower()
 
+    def test_non_404_jira_error_is_caught_and_reported(self, tmp_path, capsys):
+        cap_specs = tmp_path / "specs"
+        cap_specs.mkdir()
+        cfg = self._make_cfg(tmp_path, cap_specs)
+        src = self._make_source(tmp_path, cap_specs)
+
+        with patch.object(h, "_fetch_jira_story", side_effect=RuntimeError("connection refused")), \
+             patch.object(h, "_run_intake_prompt", return_value="text"):
+            h.intake_stories(cfg, src)  # should not propagate — caught in intake_stories loop
+
+        story_spec = cap_specs / "cap" / "stories" / "PROJ-100" / "spec.md"
+        assert not story_spec.exists()
+        out = capsys.readouterr().out
+        assert "failed" in out.lower() or "error" in out.lower() or "connection refused" in out
+
     def test_embeds_into_github_issue(self, tmp_path):
         cap_specs = tmp_path / "specs"
         cap_specs.mkdir()
@@ -5120,20 +5135,22 @@ class TestIntakeStories:
         mock_view_result = MagicMock()
         mock_view_result.stdout = json.dumps({"body": "Existing body"})
 
+        edit_bodies: list[str] = []
+
+        def _capture_gh_run(args, **kwargs):
+            # Capture the --body value from issue edit calls
+            if "edit" in args and "--body" in args:
+                edit_bodies.append(args[args.index("--body") + 1])
+            return mock_view_result
+
         with patch.object(h, "_fetch_jira_story", return_value=jira_data), \
              patch.object(h, "_run_intake_prompt", return_value="story text"), \
              patch.object(h, "_find_github_issue_for_jira_key", return_value=("owner/repo", 42)), \
-             patch.object(h, "gh_run", return_value=mock_view_result) as mock_gh:
+             patch.object(h, "gh_run", side_effect=_capture_gh_run):
             h.intake_stories(cfg, src)
 
-        # gh_run should have been called for view + edit
-        calls = mock_gh.call_args_list
-        edit_calls = [c for c in calls if "edit" in str(c)]
-        assert len(edit_calls) >= 1
-        # The body arg should contain speckit blocks
-        edit_body_arg = edit_calls[0][0][0]
-        body_idx = edit_body_arg.index("--body") + 1
-        new_body = edit_body_arg[body_idx]
+        assert len(edit_bodies) == 1
+        new_body = edit_bodies[0]
         assert "speckit:constitution" in new_body
         assert "speckit:capability-spec" in new_body
         assert "speckit:story-spec" in new_body
@@ -5254,3 +5271,49 @@ class TestRunSpeckitPlanFromIssueBody:
             result = h.run_speckit_plan(cfg, entry, worktree, 42, "Test", "no blocks")
 
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# TestFetchJiraStory
+# ---------------------------------------------------------------------------
+
+class TestFetchJiraStory:
+    def _make_cfg(self, tmp_path):
+        data = {
+            "repos": ["owner/repo"],
+            "worktree_base": str(tmp_path),
+            "github_user": "u",
+            "jira_api_enabled": True,
+            "jira_base_url": "https://jira.example.com",
+        }
+        return h.Config(data)
+
+    def test_invalid_jira_key_raises_value_error(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        with pytest.raises(ValueError, match="Invalid Jira key"):
+            h._fetch_jira_story(cfg, "not-a-key")
+
+    def test_invalid_jira_key_with_path_traversal_rejected(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        with pytest.raises(ValueError, match="Invalid Jira key"):
+            h._fetch_jira_story(cfg, "../etc/passwd")
+
+    def test_404_returns_none(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        err = Exception("HTTP Error 404")
+        err.code = 404
+        with patch.object(h, "JiraClient") as mock_cls:
+            mock_cls.return_value.get_issue.side_effect = err
+            with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}):
+                result = h._fetch_jira_story(cfg, "PROJ-123")
+        assert result is None
+
+    def test_non_404_error_reraises(self, tmp_path):
+        cfg = self._make_cfg(tmp_path)
+        err = Exception("HTTP Error 500")
+        err.code = 500
+        with patch.object(h, "JiraClient") as mock_cls:
+            mock_cls.return_value.get_issue.side_effect = err
+            with patch.dict(os.environ, {"JIRA_API_TOKEN": "tok"}):
+                with pytest.raises(Exception, match="500"):
+                    h._fetch_jira_story(cfg, "PROJ-123")

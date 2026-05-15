@@ -21,12 +21,11 @@ Source material:
 Produce the constitution.md. Include ONLY:
 
 1. **Term definitions** from Notes — copy verbatim. Do not improvise synonyms or paraphrase.
-2. **Architectural invariants** — rules the implementation must NEVER violate, not features to build.
-   Examples: tenant isolation (no cross-tenant reads at any layer), deterministic scoring (no LLM
-   opinions in scores), LLM participation boundary (discovery only, not scoring or validation).
+2. **Architectural invariants** — rules the implementation must NEVER violate, not features to
+   build. Look for statements like "must never", "under no circumstances", "always", "required at
+   every layer", or similar absolute language in the source material.
 3. **Hard thresholds** — specific numeric or categorical values baked into requirements that must
-   not drift (e.g. <50% confidence flag, <5 blueprint low-confidence notice, ≥3-consecutive
-   feedback window).
+   not drift (e.g. percentage cutoffs, count limits, time windows, retry counts).
 
 Do NOT include:
 - Business requirements as BRs

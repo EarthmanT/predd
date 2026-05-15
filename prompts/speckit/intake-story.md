@@ -39,9 +39,4 @@ The repositories that will require changes, from slice.yaml.
 
 ---
 
-Thin story rule: if the Jira description is fewer than 50 words OR has no acceptance
-criteria, add this exact warning at the very top of the file (before ## What):
-
-> ⚠️ Thin story: no acceptance criteria found in Jira. Slice "Done When" used as fallback.
-
 Output ONLY the markdown content. No preamble, no code fences, no commentary.
